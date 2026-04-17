@@ -156,8 +156,8 @@ class MattermostClient:
         """Upload a file to a channel; return its file_id."""
         with path.open("rb") as fh:
             resp = self._driver.files.upload_file(
-                channel_id=channel_id,
                 files={"files": (path.name, fh)},
+                data={"channel_id": channel_id},
             )
         infos = resp.get("file_infos") or []
         if not infos:
