@@ -38,6 +38,10 @@ class FakeMattermostClient:
     posts_by_id: dict = field(default_factory=dict)
     files_by_id: dict = field(default_factory=dict)
     download_failures: set = field(default_factory=set)
+    # Auto-join support:
+    bot_channel_ids: set = field(default_factory=set)
+    public_channels: list = field(default_factory=list)
+    joined: list = field(default_factory=list)
 
     def login(self) -> None:
         pass
@@ -66,6 +70,9 @@ class FakeMattermostClient:
 
     def set_channel_header(self, channel_id: str, header: str) -> None:
         pass
+
+    def set_channel_purpose(self, channel_id: str, purpose: str) -> None:
+        self.channels.setdefault(channel_id, {"id": channel_id})["purpose"] = purpose
 
     def get_channel(self, channel_id: str) -> dict:
         return self.channels.get(channel_id, {"id": channel_id, "purpose": ""})
@@ -98,6 +105,25 @@ class FakeMattermostClient:
     def get_post(self, post_id: str) -> dict:
         return self.posts_by_id.get(post_id, {"message": ""})
 
+    def get_bot_channel_ids(self) -> set:
+        return set(self.bot_channel_ids)
+
+    def list_public_team_channels(self) -> list:
+        return list(self.public_channels)
+
+    def join_channel(self, channel_id: str) -> None:
+        self.joined.append(channel_id)
+        self.bot_channel_ids.add(channel_id)
+
+    def join_all_public_team_channels(self) -> list:
+        newly = [
+            ch["id"] for ch in self.public_channels
+            if ch["id"] not in self.bot_channel_ids
+        ]
+        for cid in newly:
+            self.join_channel(cid)
+        return newly
+
 
 @dataclass
 class FakeVibeDeckClient:
@@ -105,6 +131,7 @@ class FakeVibeDeckClient:
     sent: list[tuple[str, str]] = field(default_factory=list)
     forks: list[tuple[str, str]] = field(default_factory=list)
     titles: list[tuple[str, str | None]] = field(default_factory=list)
+    interrupted: list[str] = field(default_factory=list)
     next_session_id: str = "session-next"
     fork_response: dict | None = None
     sessions_meta: list[dict] = field(default_factory=list)
@@ -150,6 +177,10 @@ class FakeVibeDeckClient:
 
     async def set_session_title(self, session_id, title) -> None:
         self.titles.append((session_id, title))
+
+    async def interrupt_session(self, session_id) -> dict:
+        self.interrupted.append(session_id)
+        return {"status": "interrupted", "session_id": session_id}
 
     async def list_models(self, backend) -> list[str]:
         return self.models_by_backend.get(backend, [])
@@ -553,6 +584,71 @@ class CatchUpTests(_BridgeTestCase):
         self.assertNotIn("bot echo", block)
 
 
+class InitialCatchUpTests(_BridgeTestCase):
+    """On first session creation, prepend the last N channel messages as context."""
+
+    async def test_invite_session_prepends_catch_up_block(self):
+        self.config.initial_catch_up_n = 50
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"id": "p1", "user_id": "u1", "message": "earlier chat", "type": ""},
+            {"id": "p2", "user_id": "u2", "message": "more chat", "type": ""},
+        ]
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        first_msg = self.bridge.vd.created[0]["message"]
+        self.assertIn("Catch-up context", first_msg)
+        self.assertIn("earlier chat", first_msg)
+        self.assertIn("more chat", first_msg)
+        # Original placeholder still appended after the block.
+        self.assertIn("I'll wait for the user", first_msg)
+
+    async def test_engagement_excludes_triggering_post(self):
+        self.config.auto_join_public_channels = True
+        self.config.initial_catch_up_n = 50
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"id": "p1", "user_id": "u1", "message": "old message", "type": ""},
+            {"id": "trigger", "user_id": "u1", "message": "@claude hi", "type": ""},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude hi",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        first_msg = self.bridge.vd.created[0]["message"]
+        self.assertIn("old message", first_msg)
+        self.assertNotIn("@claude hi\n[End of catch-up]", first_msg)
+        # The engagement msg itself is still the post-catch-up payload.
+        self.assertTrue(first_msg.rstrip().endswith("hi"))
+
+    async def test_zero_disables_auto_catch_up(self):
+        self.config.initial_catch_up_n = 0
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"id": "p1", "user_id": "u1", "message": "history", "type": ""},
+        ]
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        first_msg = self.bridge.vd.created[0]["message"]
+        self.assertNotIn("Catch-up context", first_msg)
+
+    async def test_empty_channel_skips_block(self):
+        self.config.initial_catch_up_n = 50
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mm.posts_by_channel["c1"] = []
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        first_msg = self.bridge.vd.created[0]["message"]
+        self.assertNotIn("Catch-up context", first_msg)
+
+
 class LeaveTests(_BridgeTestCase):
     async def test_leave_command_removes_bot_and_unlinks(self):
         self.bridge.mapping.link("c1", "s1")
@@ -571,6 +667,256 @@ class LeaveTests(_BridgeTestCase):
         await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
 
         self.assertIsNone(self.bridge.mapping.get_session("c1"))
+
+
+class StopCommandTests(_BridgeTestCase):
+    async def test_stop_command_in_channel_interrupts_session(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, ["s1"])
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_stop_command_case_insensitive(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@Claude STOP",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, ["s1"])
+
+    async def test_stop_command_in_thread_interrupts_thread_session(self):
+        self.bridge.mapping.link("c1", "parent-s")
+        self.bridge.mapping.link_thread("c1", "r1", "fork-s")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "", "root_id": "r1",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, ["fork-s"])
+
+    async def test_stop_with_trailing_text_is_regular_message(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop doing that",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+
+    async def test_stop_in_unmapped_channel_is_ignored(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+
+
+class FirstMessageConfigTests(_BridgeTestCase):
+    """First user message after invite may re-configure the channel via tokens.
+
+    If it parses cleanly as config, we apply + persist + confirm. If it changes
+    backend/model/cwd we restart the session; if only the mention flag changes,
+    we update in-place.
+    """
+
+    async def _prime_channel(self, channel_id: str, purpose: str = "") -> None:
+        """Simulate a successful invite: session mapped, awaiting first message."""
+        self.bridge.mm.channels[channel_id] = {"id": channel_id, "purpose": purpose}
+        await self.bridge._on_mm_user_added(channel_id, self.bridge.mm.bot_user_id)
+        # Pretend the SSE claim succeeded with the session we pretend-created.
+        pending = self.bridge.pending_mm_sessions.pop(channel_id, None)
+        assert pending is not None
+        session_id = "s-primed"
+        self.bridge.mapping.link(channel_id, session_id)
+        self.bridge.awaiting_first_message.add(channel_id)
+        return session_id
+
+    async def test_non_config_first_message_forwards_normally(self):
+        # Prime with autorespond so the mention-only filter is out of the way —
+        # this test is about the first-message-config gate, not the mention rule.
+        session_id = await self._prime_channel("c1", purpose="autorespond")
+        # Clear bot posts from the welcome message.
+        self.bridge.vd.created.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello world",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [(session_id, "hello world")])
+        self.assertNotIn("c1", self.bridge.awaiting_first_message)
+
+    async def test_flag_only_config_updates_in_place_no_session_restart(self):
+        session_id = await self._prime_channel("c1")
+        self.bridge.vd.created.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "autorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        # Session is NOT restarted.
+        self.assertEqual(self.bridge.vd.created, [])
+        # Still mapped.
+        self.assertEqual(self.bridge.mapping.get_session("c1"), session_id)
+        # Config updated: mention_only now False.
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
+        # Persisted back to Channel Purpose.
+        self.assertIn("autorespond", self.bridge.mm.channels["c1"]["purpose"])
+        # Confirmation posted, message not forwarded.
+        self.assertEqual(self.bridge.vd.sent, [])
+        self.assertNotIn("c1", self.bridge.awaiting_first_message)
+
+    async def test_config_with_model_change_restarts_session(self):
+        session_id = await self._prime_channel("c1", purpose="claude, opus")
+        self.bridge.vd.created.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "claude, sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        # Old session unmapped, a new session created.
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.created[0]["model_index"], 1)  # sonnet=1
+        # Original session no longer linked.
+        self.assertNotEqual(self.bridge.mapping.get_session("c1"), session_id)
+        # Persisted.
+        self.assertIn("sonnet", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_bot_mention_prefix_treats_as_normal_message(self):
+        """Commands like `@claude stop` or a plain '@claude hi' must NOT parse
+        as config — they contain the bot mention which isn't a known token."""
+        session_id = await self._prime_channel("c1")
+        self.bridge.vd.created.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude hi",
+            "user_id": "u1", "type": "",
+        })
+
+        # Forwarded (with mention stripped).
+        self.assertEqual(self.bridge.vd.sent, [(session_id, "hi")])
+
+    async def test_only_first_message_is_checked_for_config(self):
+        """Once the channel is no longer awaiting, tokens-that-look-like-config
+        should be forwarded verbatim — not swallowed."""
+        session_id = await self._prime_channel("c1", purpose="autorespond")
+        self.bridge.vd.created.clear()
+
+        # First message: normal → removes awaiting flag.
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello", "user_id": "u1", "type": "",
+        })
+        # Second message: looks like config but must forward.
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "claude, sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.vd.sent), 2)
+        self.assertEqual(self.bridge.vd.sent[1][1], "claude, sonnet")
+
+
+class RuntimeToggleTests(_BridgeTestCase):
+    """After the first message, only the literal words `autorespond` and
+    `noautorespond` toggle the mention_only flag — nothing else."""
+
+    async def test_literal_noautorespond_toggles_mention_only_on(self):
+        self.bridge.mapping.link("c1", "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "noautorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        # Persisted + not forwarded.
+        self.assertIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_literal_autorespond_toggles_mention_only_off(self):
+        self.bridge.mapping.link("c1", "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=True,
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, mention-only",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "autorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
+        self.assertNotIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_autorespond_with_trailing_text_is_regular_message(self):
+        """`autorespond now` must NOT toggle — only the literal word alone does."""
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "autorespond now",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "autorespond now")])
+
+
+class PurposeUpdateNoticeTests(_BridgeTestCase):
+    async def test_self_triggered_purpose_change_suppresses_notice(self):
+        """When the bridge writes the purpose (e.g. after a runtime toggle),
+        the incoming `channel_updated` event must not spawn a user notice."""
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "", "purpose": "claude, opus",
+        }
+        self.bridge._note_self_wrote_purpose("c1", "claude, opus, mention-only")
+
+        await self.bridge._on_mm_channel_updated({
+            "id": "c1", "display_name": "", "purpose": "claude, opus, mention-only",
+        })
+
+        self.assertFalse(
+            any("takes effect only for new sessions" in p.message
+                for p in self.bridge.mm.posted),
+            "self-written purpose must not trigger the change notice",
+        )
+
+    async def test_external_purpose_change_still_posts_notice(self):
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "", "purpose": "claude, opus",
+        }
+
+        await self.bridge._on_mm_channel_updated({
+            "id": "c1", "display_name": "", "purpose": "claude, opus, mention-only",
+        })
+
+        self.assertTrue(
+            any("takes effect only for new sessions" in p.message
+                for p in self.bridge.mm.posted),
+        )
 
 
 class SessionAddedClaimTests(_BridgeTestCase):
@@ -728,6 +1074,134 @@ class NameSyncTests(_BridgeTestCase):
         })
 
         self.assertEqual(self.bridge.vd.titles, [])
+
+
+class AutoJoinTests(_BridgeTestCase):
+    """`auto_join_public_channels` opts the bot into team-wide presence.
+
+    Joining is silent — no VD session until a user engages (by @mention
+    under mention-only, or any message under autorespond). Self-joins must
+    not be treated as external invites.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.config.auto_join_public_channels = True
+
+    async def test_channel_created_event_joins_when_enabled(self):
+        await self.bridge._on_mm_channel_created("c-new")
+        self.assertIn("c-new", self.bridge.mm.joined)
+        # Session-less silent presence; the resulting user_added must not
+        # spawn an invite flow.
+        await self.bridge._on_mm_user_added("c-new", self.bridge.mm.bot_user_id)
+        self.assertIsNone(self.bridge.mapping.get_session("c-new"))
+        self.assertEqual(self.bridge.vd.created, [])
+
+    async def test_channel_created_event_ignored_when_disabled(self):
+        self.config.auto_join_public_channels = False
+        await self.bridge._on_mm_channel_created("c-new")
+        self.assertEqual(self.bridge.mm.joined, [])
+
+    async def test_mention_triggers_engagement_session(self):
+        # Channel exists, bot joined silently; no mapping yet.
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude hello there",
+            "user_id": "u1", "type": "",
+        })
+
+        # VD session created with the engagement message (mention stripped).
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.created[0]["message"], "hello there")
+        # Pending registered, not yet mapped (awaits SSE claim).
+        self.assertIn("c1", self.bridge.pending_mm_sessions)
+        pending = self.bridge.pending_mm_sessions["c1"]
+        self.assertFalse(
+            pending.allow_first_message_config,
+            "engagement sessions must not re-enter the first-message config gate",
+        )
+        # No welcome message for engagement — the response is the welcome.
+        self.assertEqual(self.bridge.mm.posted, [])
+
+    async def test_non_mention_ignored_under_mention_only_default(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "just chatting with my team",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.created, [])
+        self.assertNotIn("c1", self.bridge.pending_mm_sessions)
+
+    async def test_autorespond_purpose_engages_on_any_message(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "no mention at all",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(
+            self.bridge.vd.created[0]["message"], "no mention at all",
+        )
+
+    async def test_mention_with_pure_config_applies_without_session(self):
+        """`@claude autorespond` on an auto-joined channel should configure, not engage."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude autorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        # No VD session created — message was pure config.
+        self.assertEqual(self.bridge.vd.created, [])
+        self.assertNotIn("c1", self.bridge.pending_mm_sessions)
+        # Purpose cached + persisted.
+        self.assertIn("c1", self.bridge.purpose_by_channel)
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
+        # Confirmation posted.
+        self.assertEqual(len(self.bridge.mm.posted), 1)
+        self.assertIn("Config applied", self.bridge.mm.posted[0].message)
+
+    async def test_mention_with_config_alias_spelling(self):
+        """Accept `autoresponse` / `noautoresponse` spelling variants."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude noautoresponse",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.created, [])
+        self.assertIn("c1", self.bridge.purpose_by_channel)
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+
+    async def test_mention_with_chat_still_engages(self):
+        """Chat text with unknown tokens should still start a session."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude hello there",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.created[0]["message"], "hello there")
+
+    async def test_engagement_disabled_when_auto_join_disabled(self):
+        self.config.auto_join_public_channels = False
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "no mention at all",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.created, [])
 
 
 if __name__ == "__main__":

@@ -30,6 +30,10 @@ VD_TITLE_MAX = 200
 
 _CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _LEAVE_CMD_RE = re.compile(r"^@claude\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
+_STOP_CMD_RE = re.compile(r"^@claude\s+stop\s*$", re.IGNORECASE)
+_RUNTIME_TOGGLE_RE = re.compile(
+    r"^(autorespond|noautorespond|autoresponse|noautoresponse)$", re.IGNORECASE,
+)
 
 
 @dataclass
@@ -47,6 +51,11 @@ class PendingMattermostSession:
     fork_thread_channel: str | None = None
     fork_thread_root: str | None = None
     queued_messages: list[str] = field(default_factory=list)
+    # Whether the next user post in this channel may be parsed as a
+    # Channel Purpose reconfiguration. True for explicit invites, false
+    # for engagement-triggered sessions in auto-joined channels (the
+    # engagement message is already the user's first real post).
+    allow_first_message_config: bool = True
 
 
 def _extract_text_from_blocks(blocks: list[dict]) -> str:
@@ -177,6 +186,16 @@ class Bridge:
         self.dead_threads: set[tuple[str, str]] = set()
         self.last_channel_state: dict[str, dict] = {}
         self.last_status_ts: dict[str, float] = {}
+        # Channels waiting on their first user message; those messages are
+        # parsed as config tokens when possible.
+        self.awaiting_first_message: set[str] = set()
+        # Channel purposes we just wrote ourselves, so the subsequent
+        # `channel_updated` event doesn't trigger a spurious change notice.
+        self._self_written_purpose: dict[str, str] = {}
+        # Channels we joined ourselves (auto-join). The resulting
+        # `user_added` event must not trigger a new VD session — presence
+        # should be silent until a user engages.
+        self._self_joined_channels: set[str] = set()
         self._max_file_size: int | None = None
 
     # ----- lifecycle -----
@@ -200,6 +219,7 @@ class Bridge:
             self._run_mm_listener(),
             self._run_vd_listener(),
             self._run_typing_watchdog(),
+            self._run_auto_join_reconciler(),
         )
 
     async def stop(self) -> None:
@@ -216,7 +236,56 @@ class Bridge:
             "user_added": self._on_mm_user_added,
             "user_removed": self._on_mm_user_removed,
             "channel_updated": self._on_mm_channel_updated,
+            "channel_created": self._on_mm_channel_created,
         })
+
+    async def _run_auto_join_reconciler(self) -> None:
+        """Periodically join all public team channels the bot is missing.
+
+        No-op when `auto_join_public_channels` is disabled. Runs forever;
+        each iteration's failures are logged but don't stop the loop.
+        """
+        if not self.config.auto_join_public_channels:
+            return
+        while True:
+            try:
+                await self._reconcile_auto_join_once()
+            except Exception:
+                logger.exception("auto-join reconciler iteration failed")
+            await asyncio.sleep(self.config.auto_join_reconcile_seconds)
+
+    async def _reconcile_auto_join_once(self) -> None:
+        """One reconciler sweep — join each missing public channel, one by one.
+
+        The mark-then-join order matters: the MM server dispatches
+        `user_added` over WS the moment the HTTP join lands, and the event
+        arrives on the main asyncio loop. If we marked after the join, the
+        event could race in and spawn a VD session before the bridge knows
+        the join was self-initiated. Marking first closes that window.
+        """
+        bot_ids = await asyncio.to_thread(self.mm.get_bot_channel_ids)
+        public = await asyncio.to_thread(self.mm.list_public_team_channels)
+        joined = 0
+        for ch in public:
+            cid = ch["id"]
+            if cid in bot_ids:
+                continue
+            self._self_joined_channels.add(cid)
+            try:
+                await asyncio.to_thread(self.mm.join_channel, cid)
+                joined += 1
+                logger.info(
+                    "Auto-joined channel: %s (%s)",
+                    ch.get("display_name") or cid, cid,
+                )
+            except Exception:
+                self._self_joined_channels.discard(cid)
+                logger.warning(
+                    "Failed to auto-join %s (%s)", ch.get("display_name") or cid, cid,
+                    exc_info=True,
+                )
+        if joined:
+            logger.info("Auto-join reconciler joined %d channel(s)", joined)
 
     async def _run_vd_listener(self) -> None:
         logger.info("Starting VibeDeck SSE listener...")
@@ -262,6 +331,26 @@ class Bridge:
             pending = self.pending_mm_sessions.get(channel_id)
             if pending:
                 pending.queued_messages.append(message)
+                return
+            # Auto-joined channel: session starts on first engagement.
+            if self.config.auto_join_public_channels:
+                await self._maybe_start_engagement_session(
+                    channel_id, post, message,
+                )
+            return
+
+        # First-message-after-invite: optionally reconfigure via plain tokens.
+        if channel_id in self.awaiting_first_message:
+            self.awaiting_first_message.discard(channel_id)
+            applied = await self._try_apply_first_message_config(
+                channel_id, session_id, message,
+            )
+            if applied:
+                return
+
+        # Runtime toggle (literal `autorespond` / `noautorespond`, nothing else).
+        if _RUNTIME_TOGGLE_RE.match(message):
+            await self._run_runtime_toggle(channel_id, message)
             return
 
         # Command: @claude catch up
@@ -274,6 +363,10 @@ class Bridge:
                 channel_id, session_id, thread_root=None, reason=(m.group(1) or "").strip(),
             )
             return
+        # Command: @claude stop
+        if _STOP_CMD_RE.match(message):
+            await self._run_stop_command(channel_id, session_id, thread_root=None)
+            return
 
         await self._forward_user_post(
             channel_id, session_id, post, message, thread_root=None,
@@ -282,12 +375,125 @@ class Bridge:
     async def _on_mm_user_added(self, channel_id: str, user_id: str) -> None:
         if user_id != self.mm.bot_user_id:
             return
+        # Self-initiated auto-join — silent presence, no session.
+        if channel_id in self._self_joined_channels:
+            self._self_joined_channels.discard(channel_id)
+            logger.info("Auto-joined %s — silent presence (no session until engagement)", channel_id)
+            return
         if self.mapping.get_session(channel_id):
             logger.info("Bot already mapped for channel %s — skipping", channel_id)
             return
         if channel_id in self.pending_mm_sessions:
             return
         await self._start_invited_session(channel_id)
+
+    async def _maybe_start_engagement_session(
+        self,
+        channel_id: str,
+        post: dict,
+        message: str,
+    ) -> None:
+        """Start a VD session on first user engagement in an auto-joined channel.
+
+        "Engagement" depends on the channel's effective config:
+          - mention-only  → require an `@claude` / `@<bot>` mention
+          - autorespond   → any non-empty message qualifies
+
+        The engagement message itself becomes the session's first VD message
+        (stripped of bot mention). Skips the first-message-config gate — the
+        user is clearly talking, not configuring.
+        """
+        try:
+            ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
+        except Exception:
+            logger.exception("Failed to fetch channel %s for engagement", channel_id)
+            return
+        purpose_text = ch.get("purpose", "") or ""
+
+        models_by_backend = await self._models_for_known_backends()
+        cfg = purpose.parse(
+            purpose_text,
+            self.config.default_backend,
+            self.config.default_model,
+            lambda b: models_by_backend.get(b, []),
+            default_autorespond=self.config.default_autorespond,
+        )
+
+        bot_mention = f"@{self.mm.bot_username}"
+        mentioned = bot_mention in message or "@claude" in message.lower()
+        if cfg.mention_only and not mentioned:
+            return  # silent — not engaging
+
+        cleaned = (
+            message.replace(bot_mention, "").replace("@claude", "").strip()
+        )
+        if not cleaned and not post.get("file_ids"):
+            return
+
+        # If the very first engagement message is pure purpose tokens
+        # (e.g. `@claude autorespond`, `@claude claude, sonnet`), apply
+        # it as channel config without starting a session. The next
+        # engagement message will start the session with these settings.
+        if cleaned and self._try_apply_pre_session_config(
+            channel_id, cleaned, models_by_backend,
+        ):
+            return
+
+        initial = cleaned or INVITE_PLACEHOLDER
+
+        await self._start_invited_session(
+            channel_id,
+            initial_message=initial,
+            allow_first_message_config=False,
+            post_welcome=False,
+            exclude_post_id=post.get("id"),
+        )
+
+    def _try_apply_pre_session_config(
+        self,
+        channel_id: str,
+        candidate: str,
+        models_by_backend: dict[str, list[str]],
+    ) -> bool:
+        """If `candidate` parses cleanly as purpose tokens, apply without starting a session.
+
+        Returns True when the message was consumed as config. Mirrors
+        `_try_apply_first_message_config` but never triggers a session
+        restart — there is no session yet.
+        """
+        parsed = purpose.parse(
+            candidate,
+            self.config.default_backend,
+            self.config.default_model,
+            lambda b: models_by_backend.get(b, []),
+            default_autorespond=self.config.default_autorespond,
+        )
+        if parsed.warnings:
+            return False
+        if not candidate.replace(",", " ").split():
+            return False
+
+        current = self.purpose_by_channel.get(channel_id)
+        merged = self._merge_configs(current, parsed)
+        self.purpose_by_channel[channel_id] = merged
+        self._persist_purpose(channel_id, merged)
+        self._post_config_confirmation(channel_id, merged, restarted=False)
+        return True
+
+    async def _on_mm_channel_created(self, channel_id: str) -> None:
+        """New channel appeared — join it if auto-join is enabled."""
+        if not self.config.auto_join_public_channels:
+            return
+        self._self_joined_channels.add(channel_id)
+        try:
+            await asyncio.to_thread(self.mm.join_channel, channel_id)
+            logger.info("Auto-joined newly-created channel %s", channel_id)
+        except Exception:
+            self._self_joined_channels.discard(channel_id)
+            logger.warning(
+                "Failed to auto-join newly-created channel %s", channel_id,
+                exc_info=True,
+            )
 
     async def _on_mm_user_removed(self, channel_id: str, user_id: str) -> None:
         if user_id != self.mm.bot_user_id:
@@ -332,8 +538,12 @@ class Bridge:
                         session_id[:8], exc_info=True,
                     )
 
-        # Purpose change (only emit notice if actually changed)
+        # Purpose change (only emit notice if actually changed AND we didn't
+        # write it ourselves).
         if prev and prev.get("purpose") != new_purpose:
+            self_written = self._self_written_purpose.pop(channel_id, None)
+            if self_written is not None and self_written == new_purpose:
+                return
             try:
                 self.mm.post_message(
                     channel_id,
@@ -346,7 +556,15 @@ class Bridge:
 
     # ─────────────────────── Invite → new session ──────────────────────────
 
-    async def _start_invited_session(self, channel_id: str) -> None:
+    async def _start_invited_session(
+        self,
+        channel_id: str,
+        *,
+        initial_message: str = INVITE_PLACEHOLDER,
+        allow_first_message_config: bool = True,
+        post_welcome: bool = True,
+        exclude_post_id: str | None = None,
+    ) -> None:
         try:
             ch = self.mm.get_channel(channel_id)
         except Exception:
@@ -368,6 +586,7 @@ class Bridge:
             self.config.default_backend,
             self.config.default_model,
             lambda b: models_by_backend.get(b, []),
+            default_autorespond=self.config.default_autorespond,
         )
 
         effective_cwd = self._resolve_purpose_cwd(cfg)
@@ -385,6 +604,12 @@ class Bridge:
                     model_index = i
                     break
 
+        # Prepend the last N messages as catch-up context so the session
+        # doesn't start cold. Only applies to brand-new sessions (not restarts).
+        effective_initial = self._prepend_catch_up(
+            channel_id, initial_message, exclude_post_id=exclude_post_id,
+        )
+
         # Register pending BEFORE create_session: VD emits `session_added`
         # over SSE before the HTTP response lands, so if we registered after
         # the await, _on_vd_session_added would find no pending invite and
@@ -393,15 +618,16 @@ class Bridge:
             channel_id=channel_id,
             cwd=effective_cwd,
             backend=cfg.backend,
-            initial_message=INVITE_PLACEHOLDER,
+            initial_message=effective_initial,
             requested_at=time.monotonic(),
             purpose_cfg=cfg,
+            allow_first_message_config=allow_first_message_config,
         )
         self.purpose_by_channel[channel_id] = cfg
 
         try:
             resp = await self.vd.create_session(
-                message=INVITE_PLACEHOLDER,
+                message=effective_initial,
                 cwd=effective_cwd,
                 backend=cfg.backend,
                 model_index=model_index,
@@ -443,11 +669,12 @@ class Bridge:
         if pending is not None:
             pending.cwd = cwd
 
-        welcome = self._format_welcome(cfg, cwd)
-        try:
-            self.mm.post_message(channel_id, welcome)
-        except Exception:
-            logger.warning("Failed to post welcome message", exc_info=True)
+        if post_welcome:
+            welcome = self._format_welcome(cfg, cwd)
+            try:
+                self.mm.post_message(channel_id, welcome)
+            except Exception:
+                logger.warning("Failed to post welcome message", exc_info=True)
 
     def _resolve_purpose_cwd(self, cfg: purpose.PurposeConfig) -> str:
         """Apply `cwd=` from the Channel Purpose, falling back to the default.
@@ -474,6 +701,231 @@ class Bridge:
         logger.info("Channel Purpose cwd override → %s", resolved)
         return str(resolved)
 
+    # ─────────────────── First-message config + runtime toggle ─────────────
+
+    async def _try_apply_first_message_config(
+        self,
+        channel_id: str,
+        session_id: str,
+        message: str,
+    ) -> bool:
+        """If `message` parses cleanly as Channel Purpose tokens, apply it.
+
+        Returns True when the message was consumed as config (caller should
+        not forward it) and False when it should be treated as a normal
+        message.
+
+        A "clean parse" means no warnings and the tokenised form is non-empty
+        — so e.g. ``hello world`` is not config, but ``claude, haiku``,
+        ``autorespond``, or ``cwd=/foo`` are.
+        """
+        candidate = message.strip()
+        if not candidate:
+            return False
+
+        models_by_backend: dict[str, list[str]] = {}
+        for b in purpose.KNOWN_BACKENDS:
+            try:
+                models_by_backend[b] = await self.vd.list_models(b)
+            except Exception:
+                models_by_backend[b] = []
+
+        parsed = purpose.parse(
+            candidate,
+            self.config.default_backend,
+            self.config.default_model,
+            lambda b: models_by_backend.get(b, []),
+            default_autorespond=self.config.default_autorespond,
+        )
+        # Unknown tokens → parser attaches warnings. Unless ALL tokens were
+        # known, bail out and treat the message as text.
+        if parsed.warnings:
+            return False
+        if not candidate.replace(",", " ").split():
+            return False
+
+        # Merge: start from the current purpose (if any) so flags stick
+        # unless the new tokens override them.
+        current = self.purpose_by_channel.get(channel_id)
+        merged = self._merge_configs(current, parsed)
+
+        current_cwd = current.cwd if current else None
+        needs_restart = bool(
+            current and (
+                merged.backend != current.backend
+                or merged.model != current.model
+                or merged.cwd != current_cwd
+            )
+        )
+
+        if needs_restart:
+            await self._restart_session_with_config(channel_id, session_id, merged)
+        else:
+            self.purpose_by_channel[channel_id] = merged
+
+        self._persist_purpose(channel_id, merged)
+        self._post_config_confirmation(channel_id, merged, restarted=needs_restart)
+        return True
+
+    def _merge_configs(
+        self,
+        current: purpose.PurposeConfig | None,
+        new: purpose.PurposeConfig,
+    ) -> purpose.PurposeConfig:
+        """Layer `new` on top of `current`. Any field explicitly set by the
+        new parse wins; omitted fields fall back to current."""
+        if current is None:
+            return new
+        return purpose.PurposeConfig(
+            backend=new.backend,
+            model=new.model if new.model is not None else current.model,
+            mention_only=new.mention_only,
+            cwd=new.cwd if new.cwd is not None else current.cwd,
+            warnings=[],
+        )
+
+    async def _restart_session_with_config(
+        self,
+        channel_id: str,
+        old_session_id: str,
+        cfg: purpose.PurposeConfig,
+    ) -> None:
+        """Tear down the current session for `channel_id` and start a new one.
+
+        We keep the MM channel and mapping slot; only the VD session is
+        replaced. The old session is abandoned (no explicit VD-side delete).
+        """
+        self.mapping.unlink_channel(channel_id)
+        self.posters.forget(old_session_id)
+        if self.typing:
+            await self.typing.stop(old_session_id)
+        effective_cwd = self._resolve_purpose_cwd(cfg)
+
+        models_by_backend = await self._models_for_known_backends()
+        model_index = self._resolve_model_index(cfg, models_by_backend)
+
+        self.pending_mm_sessions[channel_id] = PendingMattermostSession(
+            channel_id=channel_id,
+            cwd=effective_cwd,
+            backend=cfg.backend,
+            initial_message=INVITE_PLACEHOLDER,
+            requested_at=time.monotonic(),
+            purpose_cfg=cfg,
+        )
+        self.purpose_by_channel[channel_id] = cfg
+
+        try:
+            resp = await self.vd.create_session(
+                message=INVITE_PLACEHOLDER,
+                cwd=effective_cwd,
+                backend=cfg.backend,
+                model_index=model_index,
+            )
+        except Exception:
+            logger.exception("Failed to restart VD session for %s", channel_id)
+            self.pending_mm_sessions.pop(channel_id, None)
+            try:
+                self.mm.post_message(
+                    channel_id,
+                    ":warning: Failed to restart the VibeDeck session.",
+                )
+            except Exception:
+                pass
+            return
+
+        pending = self.pending_mm_sessions.get(channel_id)
+        if pending is not None:
+            pending.cwd = resp.get("cwd") or effective_cwd
+
+    async def _models_for_known_backends(self) -> dict[str, list[str]]:
+        models: dict[str, list[str]] = {}
+        for b in purpose.KNOWN_BACKENDS:
+            try:
+                models[b] = await self.vd.list_models(b)
+            except Exception:
+                models[b] = []
+        return models
+
+    def _resolve_model_index(
+        self, cfg: purpose.PurposeConfig, models_by_backend: dict[str, list[str]],
+    ) -> int | None:
+        if not cfg.model:
+            return None
+        for i, m in enumerate(models_by_backend.get(cfg.backend, [])):
+            if m.lower() == cfg.model.lower():
+                return i
+        return None
+
+    async def _run_runtime_toggle(self, channel_id: str, message: str) -> None:
+        """Handle a literal `autorespond` / `noautorespond` message.
+
+        Flips the channel's mention_only flag and persists to Channel Purpose.
+        Does not forward the token.
+        """
+        turn_on_autorespond = message.strip().lower() in purpose.AUTORESPOND_ALIASES
+        current = self.purpose_by_channel.get(channel_id) or purpose.PurposeConfig(
+            backend=self.config.default_backend,
+            model=self.config.default_model,
+            mention_only=not self.config.default_autorespond,
+        )
+        updated = purpose.PurposeConfig(
+            backend=current.backend,
+            model=current.model,
+            mention_only=not turn_on_autorespond,
+            cwd=current.cwd,
+            warnings=[],
+        )
+        self.purpose_by_channel[channel_id] = updated
+        self._persist_purpose(channel_id, updated)
+        note = (
+            ":loud_sound: _Autorespond on — I'll reply to every message._"
+            if turn_on_autorespond
+            else ":mute: _Mention-only — @mention me to talk._"
+        )
+        try:
+            self.mm.post_message(channel_id, note)
+        except Exception:
+            logger.debug("failed posting runtime-toggle confirmation", exc_info=True)
+
+    def _persist_purpose(
+        self, channel_id: str, cfg: purpose.PurposeConfig,
+    ) -> None:
+        """Write the canonical form of `cfg` back to the MM channel's Purpose.
+
+        Marks the resulting `channel_updated` event as self-triggered so the
+        bridge doesn't post a "purpose changed" notice to itself.
+        """
+        serialized = purpose.to_purpose_string(
+            cfg, default_autorespond=self.config.default_autorespond,
+        )
+        self._note_self_wrote_purpose(channel_id, serialized)
+        try:
+            self.mm.set_channel_purpose(channel_id, serialized)
+        except Exception:
+            logger.warning(
+                "Failed to persist Channel Purpose for %s", channel_id, exc_info=True,
+            )
+
+    def _note_self_wrote_purpose(self, channel_id: str, purpose_text: str) -> None:
+        self._self_written_purpose[channel_id] = purpose_text
+
+    def _post_config_confirmation(
+        self,
+        channel_id: str,
+        cfg: purpose.PurposeConfig,
+        *,
+        restarted: bool,
+    ) -> None:
+        head = f"backend: `{cfg.backend}`, model: `{cfg.model or 'default'}`"
+        flag = "mention-only" if cfg.mention_only else "autorespond"
+        cwd_note = f", cwd: `{cfg.cwd}`" if cfg.cwd else ""
+        suffix = " (session restarted)" if restarted else ""
+        note = f":gear: _Config applied — {head}, {flag}{cwd_note}._{suffix}"
+        try:
+            self.mm.post_message(channel_id, note)
+        except Exception:
+            logger.debug("failed posting config confirmation", exc_info=True)
+
     def _format_welcome(self, cfg: purpose.PurposeConfig, cwd: str) -> str:
         parts = [
             f"*Session started — backend: `{cfg.backend}`",
@@ -488,7 +940,12 @@ class Bridge:
         )
         if cfg.mention_only:
             hint = f"_mention-only mode — @mention me to talk._\n{hint}"
-        return f"{head}\n\n{hint}"
+        config_hint = (
+            "_First message can reconfigure: send e.g. `claude, sonnet, "
+            "autorespond` to switch. After that, the literal word "
+            "`autorespond` or `noautorespond` toggles auto-reply._"
+        )
+        return f"{head}\n\n{hint}\n\n{config_hint}"
 
     # ─────────────────────── Forwarding user posts ─────────────────────────
 
@@ -582,6 +1039,11 @@ class Bridge:
             if cm := _CATCH_UP_RE.match(message):
                 await self._run_catch_up(channel_id, thread_session, root_id, cm)
                 return
+            if _STOP_CMD_RE.match(message):
+                await self._run_stop_command(
+                    channel_id, thread_session, thread_root=root_id,
+                )
+                return
             await self._forward_user_post(
                 channel_id, thread_session, post, message, thread_root=root_id,
             )
@@ -671,6 +1133,68 @@ class Bridge:
 
     # ─────────────────────── Catch-up & leave ──────────────────────────────
 
+    def _collect_catch_up_lines(
+        self,
+        channel_id: str,
+        n: int,
+        *,
+        exclude_post_id: str | None = None,
+    ) -> list[str]:
+        """Fetch up to `n` user messages from a channel, oldest-first, as
+        `username: message` lines. Skips bot posts, system posts, and any
+        `@claude catch up` commands themselves.
+        """
+        try:
+            posts = self.mm.get_posts(channel_id, max(n + 2, 1))
+        except Exception:
+            logger.exception("get_posts failed for catch-up")
+            return []
+
+        lines: list[str] = []
+        for p in posts:
+            if exclude_post_id and p.get("id") == exclude_post_id:
+                continue
+            if p.get("user_id") == self.mm.bot_user_id:
+                continue
+            if _is_mm_system_post(p):
+                continue
+            if _CATCH_UP_RE.match((p.get("message") or "").strip()):
+                continue
+            username = self._resolve_username(p.get("user_id", ""))
+            lines.append(f"{username}: {p.get('message', '')}")
+            if len(lines) >= n:
+                break
+        return lines
+
+    @staticmethod
+    def _format_catch_up_block(lines: list[str]) -> str:
+        return (
+            f"[Catch-up context — last {len(lines)} messages from this channel, oldest first]\n"
+            + "\n".join(lines) + "\n[End of catch-up]"
+        )
+
+    def _prepend_catch_up(
+        self,
+        channel_id: str,
+        initial_message: str,
+        *,
+        exclude_post_id: str | None = None,
+    ) -> str:
+        """Prepend the channel's recent history to `initial_message` when the
+        `initial_catch_up_n` config is enabled and there's actual history to
+        quote. Returns `initial_message` unchanged when the block is empty.
+        """
+        n = self.config.initial_catch_up_n
+        if n <= 0:
+            return initial_message
+        lines = self._collect_catch_up_lines(
+            channel_id, n, exclude_post_id=exclude_post_id,
+        )
+        if not lines:
+            return initial_message
+        block = self._format_catch_up_block(lines)
+        return f"{block}\n\n{initial_message}"
+
     async def _run_catch_up(
         self,
         channel_id: str,
@@ -685,29 +1209,8 @@ class Bridge:
             n = self.config.catch_up_max_n
             clamped = True
 
-        try:
-            posts = self.mm.get_posts(channel_id, max(n + 1, 1))
-        except Exception:
-            logger.exception("get_posts failed for catch-up")
-            return
-
-        lines: list[str] = []
-        for p in posts:
-            if p.get("user_id") == self.mm.bot_user_id:
-                continue
-            if _is_mm_system_post(p):
-                continue
-            if _CATCH_UP_RE.match((p.get("message") or "").strip()):
-                continue
-            username = self._resolve_username(p.get("user_id", ""))
-            lines.append(f"{username}: {p.get('message', '')}")
-            if len(lines) >= n:
-                break
-
-        block = (
-            f"[Catch-up context — last {len(lines)} messages from this channel, oldest first]\n"
-            + "\n".join(lines) + "\n[End of catch-up]"
-        )
+        lines = self._collect_catch_up_lines(channel_id, n)
+        block = self._format_catch_up_block(lines)
 
         try:
             await self.vd.send_message(session_id, block)
@@ -757,6 +1260,33 @@ class Bridge:
             else "Leaving — invite me back any time for a fresh session."
         )
         await self._leave_channel(channel_id, session_id, farewell)
+
+    async def _run_stop_command(
+        self,
+        channel_id: str,
+        session_id: str,
+        thread_root: str | None,
+    ) -> None:
+        try:
+            await self.vd.interrupt_session(session_id)
+        except Exception:
+            logger.exception("Failed to interrupt VD session %s", session_id[:8])
+            try:
+                self.mm.post(
+                    channel_id,
+                    ":warning: Couldn't interrupt the session.",
+                    root_id=thread_root,
+                )
+            except Exception:
+                pass
+            return
+        if self.typing:
+            await self.typing.stop(session_id)
+        logger.info("MM → VD [%s]: stop (interrupt)", session_id[:8])
+        try:
+            self.mm.post(channel_id, ":octagonal_sign: Stopped.", root_id=thread_root)
+        except Exception:
+            pass
 
     async def _leave_channel(
         self,
@@ -861,6 +1391,8 @@ class Bridge:
         channel_id, pending = candidates[0]
         self.mapping.link(channel_id, session_id)
         self.pending_mm_sessions.pop(channel_id, None)
+        if pending.allow_first_message_config:
+            self.awaiting_first_message.add(channel_id)
         logger.info("Claimed pending invite: channel %s → session %s",
                     channel_id, session_id[:8])
         await self._flush_queued(channel_id, session_id, pending)

@@ -15,7 +15,9 @@ logger = logging.getLogger(__name__)
 
 
 # WebSocket events the bridge dispatches on.
-_HANDLED_EVENTS = {"posted", "user_added", "user_removed", "channel_updated"}
+_HANDLED_EVENTS = {
+    "posted", "user_added", "user_removed", "channel_updated", "channel_created",
+}
 
 
 class MattermostClient:
@@ -125,6 +127,9 @@ class MattermostClient:
     def set_channel_header(self, channel_id: str, header: str) -> None:
         self._driver.channels.patch_channel(channel_id, options={"header": header})
 
+    def set_channel_purpose(self, channel_id: str, purpose: str) -> None:
+        self._driver.channels.patch_channel(channel_id, options={"purpose": purpose})
+
     def rename_channel(self, channel_id: str, display_name: str) -> None:
         self._driver.channels.patch_channel(channel_id, options={
             "display_name": display_name,
@@ -136,6 +141,49 @@ class MattermostClient:
     def remove_self_from_channel(self, channel_id: str) -> None:
         """Remove the bot from a channel."""
         self._driver.channels.remove_channel_member(channel_id, self._bot_user_id)
+
+    def get_bot_channel_ids(self) -> set[str]:
+        """Return the set of channel IDs the bot currently belongs to in its team."""
+        channels = self._driver.channels.get_channels_for_team_for_user(
+            self._bot_user_id, self._team_id,
+        )
+        return {c["id"] for c in channels}
+
+    def list_public_team_channels(self) -> list[dict]:
+        """List all public channels in the bot's team."""
+        return self._driver.channels.get_public_channels_for_team(self._team_id)
+
+    def join_channel(self, channel_id: str) -> None:
+        """Add the bot to `channel_id`."""
+        self._driver.channels.add_channel_member(channel_id, options={
+            "user_id": self._bot_user_id,
+        })
+
+    def join_all_public_team_channels(self) -> list[str]:
+        """Join every public team channel the bot isn't already in.
+
+        Returns the list of channel IDs newly joined. Per-channel failures
+        are logged but don't abort the batch.
+        """
+        already = self.get_bot_channel_ids()
+        joined: list[str] = []
+        for ch in self.list_public_team_channels():
+            cid = ch["id"]
+            if cid in already:
+                continue
+            try:
+                self.join_channel(cid)
+                joined.append(cid)
+                logger.info(
+                    "Auto-joined channel: %s (%s)",
+                    ch.get("display_name") or cid, cid,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to auto-join channel %s (%s): %s",
+                    ch.get("display_name") or cid, cid, exc,
+                )
+        return joined
 
     # ----- users -----
 
@@ -196,6 +244,7 @@ class MattermostClient:
           - "user_added"      → fn(channel_id: str, user_id: str)
           - "user_removed"    → fn(channel_id: str, user_id: str)
           - "channel_updated" → fn(channel: dict)
+          - "channel_created" → fn(channel_id: str)
 
         The bot's own `posted` events are filtered before dispatch.
         """
@@ -298,5 +347,16 @@ class MattermostClient:
                     channel = channel_json if isinstance(channel_json, dict) else None
                 if channel:
                     await handler(channel)
+
+            elif event_type == "channel_created":
+                handler = handlers.get("channel_created")
+                if not handler:
+                    return
+                channel_id = (
+                    data.get("channel_id")
+                    or broadcast.get("channel_id")
+                )
+                if channel_id:
+                    await handler(channel_id)
         except Exception:
             logger.exception("handler for %s failed", event_type)
