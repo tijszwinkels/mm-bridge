@@ -298,6 +298,52 @@ class InviteFlowTests(_BridgeTestCase):
         # No orphan auto-channel created by _create_channel_for_session
         self.assertEqual(self.bridge.mm.channels, {"c1": {"id": "c1", "purpose": ""}})
 
+    async def test_invite_sets_vd_session_title_from_mm_display_name(self):
+        """On claim, the VD session title mirrors the MM channel's display_name."""
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "", "display_name": "My Project Discussion",
+        }
+
+        orig_create = self.bridge.vd.create_session
+
+        async def racing_create(**kwargs):
+            await self.bridge._on_vd_session_added({
+                "id": "s-new",
+                "projectPath": kwargs["cwd"],
+                "backend": kwargs.get("backend") or "claude",
+                "firstMessage": "Hello! I've just been added",
+            })
+            return await orig_create(**kwargs)
+
+        self.bridge.vd.create_session = racing_create
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertIn(("s-new", "My Project Discussion"), self.bridge.vd.titles)
+
+    async def test_invite_claim_skips_title_when_display_name_empty(self):
+        """Blank display_name → no title set (leave VD's default)."""
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "", "display_name": "",
+        }
+
+        orig_create = self.bridge.vd.create_session
+
+        async def racing_create(**kwargs):
+            await self.bridge._on_vd_session_added({
+                "id": "s-new",
+                "projectPath": kwargs["cwd"],
+                "backend": kwargs.get("backend") or "claude",
+                "firstMessage": "Hello! I've just been added",
+            })
+            return await orig_create(**kwargs)
+
+        self.bridge.vd.create_session = racing_create
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.vd.titles, [])
+
     async def test_bot_invited_to_mapped_channel_is_noop(self):
         self.bridge.mapping.link("c1", "s1")
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}

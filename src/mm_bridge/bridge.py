@@ -56,6 +56,9 @@ class PendingMattermostSession:
     # for engagement-triggered sessions in auto-joined channels (the
     # engagement message is already the user's first real post).
     allow_first_message_config: bool = True
+    # MM channel display_name at invite time, used to seed the VD session
+    # title on claim so the VibeDeck panel mirrors the MM channel name.
+    channel_display_name: str | None = None
 
 
 def _extract_text_from_blocks(blocks: list[dict]) -> str:
@@ -571,6 +574,7 @@ class Bridge:
             logger.exception("Failed to fetch channel %s on invite", channel_id)
             return
         purpose_text = ch.get("purpose", "") or ""
+        display_name = (ch.get("display_name") or "").strip() or None
 
         # purpose.parse takes a sync callable; preload model lists so the
         # callable can just dict-lookup.
@@ -622,6 +626,7 @@ class Bridge:
             requested_at=time.monotonic(),
             purpose_cfg=cfg,
             allow_first_message_config=allow_first_message_config,
+            channel_display_name=display_name,
         )
         self.purpose_by_channel[channel_id] = cfg
 
@@ -1395,6 +1400,16 @@ class Bridge:
             self.awaiting_first_message.add(channel_id)
         logger.info("Claimed pending invite: channel %s → session %s",
                     channel_id, session_id[:8])
+        if pending.channel_display_name:
+            try:
+                await self.vd.set_session_title(
+                    session_id, pending.channel_display_name,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to seed VD session title for %s", session_id[:8],
+                    exc_info=True,
+                )
         await self._flush_queued(channel_id, session_id, pending)
         return True
 
