@@ -36,6 +36,8 @@ class FakeMattermostClient:
     users: dict = field(default_factory=dict)
     posts_by_channel: dict = field(default_factory=dict)
     posts_by_id: dict = field(default_factory=dict)
+    files_by_id: dict = field(default_factory=dict)
+    download_failures: set = field(default_factory=set)
 
     def login(self) -> None:
         pass
@@ -81,6 +83,11 @@ class FakeMattermostClient:
         fid = f"f-{len(self.uploaded)}"
         self.uploaded.append((channel_id, str(path)))
         return fid
+
+    def download_file(self, file_id: str) -> bytes:
+        if file_id in self.download_failures:
+            raise RuntimeError(f"simulated download failure for {file_id}")
+        return self.files_by_id.get(file_id, b"")
 
     def get_max_file_size(self) -> int:
         return 50 * 1024 * 1024
@@ -287,6 +294,130 @@ class ForwardingTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
         self.assertEqual(self.bridge.vd.sent, [("s1", "help please")])
+
+
+class InboundAttachmentTests(_BridgeTestCase):
+    """User attaches files in MM → bridge downloads them into the session cwd."""
+
+    def _set_session_cwd(self, session_id: str, cwd: str) -> None:
+        self.bridge.vd.sessions_meta.append(
+            {"id": session_id, "projectPath": cwd, "backend": "claude"},
+        )
+
+    def _post_with_attachment(
+        self, channel_id: str, file_id: str, name: str, body: bytes, *,
+        message: str = "", root_id: str | None = None,
+    ) -> dict:
+        self.bridge.mm.files_by_id[file_id] = body
+        return {
+            "channel_id": channel_id,
+            "message": message,
+            "user_id": "u1",
+            "type": "",
+            "root_id": root_id or "",
+            "file_ids": [file_id],
+            "metadata": {"files": [{"id": file_id, "name": name, "size": len(body)}]},
+        }
+
+    async def test_attachment_saved_to_inbox_and_note_prepended(self):
+        from pathlib import Path
+        self.bridge.mapping.link("c1", "s1")
+        self._set_session_cwd("s1", self.tmp.name)
+
+        post = self._post_with_attachment(
+            "c1", "fid-1", "notes.md", b"# hello\n", message="please look at this",
+        )
+        await self.bridge._on_mm_posted(post)
+
+        saved = Path(self.tmp.name) / ".mattermost-inbox" / "notes.md"
+        self.assertTrue(saved.exists())
+        self.assertEqual(saved.read_bytes(), b"# hello\n")
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        sent_body = self.bridge.vd.sent[0][1]
+        self.assertIn(f"[User attached file: {saved}]", sent_body)
+        self.assertIn("please look at this", sent_body)
+        self.assertTrue(sent_body.startswith("[User attached file: "))
+
+    async def test_attachment_only_post_still_forwards(self):
+        from pathlib import Path
+        self.bridge.mapping.link("c1", "s1")
+        self._set_session_cwd("s1", self.tmp.name)
+
+        post = self._post_with_attachment("c1", "fid-1", "photo.png", b"\x89PNG...")
+        await self.bridge._on_mm_posted(post)
+
+        saved = Path(self.tmp.name) / ".mattermost-inbox" / "photo.png"
+        self.assertTrue(saved.exists())
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        self.assertIn(f"[User attached file: {saved}]", self.bridge.vd.sent[0][1])
+
+    async def test_filename_conflict_gets_suffix(self):
+        from pathlib import Path
+        self.bridge.mapping.link("c1", "s1")
+        self._set_session_cwd("s1", self.tmp.name)
+        existing = Path(self.tmp.name) / ".mattermost-inbox"
+        existing.mkdir()
+        (existing / "data.txt").write_bytes(b"original")
+
+        post = self._post_with_attachment("c1", "fid-1", "data.txt", b"second")
+        await self.bridge._on_mm_posted(post)
+
+        self.assertEqual((existing / "data.txt").read_bytes(), b"original")
+        self.assertEqual((existing / "data-1.txt").read_bytes(), b"second")
+        self.assertIn("data-1.txt", self.bridge.vd.sent[0][1])
+
+    async def test_traversal_filename_is_sanitized(self):
+        from pathlib import Path
+        self.bridge.mapping.link("c1", "s1")
+        self._set_session_cwd("s1", self.tmp.name)
+
+        post = self._post_with_attachment(
+            "c1", "fid-1", "../../etc/passwd", b"evil",
+        )
+        await self.bridge._on_mm_posted(post)
+
+        inbox = Path(self.tmp.name) / ".mattermost-inbox"
+        saved = list(inbox.iterdir())
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].parent, inbox)
+        self.assertEqual(saved[0].read_bytes(), b"evil")
+
+    async def test_download_failure_yields_skipped_note(self):
+        self.bridge.mapping.link("c1", "s1")
+        self._set_session_cwd("s1", self.tmp.name)
+        self.bridge.mm.download_failures.add("fid-bad")
+
+        post = self._post_with_attachment(
+            "c1", "fid-bad", "doc.pdf", b"unused", message="hi",
+        )
+        await self.bridge._on_mm_posted(post)
+
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        sent_body = self.bridge.vd.sent[0][1]
+        self.assertIn("[MM attachment skipped: `doc.pdf` download failed]", sent_body)
+        self.assertIn("hi", sent_body)
+
+    async def test_thread_fork_downloads_to_parent_cwd(self):
+        from pathlib import Path
+        self.bridge.mapping.link("c1", "s-parent")
+        self._set_session_cwd("s-parent", self.tmp.name)
+        self.bridge.mm.posts_by_id["root-post"] = {"message": "original msg"}
+
+        post = self._post_with_attachment(
+            "c1", "fid-t", "thread.txt", b"fork payload",
+            message="replying", root_id="root-post",
+        )
+        await self.bridge._on_mm_posted(post)
+
+        saved = Path(self.tmp.name) / ".mattermost-inbox" / "thread.txt"
+        self.assertTrue(saved.exists())
+        self.assertEqual(saved.read_bytes(), b"fork payload")
+
+        self.assertEqual(len(self.bridge.vd.forks), 1)
+        fork_body = self.bridge.vd.forks[0][1]
+        self.assertIn(f"[User attached file: {saved}]", fork_body)
+        self.assertIn("replying", fork_body)
+        self.assertIn("Mattermost thread context", fork_body)
 
 
 class CatchUpTests(_BridgeTestCase):

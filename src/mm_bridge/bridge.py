@@ -87,6 +87,29 @@ def _is_mm_system_post(post: dict) -> bool:
     return bool(post.get("type"))
 
 
+MM_INBOX_DIRNAME = ".mattermost-inbox"
+
+
+def _safe_inbox_filename(name: str, fallback: str) -> str:
+    """Sanitize a MM-supplied filename so it can't escape the inbox dir."""
+    base = Path(name or "").name.strip().lstrip(".")
+    base = base.replace("\0", "").replace("/", "_").replace("\\", "_")
+    return base or fallback
+
+
+def _unique_inbox_path(dest_dir: Path, filename: str) -> Path:
+    """Return dest_dir/filename, with -N suffix on conflict."""
+    candidate = dest_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    for n in range(1, 10_000):
+        cand = dest_dir / f"{stem}-{n}{suffix}"
+        if not cand.exists():
+            return cand
+    raise RuntimeError(f"too many filename conflicts in {dest_dir}")
+
+
 def _resolve_attachment_path(
     raw_path: str,
     project_path: str | None,
@@ -222,7 +245,7 @@ class Bridge:
         if _is_mm_system_post(post):
             return
         message = (post.get("message") or "").strip()
-        if not message:
+        if not message and not post.get("file_ids"):
             return
         channel_id = post["channel_id"]
         root_id = post.get("root_id") or None
@@ -442,18 +465,37 @@ class Bridge:
 
         # Strip the @-mention so Claude doesn't see a stray handle.
         cleaned = message.replace(bot_mention, "").replace("@claude", "").strip()
-        if not cleaned:
+
+        # Download any inbound MM attachments into the session's cwd.
+        attachment_notes: list[str] = []
+        if post.get("file_ids"):
+            try:
+                cwd = await self._project_path_for(session_id)
+            except Exception:
+                logger.exception("project-path lookup failed for %s", session_id[:8])
+                cwd = None
+            if cwd:
+                attachment_notes = await self._save_mm_attachments(post, cwd)
+            else:
+                attachment_notes = ["[MM attachment skipped: no project path for session]"]
+
+        if not cleaned and not attachment_notes:
             return
 
         user_id = post.get("user_id", "")
         attribute = self.posters.note_post(session_id, user_id)
-        if attribute:
+        if attribute and cleaned:
             username = self._resolve_username(user_id)
             cleaned = self.posters.format(cleaned, username, True)
 
-        logger.info("MM → VD [%s]: %s", session_id[:8], cleaned[:80])
+        body = cleaned
+        if attachment_notes:
+            notes_block = "\n".join(attachment_notes)
+            body = f"{notes_block}\n\n{body}" if body else notes_block
+
+        logger.info("MM → VD [%s]: %s", session_id[:8], body[:80])
         try:
-            await self.vd.send_message(session_id, cleaned)
+            await self.vd.send_message(session_id, body)
         except Exception:
             logger.exception("Failed to send to VD session %s", session_id[:8])
             try:
@@ -507,7 +549,20 @@ class Bridge:
         if not parent_session:
             return  # thread in an unmapped channel
 
-        fork_message = self._wrap_thread_fork_message(channel_id, root_id, message)
+        parent_meta = await self.vd.get_session_meta(parent_session)
+        cwd = parent_meta.get("projectPath") or self.config.default_cwd
+
+        # Download attachments into the parent's cwd (the fork inherits it).
+        attachment_notes: list[str] = []
+        if post.get("file_ids") and cwd:
+            attachment_notes = await self._save_mm_attachments(post, cwd)
+
+        message_for_llm = message
+        if attachment_notes:
+            notes_block = "\n".join(attachment_notes)
+            message_for_llm = f"{notes_block}\n\n{message}" if message else notes_block
+
+        fork_message = self._wrap_thread_fork_message(channel_id, root_id, message_for_llm)
 
         try:
             resp = await self.vd.fork_session(parent_session, fork_message)
@@ -521,9 +576,6 @@ class Bridge:
             self._mark_dead_thread(channel_id, root_id,
                                    f"Couldn't fork ({resp.get('reason', 'unsupported')}).")
             return
-
-        parent_meta = await self.vd.get_session_meta(parent_session)
-        cwd = parent_meta.get("projectPath") or self.config.default_cwd
 
         self.pending_forks.append(PendingMattermostSession(
             channel_id=channel_id,
@@ -964,6 +1016,58 @@ class Bridge:
     async def _project_path_for(self, session_id: str) -> str | None:
         meta = await self.vd.get_session_meta(session_id)
         return meta.get("projectPath") or None
+
+    async def _save_mm_attachments(self, post: dict, cwd: str) -> list[str]:
+        """Download MM file attachments into <cwd>/.mattermost-inbox/.
+
+        Returns human-readable notes to prepend to the forwarded message.
+        Each successful download yields `[User attached file: <abs-path>]`;
+        failures yield a skipped-with-reason note so the LLM still sees them.
+        """
+        file_ids = post.get("file_ids") or []
+        if not file_ids:
+            return []
+
+        try:
+            inbox = Path(cwd).expanduser().resolve(strict=False) / MM_INBOX_DIRNAME
+            inbox.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception("Failed to prepare MM inbox in %s", cwd)
+            return [f"[MM attachment skipped: cannot write to inbox in {cwd}]"]
+
+        file_meta = {
+            f.get("id"): f
+            for f in ((post.get("metadata") or {}).get("files") or [])
+            if isinstance(f, dict) and f.get("id")
+        }
+
+        notes: list[str] = []
+        max_size = self._get_max_file_size()
+        for fid in file_ids:
+            meta = file_meta.get(fid) or {}
+            name = _safe_inbox_filename(meta.get("name", ""), f"file-{fid[:8]}")
+            size = int(meta.get("size") or 0)
+            if size and size > max_size:
+                notes.append(
+                    f"[MM attachment skipped: `{name}` too large ({size} bytes)]"
+                )
+                continue
+            try:
+                data = await asyncio.to_thread(self.mm.download_file, fid)
+            except Exception:
+                logger.exception("Download failed for MM file %s", fid)
+                notes.append(f"[MM attachment skipped: `{name}` download failed]")
+                continue
+            try:
+                dest = _unique_inbox_path(inbox, name)
+                dest.write_bytes(data)
+            except OSError:
+                logger.exception("Write failed for MM file %s", fid)
+                notes.append(f"[MM attachment skipped: `{name}` write failed]")
+                continue
+            logger.info("Saved MM attachment %s → %s", fid[:8], dest)
+            notes.append(f"[User attached file: {dest}]")
+        return notes
 
     def _get_max_file_size(self) -> int:
         if self._max_file_size is None:

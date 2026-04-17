@@ -167,6 +167,16 @@ class MattermostClient:
             raise RuntimeError(f"upload_file returned no file_infos: {resp!r}")
         return infos[0]["id"]
 
+    def download_file(self, file_id: str) -> bytes:
+        """Fetch the raw bytes of an uploaded file from Mattermost."""
+        resp = self._driver.files.get_file(file_id)
+        if isinstance(resp, (bytes, bytearray)):
+            return bytes(resp)
+        content = getattr(resp, "content", None)
+        if content is None:
+            raise RuntimeError(f"Unexpected get_file response: {type(resp).__name__}")
+        return content
+
     def get_max_file_size(self) -> int:
         """Read MaxFileSize from the MM server config; 50MB fallback."""
         try:
