@@ -1,0 +1,20 @@
+[project]
+name = "mm-bridge"
+version = "0.1.0"
+description = "Mattermost ↔ VibeDeck bridge — one channel per Claude session"
+requires-python = ">=3.11"
+dependencies = [
+    "mattermostautodriver>=2.0.0",
+    "httpx>=0.27",
+    "httpx-sse>=0.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mm_bridge"]
+
+[project.scripts]
+mm-bridge = "mm_bridge.main:main"
