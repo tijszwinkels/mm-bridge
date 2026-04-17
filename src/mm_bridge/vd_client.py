@@ -81,6 +81,11 @@ class VibeDeckClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def interrupt_session(self, session_id: str) -> dict:
+        resp = await self._http.post(f"/sessions/{session_id}/interrupt")
+        resp.raise_for_status()
+        return resp.json()
+
     async def fork_session(self, session_id: str, message: str) -> dict:
         """Fork a session. Returns the VibeDeck response plus a `status` hint.
 
@@ -127,11 +132,16 @@ class VibeDeckClient:
         resp.raise_for_status()
 
     async def list_models(self, backend: str) -> list[str]:
-        """Return model names for a backend. Cached in-process."""
+        """Return model names for a backend. Cached in-process.
+
+        Uses the same wire-alias mapping as `create_session` so the
+        purpose token ``claude`` reaches VD as ``claude-code``.
+        """
         if backend in self._model_cache:
             return self._model_cache[backend]
+        wire = _to_wire_backend(backend)
         try:
-            resp = await self._http.get(f"/backends/{backend}/models")
+            resp = await self._http.get(f"/backends/{wire}/models")
             resp.raise_for_status()
             models = resp.json().get("models", []) or []
         except httpx.HTTPError as exc:

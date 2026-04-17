@@ -7,7 +7,12 @@ from __future__ import annotations
 
 import pytest
 
-from mm_bridge.purpose import KNOWN_BACKENDS, PurposeConfig, parse
+from mm_bridge.purpose import (
+    KNOWN_BACKENDS,
+    PurposeConfig,
+    parse,
+    to_purpose_string,
+)
 
 
 # A fixed model catalogue used by most tests — mirrors what VibeDeck would return.
@@ -288,6 +293,120 @@ def test_never_raises_on_garbage_input():
     cfg = parse(",,,,", "claude", "opus", _models_for)
     assert cfg.backend == "claude"
     assert cfg.model == "opus"
+
+
+# ---------------------------------------------------------------------------
+# autorespond / noautorespond tokens + default_autorespond
+# ---------------------------------------------------------------------------
+
+
+def test_noautorespond_is_synonym_for_mention_only():
+    cfg = parse("claude, noautorespond", "claude", "opus", _models_for)
+    assert cfg.mention_only is True
+    assert cfg.warnings == []
+
+
+def test_autorespond_token_turns_mention_only_off():
+    cfg = parse("claude, mention-only, autorespond", "claude", "opus", _models_for)
+    # Last-write wins within Step 2a — autorespond clears the flag.
+    assert cfg.mention_only is False
+
+
+def test_default_autorespond_false_means_mention_only_by_default():
+    cfg = parse("", "claude", "opus", _models_for, default_autorespond=False)
+    assert cfg.mention_only is True
+
+
+def test_default_autorespond_false_still_overridable_by_autorespond_token():
+    cfg = parse(
+        "claude, autorespond", "claude", "opus", _models_for,
+        default_autorespond=False,
+    )
+    assert cfg.mention_only is False
+
+
+def test_default_autorespond_true_defaults_to_responding():
+    cfg = parse("", "claude", "opus", _models_for, default_autorespond=True)
+    assert cfg.mention_only is False
+
+
+def test_autoresponse_spelling_alias():
+    """Users naturally type `autoresponse` / `noautoresponse` (with `e`)."""
+    cfg = parse("claude, autoresponse", "claude", "opus", _models_for)
+    assert cfg.mention_only is False
+    assert cfg.warnings == []
+
+
+def test_noautoresponse_spelling_alias():
+    cfg = parse("claude, noautoresponse", "claude", "opus", _models_for)
+    assert cfg.mention_only is True
+    assert cfg.warnings == []
+
+
+def test_autorespond_case_insensitive():
+    cfg = parse("claude, AUTORESPOND", "claude", "opus", _models_for,
+                default_autorespond=False)
+    assert cfg.mention_only is False
+
+
+# ---------------------------------------------------------------------------
+# to_purpose_string — canonical serialization for persistence
+# ---------------------------------------------------------------------------
+
+
+def test_to_purpose_string_always_emits_flag():
+    cfg = PurposeConfig(backend="claude", model="opus", mention_only=False)
+    assert to_purpose_string(cfg, default_autorespond=True) == (
+        "claude, opus, autorespond"
+    )
+
+
+def test_to_purpose_string_emits_mention_only_when_set():
+    cfg = PurposeConfig(backend="claude", model="opus", mention_only=True)
+    assert to_purpose_string(cfg, default_autorespond=True) == (
+        "claude, opus, mention-only"
+    )
+
+
+def test_to_purpose_string_flag_independent_of_default():
+    """Same config, different default_autorespond → same output."""
+    cfg = PurposeConfig(backend="claude", model="opus", mention_only=False)
+    assert (
+        to_purpose_string(cfg, default_autorespond=True)
+        == to_purpose_string(cfg, default_autorespond=False)
+    )
+
+
+def test_to_purpose_string_with_cwd():
+    cfg = PurposeConfig(
+        backend="claude", model="opus", cwd="/home/claude/foo",
+    )
+    assert to_purpose_string(cfg, default_autorespond=True) == (
+        "claude, opus, autorespond, cwd=/home/claude/foo"
+    )
+
+
+def test_to_purpose_string_drops_model_when_none():
+    cfg = PurposeConfig(backend="claude", model=None)
+    assert to_purpose_string(cfg, default_autorespond=True) == "claude, autorespond"
+
+
+def test_to_purpose_string_parseable_again():
+    """Round-trip: serialize → parse → same effective config."""
+    models = {"claude": ["opus", "haiku"], "codex": [], "pi": [], "opencode": []}
+    orig = PurposeConfig(
+        backend="claude", model="haiku", mention_only=True, cwd="/home/foo",
+    )
+    s = to_purpose_string(orig, default_autorespond=True)
+    reparsed = parse(
+        s, "claude", "opus", lambda b: models.get(b, []),
+        default_autorespond=True,
+    )
+    assert reparsed.backend == orig.backend
+    assert reparsed.model == orig.model
+    assert reparsed.mention_only == orig.mention_only
+    assert reparsed.cwd == orig.cwd
+    assert reparsed.warnings == []
 
 
 if __name__ == "__main__":

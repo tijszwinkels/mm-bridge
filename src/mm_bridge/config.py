@@ -39,6 +39,12 @@ class Config:
     default_backend: str = "claude"
     default_model: str | None = "opus"
     default_cwd: str = str(Path.home())
+    default_autorespond: bool = False
+
+    # Auto-join all public channels (silent presence — sessions start on
+    # first engagement, not on join).
+    auto_join_public_channels: bool = False
+    auto_join_reconcile_seconds: float = 60.0
 
     # State + config file paths
     state_file: str = str(Path.home() / ".config/mm-bridge/state.json")
@@ -50,6 +56,9 @@ class Config:
     # Catch-up command
     catch_up_default_n: int = 50
     catch_up_max_n: int = 500
+    # Auto-inject the last N channel messages on first session creation
+    # (0 disables). Applies to both invite and engagement flows.
+    initial_catch_up_n: int = 50
 
     # Typing indicator
     typing_refresh_seconds: float = 3.0
@@ -96,10 +105,14 @@ class Config:
             "default_backend",
             "default_model",
             "default_cwd",
+            "default_autorespond",
+            "auto_join_public_channels",
+            "auto_join_reconcile_seconds",
             "state_file",
             "allowed_attachment_roots",
             "catch_up_default_n",
             "catch_up_max_n",
+            "initial_catch_up_n",
             "typing_refresh_seconds",
             "typing_stop_after_silence_seconds",
             "pending_session_merge_window_seconds",
@@ -142,6 +155,14 @@ class Config:
             self.default_backend = env["VD_DEFAULT_BACKEND"]
         if "VD_DEFAULT_MODEL" in env:
             self.default_model = env["VD_DEFAULT_MODEL"] or None
+        if "VD_DEFAULT_AUTORESPOND" in env:
+            self.default_autorespond = env["VD_DEFAULT_AUTORESPOND"].lower() in (
+                "1", "true", "yes", "on",
+            )
+        if "MM_AUTO_JOIN" in env:
+            self.auto_join_public_channels = env["MM_AUTO_JOIN"].lower() in (
+                "1", "true", "yes", "on",
+            )
         if "MM_BRIDGE_STATE" in env:
             self.state_file = env["MM_BRIDGE_STATE"]
 

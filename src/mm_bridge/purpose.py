@@ -16,6 +16,16 @@ from typing import Callable
 KNOWN_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "pi", "opencode"})
 
 MENTION_ONLY_TOKEN = "mention-only"
+NOAUTORESPOND_TOKEN = "noautorespond"  # synonym for mention-only
+AUTORESPOND_TOKEN = "autorespond"       # explicit mention_only=False
+# Forgiving spelling variants — users naturally type "autoresponse" /
+# "noautoresponse" (with trailing `e`). Accept both as synonyms.
+NOAUTORESPOND_ALIASES: frozenset[str] = frozenset({
+    NOAUTORESPOND_TOKEN, "noautoresponse", MENTION_ONLY_TOKEN,
+})
+AUTORESPOND_ALIASES: frozenset[str] = frozenset({
+    AUTORESPOND_TOKEN, "autoresponse",
+})
 CWD_PREFIX = "cwd="
 
 
@@ -80,6 +90,8 @@ def parse(
     default_backend: str,
     default_model: str | None,
     available_models_for: Callable[[str], list[str]],
+    *,
+    default_autorespond: bool = True,
 ) -> PurposeConfig:
     """Parse a channel purpose string into a PurposeConfig.
 
@@ -89,25 +101,33 @@ def parse(
         default_model: model to use when only the backend is specified.
         available_models_for: callable returning the list of model names for
             a given backend. Called at most once per backend during parsing.
+        default_autorespond: when True, channels without an explicit
+            mention-only / noautorespond / autorespond token default to
+            responding to every message. When False, they default to
+            mention-only (explicit `autorespond` needed to turn it off).
 
     Never raises. Unknown tokens are collected into PurposeConfig.warnings.
     """
+    default_mention_only = not default_autorespond
+
     raw_tokens = _tokenize(purpose)
 
     if not raw_tokens:
         return PurposeConfig(
             backend=default_backend,
             model=default_model,
-            mention_only=False,
+            mention_only=default_mention_only,
             cwd=None,
             warnings=[],
         )
 
     warnings: list[str] = []
 
-    # Step 2a: extract cwd= assignments up-front. Paths are case-sensitive so
-    # we keep the raw tokens (not lowercased) until this point.
+    # Step 2a: extract cwd= and autorespond/noautorespond/mention-only tokens
+    # up-front so they work positionally anywhere. Paths are case-sensitive so
+    # we keep raw tokens until this point.
     cwd: str | None = None
+    mention_only_override: bool | None = None
     remaining: list[str] = []
     for tok in raw_tokens:
         value, warn = _parse_cwd_token(tok)
@@ -121,13 +141,25 @@ def parse(
                 )
             cwd = value
             continue
+        tok_lc = tok.lower()
+        if tok_lc in NOAUTORESPOND_ALIASES:
+            mention_only_override = True
+            continue
+        if tok_lc in AUTORESPOND_ALIASES:
+            mention_only_override = False
+            continue
         remaining.append(tok)
+
+    mention_only_effective = (
+        mention_only_override if mention_only_override is not None
+        else default_mention_only
+    )
 
     if not remaining:
         return PurposeConfig(
             backend=default_backend,
             model=default_model,
-            mention_only=False,
+            mention_only=mention_only_effective,
             cwd=cwd,
             warnings=warnings,
         )
@@ -158,15 +190,10 @@ def parse(
     # Cache the model list for the *chosen* backend (may differ from default).
     backend_models = _models_for(backend, available_models_for)
 
-    mention_only = False
-
-    # Step 4: walk remaining tokens.
+    # Step 4: walk remaining tokens (mention-only / autorespond / cwd were
+    # already extracted in Step 2a).
     for token in rest:
         token_lc = token.lower()
-        if token_lc == MENTION_ONLY_TOKEN:
-            mention_only = True
-            continue
-
         if token_lc in backend_models:
             if model is not None and model != token_lc:
                 warnings.append(
@@ -189,7 +216,34 @@ def parse(
     return PurposeConfig(
         backend=backend,
         model=model,
-        mention_only=mention_only,
+        mention_only=mention_only_effective,
         cwd=cwd,
         warnings=warnings,
     )
+
+
+def to_purpose_string(cfg: PurposeConfig, *, default_autorespond: bool) -> str:
+    """Serialize a PurposeConfig back into canonical Channel Purpose form.
+
+    Emits tokens in a stable order: backend, model, (mention-only|autorespond),
+    cwd. Always emits the mention/autorespond flag explicitly so the Channel
+    Purpose documents the effective setting regardless of config defaults.
+
+    The `default_autorespond` argument is accepted for symmetry with `parse()`
+    but currently doesn't change the output; kept for future-proofing in case
+    we want to elide redundant flags later.
+
+    The result is round-trippable: parse(to_purpose_string(cfg)) == cfg
+    (modulo warnings).
+    """
+    del default_autorespond  # explicit: flag is always emitted
+    parts: list[str] = [cfg.backend]
+    if cfg.model:
+        parts.append(cfg.model)
+
+    parts.append(MENTION_ONLY_TOKEN if cfg.mention_only else AUTORESPOND_TOKEN)
+
+    if cfg.cwd:
+        parts.append(f"{CWD_PREFIX}{cfg.cwd}")
+
+    return ", ".join(parts)
