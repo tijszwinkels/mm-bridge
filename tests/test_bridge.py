@@ -228,6 +228,48 @@ class InviteFlowTests(_BridgeTestCase):
 
         self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
 
+    async def test_purpose_cwd_inside_allowed_roots_is_applied(self):
+        self.config.allowed_attachment_roots = [self.tmp.name]
+        project = f"{self.tmp.name}/myproj"
+        import os; os.makedirs(project, exist_ok=True)
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": f"claude, cwd={project}",
+        }
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.vd.created[0]["cwd"], project)
+        # No warning about the cwd itself (welcome post is the only notice).
+        self.assertFalse(
+            any(":warning:" in p.message and "cwd" in p.message
+                for p in self.bridge.mm.posted)
+        )
+
+    async def test_purpose_cwd_outside_allowed_roots_warns_and_uses_default(self):
+        self.config.allowed_attachment_roots = [self.tmp.name]
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, cwd=/etc/passwd-dir",
+        }
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.vd.created[0]["cwd"], "/tmp/proj")
+        self.assertTrue(
+            any(":warning:" in p.message and "cwd" in p.message
+                for p in self.bridge.mm.posted),
+            f"expected a cwd rejection warning; got {[p.message for p in self.bridge.mm.posted]}",
+        )
+
+    async def test_purpose_cwd_trusted_when_no_allowed_roots(self):
+        self.config.allowed_attachment_roots = []
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, cwd=/opt/whatever",
+        }
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.vd.created[0]["cwd"], "/opt/whatever")
+
 
 class ForwardingTests(_BridgeTestCase):
     async def test_posted_in_mapped_channel_forwards_to_session(self):

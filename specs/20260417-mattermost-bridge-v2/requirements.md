@@ -343,6 +343,17 @@ As a user, I can configure a channel where humans chat freely and Claude only re
 - The `@claude` mention itself is stripped from the forwarded text (so Claude doesn't see a stray @-handle)
 - `mention-only` is orthogonal to backend/model tokens: `claude, sonnet, mention-only` is valid
 
+### US-11.4: Per-channel working directory
+As a user, I can point a channel at a specific project directory by adding a `cwd=` token to the Channel Purpose, so the bot runs where I'm working instead of the global default.
+
+**Acceptance Criteria:**
+- WHEN the Channel Purpose includes `cwd=/abs/path` THEN the invited VibeDeck session is created with that cwd
+- WHEN the `cwd=` value is not absolute (e.g. `./foo`) OR the `=` is missing a value THEN a warning is posted and the session falls back to `default_cwd`
+- WHEN `allowed_attachment_roots` is non-empty AND the requested `cwd` does not resolve inside any of them THEN a warning is posted and the session falls back to `default_cwd`
+- WHEN `allowed_attachment_roots` is empty THEN the `cwd` is trusted (matches existing behaviour of `_resolve_attachment_path`)
+- The `cwd` value preserves case — path comparisons happen against the on-disk roots, not against a lowercased copy
+- `cwd=` is orthogonal to backend/model/`mention-only` tokens; order doesn't matter
+
 ---
 
 ## 12. Claude Can Leave the Channel

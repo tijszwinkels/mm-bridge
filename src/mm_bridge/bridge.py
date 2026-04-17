@@ -370,6 +370,8 @@ class Bridge:
             lambda b: models_by_backend.get(b, []),
         )
 
+        effective_cwd = self._resolve_purpose_cwd(cfg)
+
         for w in cfg.warnings:
             try:
                 self.mm.post_message(channel_id, f":warning: {w}")
@@ -386,7 +388,7 @@ class Bridge:
         try:
             resp = await self.vd.create_session(
                 message=INVITE_PLACEHOLDER,
-                cwd=self.config.default_cwd,
+                cwd=effective_cwd,
                 backend=cfg.backend,
                 model_index=model_index,
             )
@@ -414,7 +416,7 @@ class Bridge:
             )
             return
 
-        cwd = resp.get("cwd") or self.config.default_cwd
+        cwd = resp.get("cwd") or effective_cwd
         self.pending_mm_sessions[channel_id] = PendingMattermostSession(
             channel_id=channel_id,
             cwd=cwd,
@@ -430,6 +432,31 @@ class Bridge:
             self.mm.post_message(channel_id, welcome)
         except Exception:
             logger.warning("Failed to post welcome message", exc_info=True)
+
+    def _resolve_purpose_cwd(self, cfg: purpose.PurposeConfig) -> str:
+        """Apply `cwd=` from the Channel Purpose, falling back to the default.
+
+        The requested path must resolve inside `allowed_attachment_roots`;
+        otherwise we append a warning to `cfg.warnings` so the channel learns
+        the override was rejected, and fall back to `config.default_cwd`.
+        With no allowed roots configured we trust the caller (same as
+        `_resolve_attachment_path`).
+        """
+        if not cfg.cwd:
+            return self.config.default_cwd
+        roots = self.config.allowed_attachment_roots
+        resolved = _resolve_attachment_path(cfg.cwd, project_path=None, allowed_roots=roots)
+        if resolved is None:
+            cfg.warnings.append(
+                f"Channel Purpose `cwd={cfg.cwd}` is not inside any allowed_attachment_root "
+                f"— using default `{self.config.default_cwd}`."
+            )
+            logger.warning(
+                "Rejected Channel Purpose cwd=%r (not in allowed_attachment_roots)", cfg.cwd,
+            )
+            return self.config.default_cwd
+        logger.info("Channel Purpose cwd override → %s", resolved)
+        return str(resolved)
 
     def _format_welcome(self, cfg: purpose.PurposeConfig, cwd: str) -> str:
         parts = [

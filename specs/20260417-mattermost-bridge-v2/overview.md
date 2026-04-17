@@ -64,6 +64,7 @@ Make the bridge invite-driven, per-channel-configurable, and feel like a real ch
 - All non-bot posts forward to VibeDeck by default. Bot's own posts are filtered by `user_id` (belt-and-suspenders; Mattermost normally doesn't deliver a user their own WS events).
 - **Attribution kicks in on demand.** While only one human has posted in a session, messages forward as-is. As soon as a second human speaks, the bridge starts prefixing every forwarded message with `<username>: ` (Mattermost `username`, not display name) so Claude can tell contributors apart. This is tracked in-memory per session (and per thread-fork).
 - `mention-only` Channel-Purpose token filters forwarding to posts containing `@claude` — useful for channels where humans chat freely and Claude is on standby.
+- `cwd=/abs/path` Channel-Purpose token overrides the session's working directory. The path must be absolute and (when `allowed_attachment_roots` is configured) inside one of those roots — otherwise the override is rejected with a warning and the session falls back to `default_cwd`.
 
 ### Leaving a channel
 

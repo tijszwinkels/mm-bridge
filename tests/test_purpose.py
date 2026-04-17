@@ -173,6 +173,67 @@ def test_mention_only_case_insensitive():
 
 
 # ---------------------------------------------------------------------------
+# cwd= token
+# ---------------------------------------------------------------------------
+
+
+def test_cwd_defaults_to_none():
+    cfg = parse("claude, opus", "claude", "opus", _models_for)
+    assert cfg.cwd is None
+
+
+def test_cwd_absolute_path():
+    cfg = parse("claude, cwd=/home/claude/projects/foo", "claude", "opus", _models_for)
+    assert cfg.backend == "claude"
+    assert cfg.model == "opus"
+    assert cfg.cwd == "/home/claude/projects/foo"
+    assert cfg.warnings == []
+
+
+def test_cwd_preserves_case():
+    cfg = parse("cwd=/Users/Tijs/Foo", "claude", "opus", _models_for)
+    assert cfg.cwd == "/Users/Tijs/Foo"
+    assert cfg.warnings == []
+
+
+def test_cwd_with_backend_model_and_mention_only():
+    cfg = parse(
+        "claude, sonnet, cwd=/home/claude/projects/foo, mention-only",
+        "claude", "opus", _models_for,
+    )
+    assert cfg.backend == "claude"
+    assert cfg.model == "sonnet"
+    assert cfg.mention_only is True
+    assert cfg.cwd == "/home/claude/projects/foo"
+    assert cfg.warnings == []
+
+
+def test_cwd_relative_path_warns():
+    cfg = parse("claude, cwd=./foo", "claude", "opus", _models_for)
+    assert cfg.cwd is None
+    assert len(cfg.warnings) == 1
+    assert "cwd" in cfg.warnings[0].lower()
+    assert "./foo" in cfg.warnings[0]
+
+
+def test_cwd_empty_value_warns():
+    cfg = parse("claude, cwd=", "claude", "opus", _models_for)
+    assert cfg.cwd is None
+    assert len(cfg.warnings) == 1
+    assert "cwd" in cfg.warnings[0].lower()
+
+
+def test_cwd_prefix_case_insensitive():
+    cfg = parse("claude, CWD=/home/claude/foo", "claude", "opus", _models_for)
+    assert cfg.cwd == "/home/claude/foo"
+
+
+def test_cwd_surrounding_whitespace_tolerated():
+    cfg = parse("claude, cwd = /home/claude/foo  ", "claude", "opus", _models_for)
+    assert cfg.cwd == "/home/claude/foo"
+
+
+# ---------------------------------------------------------------------------
 # Whitespace tolerance
 # ---------------------------------------------------------------------------
 
