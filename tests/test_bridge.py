@@ -1,201 +1,477 @@
+"""Bridge dispatch tests — use fake MM/VD clients and drive events in."""
+
+from __future__ import annotations
+
+import asyncio
 import tempfile
 import unittest
+from dataclasses import dataclass, field
 
 from mm_bridge.bridge import Bridge
 from mm_bridge.config import Config
-from mm_bridge.mm_client import MattermostClient
 
 
+# ───────────────────── Fakes ──────────────────────────────────────────────
+
+
+@dataclass
+class _Post:
+    channel_id: str
+    message: str
+    file_ids: list[str] | None = None
+    root_id: str | None = None
+
+
+@dataclass
 class FakeMattermostClient:
-    def __init__(self):
-        self.listen_args = None
-        self.joined_channels = []
-        self.join_all_calls = 0
-        self.created_channels = []
-        self.posted_messages = []
+    bot_user_id: str = "bot-user"
+    bot_username: str = "claude"
+    team_id: str = "team-1"
+    channels: dict = field(default_factory=dict)
+    posted: list[_Post] = field(default_factory=list)
+    renames: list[tuple[str, str]] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    typing: list[tuple[str, str | None]] = field(default_factory=list)
+    uploaded: list[tuple[str, str]] = field(default_factory=list)
+    users: dict = field(default_factory=dict)
+    posts_by_channel: dict = field(default_factory=dict)
 
-    async def listen_websocket(self, on_message, on_channel_created=None):
-        self.listen_args = (on_message, on_channel_created)
+    def login(self) -> None:
+        pass
 
-    def join_channel(self, channel_id: str) -> None:
-        self.joined_channels.append(channel_id)
-
-    def join_all_team_channels(self) -> int:
-        self.join_all_calls += 1
-        return 0
-
-    def create_channel(self, name: str, display_name: str, purpose: str = "") -> dict:
-        self.created_channels.append((name, display_name, purpose))
-        return {"id": "created-channel"}
+    async def listen_websocket(self, handlers) -> None:
+        # Not driven in unit tests.
+        return
 
     def post_message(self, channel_id: str, message: str) -> dict:
-        self.posted_messages.append((channel_id, message))
-        return {"id": "post-1"}
+        self.posted.append(_Post(channel_id, message))
+        return {"id": "p"}
+
+    def post(self, channel_id: str, message: str, *, file_ids=None, root_id=None):
+        self.posted.append(_Post(channel_id, message, file_ids, root_id))
+        return {"id": "p"}
+
+    def create_channel(self, name: str, display_name: str, purpose: str = "") -> dict:
+        cid = f"c-{name}"
+        self.channels[cid] = {
+            "id": cid, "name": name, "display_name": display_name, "purpose": purpose,
+        }
+        return {"id": cid}
+
+    def rename_channel(self, channel_id: str, display_name: str) -> None:
+        self.renames.append((channel_id, display_name))
+
+    def set_channel_header(self, channel_id: str, header: str) -> None:
+        pass
+
+    def get_channel(self, channel_id: str) -> dict:
+        return self.channels.get(channel_id, {"id": channel_id, "purpose": ""})
+
+    def remove_self_from_channel(self, channel_id: str) -> None:
+        self.removed.append(channel_id)
+
+    def get_user(self, user_id: str) -> dict:
+        return self.users.get(user_id, {"id": user_id, "username": f"u-{user_id[:4]}"})
+
+    def publish_user_typing(self, channel_id: str, parent_id=None) -> None:
+        self.typing.append((channel_id, parent_id))
+
+    def upload_file(self, channel_id: str, path) -> str:
+        fid = f"f-{len(self.uploaded)}"
+        self.uploaded.append((channel_id, str(path)))
+        return fid
+
+    def get_max_file_size(self) -> int:
+        return 50 * 1024 * 1024
+
+    def get_posts(self, channel_id: str, limit: int) -> list[dict]:
+        return self.posts_by_channel.get(channel_id, [])[:limit]
 
 
+@dataclass
 class FakeVibeDeckClient:
-    def __init__(self):
-        self.sent_messages = []
-        self.created_sessions = []
+    created: list[dict] = field(default_factory=list)
+    sent: list[tuple[str, str]] = field(default_factory=list)
+    forks: list[tuple[str, str]] = field(default_factory=list)
+    titles: list[tuple[str, str | None]] = field(default_factory=list)
+    next_session_id: str = "session-next"
+    fork_response: dict | None = None
+    sessions_meta: list[dict] = field(default_factory=list)
+    models_by_backend: dict = field(default_factory=lambda: {
+        "claude": ["opus", "sonnet"],
+        "codex": ["gpt-5.4"],
+        "pi": ["pi-v1"],
+        "opencode": [],
+    })
 
-    async def send_message(self, session_id: str, message: str) -> dict:
-        self.sent_messages.append((session_id, message))
-        return {"status": "sent"}
+    async def close(self) -> None:
+        pass
 
-    async def create_session(
-        self,
-        message: str,
-        cwd: str,
-        backend: str | None = None,
-        model_index: int | None = None,
-        source_session_id: str | None = None,
-    ) -> dict:
-        self.created_sessions.append(
-            (message, cwd, backend, model_index, source_session_id)
-        )
+    async def health(self) -> dict:
+        return {"ok": True}
+
+    async def create_session(self, message, cwd, backend=None, model_index=None,
+                             source_session_id=None) -> dict:
+        self.created.append({
+            "message": message, "cwd": cwd, "backend": backend,
+            "model_index": model_index, "source_session_id": source_session_id,
+        })
         return {"status": "started", "cwd": cwd}
 
+    async def send_message(self, session_id, message) -> dict:
+        self.sent.append((session_id, message))
+        return {"status": "sent"}
 
-class FakeChannelsApi:
-    def __init__(self):
-        self.add_channel_member_calls = []
+    async def fork_session(self, session_id, message) -> dict:
+        self.forks.append((session_id, message))
+        if self.fork_response is not None:
+            return self.fork_response
+        return {"status": "forking", "session_id": session_id}
 
-    def add_channel_member(self, channel_id, options):
-        self.add_channel_member_calls.append((channel_id, options))
+    async def list_sessions(self) -> list[dict]:
+        return self.sessions_meta
+
+    async def get_session_meta(self, session_id):
+        for s in self.sessions_meta:
+            if s.get("id") == session_id:
+                return s
+        return {}
+
+    async def set_session_title(self, session_id, title) -> None:
+        self.titles.append((session_id, title))
+
+    async def list_models(self, backend) -> list[str]:
+        return self.models_by_backend.get(backend, [])
+
+    async def stream_events(self, on_event) -> None:
+        return
 
 
-class FakeDriver:
-    def __init__(self, channels_api):
-        self.channels = channels_api
-        self.client = None
+# ───────────────────── Test fixtures ──────────────────────────────────────
 
 
-class BridgeTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
+class _BridgeTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):  # type: ignore[override]
+        self.tmp = tempfile.TemporaryDirectory()
         self.config = Config(
-            mm_bot_token="test-token",
-            state_file=f"{self.temp_dir.name}/state.json",
-            vd_default_cwd="/tmp/mm-bridge-tests",
-            vd_new_session_backend="opencode",
-            vd_new_session_model_index=2,
+            mm_bot_token="t",
+            default_cwd="/tmp/proj",
+            state_file=f"{self.tmp.name}/state.json",
+            default_backend="claude",
+            default_model="opus",
         )
         self.bridge = Bridge(self.config)
         self.bridge.mm = FakeMattermostClient()
         self.bridge.vd = FakeVibeDeckClient()
-        self.bridge.mapping.link("channel-1", "session-1")
+        from mm_bridge.typing_indicator import TypingIndicator
+        self.bridge.typing = TypingIndicator(self.bridge.mm, refresh_s=0.01)
 
-    def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+    async def asyncTearDown(self):  # type: ignore[override]
+        self.tmp.cleanup()
 
-    async def test_run_mm_listener_registers_channel_created_callback(self):
-        await self.bridge._run_mm_listener()
 
-        _, on_channel_created = self.bridge.mm.listen_args
-        self.assertIsNotNone(on_channel_created)
+# ───────────────────── Tests ──────────────────────────────────────────────
 
-    async def test_on_mm_message_ignores_system_posts(self):
-        await self.bridge._on_mm_message({
-            "channel_id": "channel-1",
-            "message": "admin archived the channel.",
-            "type": "system_channel_deleted",
+
+class InviteFlowTests(_BridgeTestCase):
+    async def test_bot_invited_to_unmapped_channel_creates_session(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.created[0]["cwd"], "/tmp/proj")
+        self.assertEqual(self.bridge.vd.created[0]["backend"], "claude")
+        self.assertIn("c1", self.bridge.pending_mm_sessions)
+        # A welcome post (plus no warnings since purpose was empty).
+        self.assertTrue(any("Session started" in p.message for p in self.bridge.mm.posted))
+
+    async def test_bot_invited_to_mapped_channel_is_noop(self):
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(len(self.bridge.vd.created), 0)
+
+    async def test_purpose_with_model_resolves_model_index(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, sonnet"}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.vd.created[0]["backend"], "claude")
+        self.assertEqual(self.bridge.vd.created[0]["model_index"], 1)
+
+    async def test_unknown_purpose_token_posts_warning_and_uses_defaults(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "opusz"}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertTrue(any(":warning:" in p.message for p in self.bridge.mm.posted))
+        self.assertEqual(self.bridge.vd.created[0]["backend"], "claude")
+
+    async def test_mention_only_token_is_cached_on_channel(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, mention-only"}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+
+
+class ForwardingTests(_BridgeTestCase):
+    async def test_posted_in_mapped_channel_forwards_to_session(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hi", "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.sent_messages, [])
+        self.assertEqual(self.bridge.vd.sent, [("s1", "hi")])
 
-    async def test_on_mm_message_forwards_regular_posts(self):
-        await self.bridge._on_mm_message({
-            "channel_id": "channel-1",
-            "message": "hello from mattermost",
-            "type": "",
+    async def test_posted_in_unmapped_channel_is_dropped(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": "hi", "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(
-            self.bridge.vd.sent_messages,
-            [("session-1", "hello from mattermost")],
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_posted_queues_while_session_pending(self):
+        self.bridge.pending_mm_sessions["c1"] = type(self.bridge.pending_mm_sessions.get("c1") or self.bridge)  # placeholder
+        # Use the real dataclass:
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message="placeholder", requested_at=_time.monotonic(),
         )
 
-    async def test_on_mm_message_starts_new_session_for_unmapped_channel(self):
-        await self.bridge._on_mm_message({
-            "channel_id": "channel-new",
-            "message": "start a new session",
-            "type": "",
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "waiting msg", "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(
-            self.bridge.vd.created_sessions,
-            [("start a new session", "/tmp/mm-bridge-tests", "opencode", 2, None)],
+        self.assertIn("waiting msg",
+                      self.bridge.pending_mm_sessions["c1"].queued_messages)
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_attribution_kicks_in_on_second_user(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "first", "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "second", "user_id": "u2", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent[0], ("s1", "first"))
+        self.assertTrue(self.bridge.vd.sent[1][1].startswith("u-u2: second"))
+
+    async def test_mention_only_filters_non_mentions(self):
+        self.bridge.mapping.link("c1", "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
         )
 
-    async def test_follow_up_messages_queue_until_session_added(self):
-        await self.bridge._on_mm_message({
-            "channel_id": "channel-new",
-            "message": "start a new session",
-            "type": "",
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "just chatting", "user_id": "u1", "type": "",
         })
-        await self.bridge._on_mm_message({
-            "channel_id": "channel-new",
-            "message": "second message",
-            "type": "",
+        self.assertEqual(self.bridge.vd.sent, [])
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude help please",
+            "user_id": "u1", "type": "",
+        })
+        self.assertEqual(self.bridge.vd.sent, [("s1", "help please")])
+
+
+class CatchUpTests(_BridgeTestCase):
+    async def test_catch_up_command_sends_block_to_session(self):
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"user_id": "u1", "message": "m1", "type": ""},
+            {"user_id": self.bridge.mm.bot_user_id, "message": "bot echo", "type": ""},
+            {"user_id": "u2", "message": "m2", "type": ""},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude catch up 50",
+            "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(len(self.bridge.vd.created_sessions), 1)
-        self.assertEqual(
-            self.bridge.pending_mm_channels["channel-new"].queued_messages,
-            ["second message"],
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        block = self.bridge.vd.sent[0][1]
+        self.assertIn("m1", block)
+        self.assertIn("m2", block)
+        self.assertNotIn("bot echo", block)
+
+
+class LeaveTests(_BridgeTestCase):
+    async def test_leave_command_removes_bot_and_unlinks(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude leave done",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertIn("c1", self.bridge.mm.removed)
+        self.assertIsNone(self.bridge.mapping.get_session("c1"))
+
+    async def test_user_removed_unlinks_mapping(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
+
+        self.assertIsNone(self.bridge.mapping.get_session("c1"))
+
+
+class SessionAddedClaimTests(_BridgeTestCase):
+    async def test_session_added_claims_pending_invite(self):
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message="placeholder", requested_at=_time.monotonic(),
         )
-
-    async def test_session_added_claims_pending_channel_and_flushes_queue(self):
-        await self.bridge._on_mm_message({
-            "channel_id": "channel-new",
-            "message": "start a new session",
-            "type": "",
-        })
-        await self.bridge._on_mm_message({
-            "channel_id": "channel-new",
-            "message": "second message",
-            "type": "",
-        })
 
         await self.bridge._on_vd_event("session_added", {
-            "id": "session-new",
-            "projectPath": "/tmp/mm-bridge-tests",
-            "backend": "opencode",
-            "firstMessage": "start a new session",
+            "id": "sess-new", "projectPath": "/tmp/proj",
+            "firstMessage": "placeholder", "backend": "claude",
+        })
+
+        self.assertEqual(self.bridge.mapping.get_session("c1"), "sess-new")
+        self.assertNotIn("c1", self.bridge.pending_mm_sessions)
+
+    async def test_session_added_without_pending_creates_channel(self):
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-cli", "projectPath": "/tmp/proj",
+            "projectName": "my-project", "firstMessage": "hi from CLI",
+        })
+
+        self.assertTrue(self.bridge.mapping.get_channel("sess-cli"))
+        self.assertTrue(self.bridge.mm.channels)
+
+
+class ThreadForkTests(_BridgeTestCase):
+    async def test_thread_post_in_mapped_channel_calls_fork(self):
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.vd.sessions_meta = [
+            {"id": "s1", "projectPath": "/tmp/proj", "backend": "claude"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "root_id": "r1", "message": "thread starter",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.forks, [("s1", "thread starter")])
+        self.assertEqual(len(self.bridge.pending_forks), 1)
+
+    async def test_thread_fork_unavailable_marks_dead(self):
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.vd.fork_response = {
+            "status": "fork_unavailable", "reason": "opencode", "http_status": 501,
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "root_id": "r1", "message": "thread starter",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertIn(("c1", "r1"), self.bridge.dead_threads)
+        self.assertEqual(len(self.bridge.pending_forks), 0)
+
+    async def test_session_added_claims_fork_then_posts_disclaimer(self):
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.pending_forks.append(PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message="thread starter", requested_at=_time.monotonic(),
+            is_fork=True, fork_parent_session="s1",
+            fork_thread_channel="c1", fork_thread_root="r1",
+        ))
+
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-fork", "projectPath": "/tmp/proj",
+            "firstMessage": "thread starter", "backend": "claude",
         })
 
         self.assertEqual(
-            self.bridge.mapping.get_session("channel-new"),
-            "session-new",
+            self.bridge.mapping.get_thread_session("c1", "r1"), "sess-fork",
         )
-        self.assertEqual(
-            self.bridge.vd.sent_messages,
-            [("session-new", "second message")],
-        )
-        self.assertEqual(self.bridge.mm.created_channels, [])
-
-    async def test_on_mm_channel_created_joins_channel(self):
-        await self.bridge._on_mm_channel_created("channel-2")
-
-        self.assertEqual(self.bridge.mm.joined_channels, ["channel-2"])
-
-    def test_reconcile_mm_channel_membership_once(self):
-        joined = self.bridge._reconcile_mm_channel_membership_once()
-
-        self.assertEqual(joined, 0)
-        self.assertEqual(self.bridge.mm.join_all_calls, 1)
+        disclaimer = [p for p in self.bridge.mm.posted if "Forked conversation" in p.message]
+        self.assertEqual(len(disclaimer), 1)
+        self.assertEqual(disclaimer[0].root_id, "r1")
 
 
-class MattermostClientTests(unittest.TestCase):
-    def test_join_channel_uses_add_channel_member(self):
-        channels_api = FakeChannelsApi()
-        client = MattermostClient.__new__(MattermostClient)
-        client._driver = FakeDriver(channels_api)
-        client._bot_user_id = "bot-user"
+class AssistantMessageTests(_BridgeTestCase):
+    async def test_plain_text_posts_to_channel(self):
+        self.bridge.mapping.link("c1", "s1")
 
-        client.join_channel("channel-123")
+        await self.bridge._on_vd_event("message", {
+            "session_id": "s1",
+            "message": {
+                "role": "assistant",
+                "blocks": [{"type": "text", "text": "hello there"}],
+            },
+        })
 
-        self.assertEqual(
-            channels_api.add_channel_member_calls,
-            [("channel-123", {"user_id": "bot-user"})],
-        )
+        self.assertTrue(any(p.message == "hello there" for p in self.bridge.mm.posted))
+
+    async def test_leave_channel_directive_removes_bot(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_vd_event("message", {
+            "session_id": "s1",
+            "message": {
+                "role": "assistant",
+                "blocks": [
+                    {"type": "text", "text": 'goodbye <leaveChannel reason="done" />'},
+                ],
+            },
+        })
+
+        self.assertIn("c1", self.bridge.mm.removed)
+        self.assertIsNone(self.bridge.mapping.get_session("c1"))
+
+
+class NameSyncTests(_BridgeTestCase):
+    async def test_channel_renamed_syncs_title_to_vibedeck(self):
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "old", "purpose": "",
+        }
+
+        await self.bridge._on_mm_channel_updated({
+            "id": "c1", "display_name": "new-name", "purpose": "",
+        })
+
+        self.assertEqual(self.bridge.vd.titles, [("s1", "new-name")])
+
+    async def test_summary_updated_renames_channel(self):
+        self.bridge.mapping.link("c1", "s1")
+
+        await self.bridge._on_vd_event("session_summary_updated", {
+            "session_id": "s1", "summaryTitle": "Great Session",
+        })
+
+        self.assertEqual(self.bridge.mm.renames, [("c1", "Great Session")])
+
+    async def test_name_sync_prevents_ping_pong(self):
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.name_sync.note_remote_update("mm", "c1")
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "old", "purpose": "",
+        }
+
+        await self.bridge._on_mm_channel_updated({
+            "id": "c1", "display_name": "new-name", "purpose": "",
+        })
+
+        self.assertEqual(self.bridge.vd.titles, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

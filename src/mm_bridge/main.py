@@ -4,8 +4,8 @@ import asyncio
 import logging
 import sys
 
-from .config import Config
 from .bridge import Bridge
+from .config import Config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    config = Config.from_env()
+    config = Config.load()
 
     if not config.mm_bot_token:
         print("Error: MM_BOT_TOKEN environment variable is required")
@@ -24,15 +24,14 @@ def main() -> None:
         print("Usage:")
         print("  MM_BOT_TOKEN=<token> mm-bridge")
         print()
+        print("Config precedence: built-in defaults < ~/.config/mm-bridge/config.toml < env vars")
+        print()
         print("Environment variables:")
-        print("  MM_BOT_TOKEN     - Mattermost bot token (required)")
-        print("  MM_URL           - Mattermost host (default: localhost)")
-        print("  MM_PORT          - Mattermost port (default: 8065)")
-        print("  MM_TEAM          - Team name (default: workspace)")
-        print("  VD_URL           - VibeDeck URL (default: http://localhost:8765)")
-        print("  VD_DEFAULT_CWD   - Working dir for new sessions (default: ~)")
-        print("  VD_NEW_SESSION_BACKEND     - Optional backend for MM-originated sessions")
-        print("  VD_NEW_SESSION_MODEL_INDEX - Optional model index for MM-originated sessions")
+        print("  MM_BOT_TOKEN          - Mattermost bot token (required, env-only)")
+        print("  MM_BRIDGE_CONFIG      - override config.toml path")
+        print("  MM_BRIDGE_STATE       - override state.json path")
+        print("  MM_URL / MM_PORT / MM_SCHEME / MM_TEAM")
+        print("  VD_URL / VD_DEFAULT_CWD / VD_DEFAULT_BACKEND / VD_DEFAULT_MODEL")
         sys.exit(1)
 
     bridge = Bridge(config)
