@@ -197,6 +197,76 @@ class InviteFlowTests(_BridgeTestCase):
         # A welcome post (plus no warnings since purpose was empty).
         self.assertTrue(any("Session started" in p.message for p in self.bridge.mm.posted))
 
+    async def test_invite_claim_normalises_backend_name_variants(self):
+        """VD echoes the display name ('Claude Code', 'Codex') in session_added
+        while pending stores the purpose token ('claude', 'codex'). The claim
+        must still recognise them as the same backend."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "codex"}
+
+        orig_create = self.bridge.vd.create_session
+
+        async def create_that_renames_backend(**kwargs):
+            await self.bridge._on_vd_session_added({
+                "id": "s-new",
+                "projectPath": kwargs["cwd"],
+                "backend": "Codex",  # VD's SSE-side display form
+                "firstMessage": "Hello! I've just been added",
+            })
+            return await orig_create(**kwargs)
+
+        self.bridge.vd.create_session = create_that_renames_backend
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.mapping.get_session("c1"), "s-new")
+
+    async def test_invite_claim_normalises_claude_to_claude_code(self):
+        """Purpose token 'claude' and VD's 'Claude Code' must be treated as the
+        same backend by the claim path."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude"}
+
+        orig_create = self.bridge.vd.create_session
+
+        async def create_that_renames_backend(**kwargs):
+            await self.bridge._on_vd_session_added({
+                "id": "s-claude",
+                "projectPath": kwargs["cwd"],
+                "backend": "Claude Code",
+                "firstMessage": "Hello! I've just been added",
+            })
+            return await orig_create(**kwargs)
+
+        self.bridge.vd.create_session = create_that_renames_backend
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.mapping.get_session("c1"), "s-claude")
+
+    async def test_invite_claimed_when_session_added_fires_during_create(self):
+        """Regression: VD emits session_added SSE before create_session HTTP
+        returns, so the pending entry must be registered BEFORE the await."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        orig_create = self.bridge.vd.create_session
+
+        async def racing_create(**kwargs):
+            # SSE arrives mid-await, before create_session returns
+            await self.bridge._on_vd_session_added({
+                "id": "s-new",
+                "projectPath": kwargs["cwd"],
+                "backend": kwargs.get("backend") or "claude",
+                "firstMessage": "Hello! I've just been added",
+            })
+            return await orig_create(**kwargs)
+
+        self.bridge.vd.create_session = racing_create
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(self.bridge.mapping.get_session("c1"), "s-new")
+        # No orphan auto-channel created by _create_channel_for_session
+        self.assertEqual(self.bridge.mm.channels, {"c1": {"id": "c1", "purpose": ""}})
+
     async def test_bot_invited_to_mapped_channel_is_noop(self):
         self.bridge.mapping.link("c1", "s1")
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}

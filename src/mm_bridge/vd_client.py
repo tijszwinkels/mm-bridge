@@ -12,6 +12,34 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+# VD accepts mixed names for /sessions/new. Our purpose tokens are lowercase
+# ("claude", "codex", ...). VD does not recognise the bare token "claude" —
+# it wants the CLI-backend name ("claude-code" / "Claude Code"). For the
+# others, lowercase works as-is.
+_BACKEND_WIRE_ALIAS: dict[str, str] = {
+    "claude": "claude-code",
+}
+
+
+def _to_wire_backend(name: str) -> str:
+    return _BACKEND_WIRE_ALIAS.get(name.lower(), name)
+
+
+def canon_backend(name: str | None) -> str | None:
+    """Canonical form for comparing backend strings across bridge/VD.
+
+    Collapses case, whitespace, hyphens, and underscores so that the
+    purpose token ``claude``, the wire name ``claude-code``, and VD's SSE
+    display name ``Claude Code`` all hash to the same value.
+    """
+    if not name:
+        return None
+    s = "".join(c for c in name.lower() if c.isalnum())
+    if s == "claude":
+        s = "claudecode"
+    return s
+
+
 class VibeDeckClient:
     """Async client for VibeDeck's REST API and SSE event stream."""
 
@@ -35,7 +63,7 @@ class VibeDeckClient:
     ) -> dict:
         payload: dict = {"message": message, "cwd": cwd}
         if backend:
-            payload["backend"] = backend
+            payload["backend"] = _to_wire_backend(backend)
         if model_index is not None:
             payload["model_index"] = model_index
         if source_session_id:

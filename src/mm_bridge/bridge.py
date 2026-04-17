@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import attribution, directives, name_sync, purpose
+from . import attribution, directives, name_sync, purpose, vd_client
 from .config import ChannelMapping, Config
 from .mm_client import MattermostClient
 from .typing_indicator import TypingIndicator
@@ -385,6 +385,20 @@ class Bridge:
                     model_index = i
                     break
 
+        # Register pending BEFORE create_session: VD emits `session_added`
+        # over SSE before the HTTP response lands, so if we registered after
+        # the await, _on_vd_session_added would find no pending invite and
+        # orphan the session into a new auto-created channel.
+        self.pending_mm_sessions[channel_id] = PendingMattermostSession(
+            channel_id=channel_id,
+            cwd=effective_cwd,
+            backend=cfg.backend,
+            initial_message=INVITE_PLACEHOLDER,
+            requested_at=time.monotonic(),
+            purpose_cfg=cfg,
+        )
+        self.purpose_by_channel[channel_id] = cfg
+
         try:
             resp = await self.vd.create_session(
                 message=INVITE_PLACEHOLDER,
@@ -394,6 +408,8 @@ class Bridge:
             )
         except Exception:
             logger.exception("Failed to create VD session for channel %s", channel_id)
+            self.pending_mm_sessions.pop(channel_id, None)
+            self.purpose_by_channel.pop(channel_id, None)
             try:
                 self.mm.post_message(
                     channel_id, ":warning: Failed to start a VibeDeck session.",
@@ -404,28 +420,28 @@ class Bridge:
 
         status = resp.get("status")
         if status == "permission_denied":
+            self.pending_mm_sessions.pop(channel_id, None)
+            self.purpose_by_channel.pop(channel_id, None)
             self.mm.post_message(
                 channel_id,
                 ":warning: VibeDeck could not start the session — needs additional permissions.",
             )
             return
         if status != "started":
+            self.pending_mm_sessions.pop(channel_id, None)
+            self.purpose_by_channel.pop(channel_id, None)
             self.mm.post_message(
                 channel_id,
                 f":warning: VibeDeck returned unexpected status `{status}` while starting the session.",
             )
             return
 
+        # VD may have normalised the cwd — keep pending in sync so the claim
+        # path matches projectPath from the SSE event.
         cwd = resp.get("cwd") or effective_cwd
-        self.pending_mm_sessions[channel_id] = PendingMattermostSession(
-            channel_id=channel_id,
-            cwd=cwd,
-            backend=cfg.backend,
-            initial_message=INVITE_PLACEHOLDER,
-            requested_at=time.monotonic(),
-            purpose_cfg=cfg,
-        )
-        self.purpose_by_channel[channel_id] = cfg
+        pending = self.pending_mm_sessions.get(channel_id)
+        if pending is not None:
+            pending.cwd = cwd
 
         welcome = self._format_welcome(cfg, cwd)
         try:
@@ -816,7 +832,7 @@ class Bridge:
     async def _claim_pending_invite(self, session_id: str, data: dict) -> bool:
         self._expire_pending()
         incoming_cwd = _normalize_path(data.get("projectPath"))
-        incoming_backend = data.get("backend") or None
+        incoming_backend_canon = vd_client.canon_backend(data.get("backend"))
         first_msg = (data.get("firstMessage") or "").strip()
 
         if not incoming_cwd:
@@ -826,7 +842,9 @@ class Bridge:
         for channel_id, pending in self.pending_mm_sessions.items():
             if _normalize_path(pending.cwd) != incoming_cwd:
                 continue
-            if pending.backend and incoming_backend and pending.backend != incoming_backend:
+            pending_backend_canon = vd_client.canon_backend(pending.backend)
+            if (pending_backend_canon and incoming_backend_canon
+                    and pending_backend_canon != incoming_backend_canon):
                 continue
             if first_msg:
                 pending_msg = pending.initial_message.strip()
