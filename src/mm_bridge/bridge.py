@@ -507,8 +507,10 @@ class Bridge:
         if not parent_session:
             return  # thread in an unmapped channel
 
+        fork_message = self._wrap_thread_fork_message(channel_id, root_id, message)
+
         try:
-            resp = await self.vd.fork_session(parent_session, message)
+            resp = await self.vd.fork_session(parent_session, fork_message)
         except Exception:
             logger.exception("fork_session error for session %s", parent_session[:8])
             self._mark_dead_thread(channel_id, root_id,
@@ -527,7 +529,7 @@ class Bridge:
             channel_id=channel_id,
             cwd=cwd,
             backend=parent_meta.get("backend") or None,
-            initial_message=message,
+            initial_message=fork_message,
             requested_at=time.monotonic(),
             is_fork=True,
             fork_parent_session=parent_session,
@@ -536,6 +538,28 @@ class Bridge:
         ))
         logger.info("Thread fork requested for %s:%s from parent %s",
                     channel_id, root_id[:8], parent_session[:8])
+
+    def _wrap_thread_fork_message(
+        self, channel_id: str, root_id: str, message: str,
+    ) -> str:
+        """Prefix the fork's initial message with thread context for the LLM."""
+        quoted_root = ""
+        try:
+            root_post = self.mm.get_post(root_id)
+            root_text = (root_post.get("message") or "").strip()
+            if root_text:
+                quoted_root = "\n".join(f"> {line}" for line in root_text.splitlines())
+        except Exception:
+            logger.debug("Failed to fetch thread-root post %s", root_id, exc_info=True)
+
+        header = (
+            "[Mattermost thread context] You are continuing the parent "
+            "conversation in a Mattermost thread. The user replied to this "
+            "message:\n\n"
+            f"{quoted_root or '> (original message could not be retrieved)'}\n\n"
+            "Their reply follows:\n\n"
+        )
+        return header + message
 
     def _mark_dead_thread(
         self, channel_id: str, root_id: str, reason_text: str,
@@ -748,24 +772,19 @@ class Bridge:
     async def _claim_pending_fork(self, session_id: str, data: dict) -> bool:
         self._expire_pending()
         incoming_cwd = _normalize_path(data.get("projectPath"))
-        first_msg = (data.get("firstMessage") or "").strip()
 
-        candidates: list[PendingMattermostSession] = []
-        for pending in self.pending_forks:
-            if incoming_cwd and _normalize_path(pending.cwd) != incoming_cwd:
-                continue
-            if first_msg:
-                pending_msg = pending.initial_message.strip()
-                if not (
-                    pending_msg.startswith(first_msg)
-                    or first_msg.startswith(pending_msg)
-                ):
-                    continue
-            candidates.append(pending)
+        # Fork claims can't use firstMessage: on Claude Code, a forked
+        # session's firstMessage is the parent's context-continuation summary,
+        # not the thread message. Match purely on cwd; if multiple forks are
+        # pending for the same cwd, take the oldest one (FIFO).
+        candidates: list[PendingMattermostSession] = [
+            p for p in self.pending_forks
+            if not incoming_cwd or _normalize_path(p.cwd) == incoming_cwd
+        ]
 
-        if len(candidates) != 1:
+        if not candidates:
             return False
-
+        candidates.sort(key=lambda p: p.requested_at)
         pending = candidates[0]
         self.pending_forks.remove(pending)
         ch_id = pending.fork_thread_channel or ""

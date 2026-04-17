@@ -35,6 +35,7 @@ class FakeMattermostClient:
     uploaded: list[tuple[str, str]] = field(default_factory=list)
     users: dict = field(default_factory=dict)
     posts_by_channel: dict = field(default_factory=dict)
+    posts_by_id: dict = field(default_factory=dict)
 
     def login(self) -> None:
         pass
@@ -86,6 +87,9 @@ class FakeMattermostClient:
 
     def get_posts(self, channel_id: str, limit: int) -> list[dict]:
         return self.posts_by_channel.get(channel_id, [])[:limit]
+
+    def get_post(self, post_id: str) -> dict:
+        return self.posts_by_id.get(post_id, {"message": ""})
 
 
 @dataclass
@@ -359,13 +363,19 @@ class ThreadForkTests(_BridgeTestCase):
         self.bridge.vd.sessions_meta = [
             {"id": "s1", "projectPath": "/tmp/proj", "backend": "claude"},
         ]
+        self.bridge.mm.posts_by_id["r1"] = {"message": "root post body"}
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "root_id": "r1", "message": "thread starter",
             "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.forks, [("s1", "thread starter")])
+        self.assertEqual(len(self.bridge.vd.forks), 1)
+        fork_sid, fork_msg = self.bridge.vd.forks[0]
+        self.assertEqual(fork_sid, "s1")
+        self.assertIn("Mattermost thread context", fork_msg)
+        self.assertIn("> root post body", fork_msg)
+        self.assertTrue(fork_msg.endswith("thread starter"))
         self.assertEqual(len(self.bridge.pending_forks), 1)
 
     async def test_thread_fork_unavailable_marks_dead(self):
@@ -393,9 +403,13 @@ class ThreadForkTests(_BridgeTestCase):
             fork_thread_channel="c1", fork_thread_root="r1",
         ))
 
+        # On Claude Code, a fork's firstMessage is the parent's
+        # context-continuation summary — NOT the user's thread message.
+        # The claim must succeed anyway (matched by cwd).
         await self.bridge._on_vd_event("session_added", {
             "id": "sess-fork", "projectPath": "/tmp/proj",
-            "firstMessage": "thread starter", "backend": "claude",
+            "firstMessage": "This session is being continued from a previous conversation...",
+            "backend": "claude",
         })
 
         self.assertEqual(

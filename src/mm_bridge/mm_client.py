@@ -106,6 +106,9 @@ class MattermostClient:
         posts = resp.get("posts", {})
         return [posts[pid] for pid in reversed(order) if pid in posts]
 
+    def get_post(self, post_id: str) -> dict:
+        return self._driver.posts.get_post(post_id)
+
     # ----- channels -----
 
     def create_channel(
