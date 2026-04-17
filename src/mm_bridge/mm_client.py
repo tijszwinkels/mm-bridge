@@ -146,11 +146,11 @@ class MattermostClient:
         self, channel_id: str, parent_id: str | None = None
     ) -> None:
         """Publish a 'user is typing' event from the bot to the channel."""
-        options: dict = {}
+        options: dict = {"channel_id": channel_id}
         if parent_id:
             options["parent_id"] = parent_id
         self._driver.users.publish_user_typing(
-            self._bot_user_id, channel_id, options=options
+            self._bot_user_id, options=options
         )
 
     # ----- files -----
