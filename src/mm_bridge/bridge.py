@@ -30,7 +30,7 @@ VD_TITLE_MAX = 200
 
 _CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _LEAVE_CMD_RE = re.compile(r"^@claude\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
-_STOP_CMD_RE = re.compile(r"^@claude\s+stop\s*$", re.IGNORECASE)
+_STOP_CMD_RE = re.compile(r"^(?P<mention>@claude\s+)?stop\s*$", re.IGNORECASE)
 _RUNTIME_TOGGLE_RE = re.compile(
     r"^(autorespond|noautorespond|autoresponse|noautoresponse)$", re.IGNORECASE,
 )
@@ -366,10 +366,12 @@ class Bridge:
                 channel_id, session_id, thread_root=None, reason=(m.group(1) or "").strip(),
             )
             return
-        # Command: @claude stop
-        if _STOP_CMD_RE.match(message):
-            await self._run_stop_command(channel_id, session_id, thread_root=None)
-            return
+        # Command: @claude stop (bare `stop` is honored only in autorespond mode)
+        if sm := _STOP_CMD_RE.match(message):
+            cfg = self.purpose_by_channel.get(channel_id)
+            if sm.group("mention") or not (cfg and cfg.mention_only):
+                await self._run_stop_command(channel_id, session_id, thread_root=None)
+                return
 
         await self._forward_user_post(
             channel_id, session_id, post, message, thread_root=None,
@@ -1044,11 +1046,13 @@ class Bridge:
             if cm := _CATCH_UP_RE.match(message):
                 await self._run_catch_up(channel_id, thread_session, root_id, cm)
                 return
-            if _STOP_CMD_RE.match(message):
-                await self._run_stop_command(
-                    channel_id, thread_session, thread_root=root_id,
-                )
-                return
+            if sm := _STOP_CMD_RE.match(message):
+                cfg = self.purpose_by_channel.get(channel_id)
+                if sm.group("mention") or not (cfg and cfg.mention_only):
+                    await self._run_stop_command(
+                        channel_id, thread_session, thread_root=root_id,
+                    )
+                    return
             await self._forward_user_post(
                 channel_id, thread_session, post, message, thread_root=root_id,
             )

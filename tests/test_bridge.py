@@ -767,6 +767,49 @@ class StopCommandTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.interrupted, [])
 
+    async def test_bare_stop_in_autorespond_mode_interrupts(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=False,
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, ["s1"])
+
+    async def test_bare_stop_in_mention_only_mode_is_not_interrupt(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link("c1", "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+
+    async def test_bare_stop_in_thread_autorespond_interrupts_thread_session(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link("c1", "parent-s")
+        self.bridge.mapping.link_thread("c1", "r1", "fork-s")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=False,
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "stop",
+            "user_id": "u1", "type": "", "root_id": "r1",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, ["fork-s"])
+
 
 class FirstMessageConfigTests(_BridgeTestCase):
     """First user message after invite may re-configure the channel via tokens.
