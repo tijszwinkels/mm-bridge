@@ -38,6 +38,20 @@ def format_spawn_announcement(
     return f"{header}\n\n{quoted}"
 
 
+def format_spawn_kickoff(parent_channel_name: str, prompt: str) -> str:
+    """Kickoff message posted into a newly-spawned sub-channel.
+
+    VD's initial prompt stays inside VibeDeck and never reaches MM, so
+    without this post the new channel would appear empty until the
+    backend emits its first assistant reply.
+    """
+    header = f":thread: Spawned from ~{parent_channel_name}~"
+    if not prompt.strip():
+        return header
+    quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
+    return f"{header}\n\n{quoted}"
+
+
 def derive_display_name(title: str | None, fallback: str) -> str:
     """Resolve the ``--title`` argument or fall back to a default.
 

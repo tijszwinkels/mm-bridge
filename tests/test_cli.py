@@ -326,12 +326,17 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertEqual(
             self.fake_mm.headers, [("new-chan", "Parent: ~parent-slug~")],
         )
-        # Parent channel announcement posted.
-        self.assertEqual(len(self.fake_mm.posts), 1)
-        parent_post_chan, parent_post_body = self.fake_mm.posts[0]
-        self.assertEqual(parent_post_chan, "parent-chan")
-        self.assertIn("Spawned **Bug Fix** in ~s-abc~", parent_post_body)
-        self.assertIn("> fix the bug", parent_post_body)
+        # Two posts: kickoff in sub-channel, announcement in parent.
+        self.assertEqual(len(self.fake_mm.posts), 2)
+        posts_by_chan = dict(self.fake_mm.posts)
+        self.assertIn("new-chan", posts_by_chan)
+        self.assertIn("parent-chan", posts_by_chan)
+        sub_body = posts_by_chan["new-chan"]
+        parent_body = posts_by_chan["parent-chan"]
+        self.assertIn("Spawned from ~parent-slug~", sub_body)
+        self.assertIn("> fix the bug", sub_body)
+        self.assertIn("Spawned **Bug Fix** in ~s-abc~", parent_body)
+        self.assertIn("> fix the bug", parent_body)
 
     def test_spawn_without_title_does_not_rename(self) -> None:
         rc = self._invoke(["mm-bridge", "spawn", "ad hoc"])
@@ -340,11 +345,12 @@ class SpawnCommandTests(unittest.TestCase):
         # Header still set.
         self.assertEqual(len(self.fake_mm.headers), 1)
         # Parent post uses daemon-derived display_name.
+        posts_by_chan = dict(self.fake_mm.posts)
         self.assertIn(
-            "**Auto-derived Title**", self.fake_mm.posts[0][1],
+            "**Auto-derived Title**", posts_by_chan["parent-chan"],
         )
 
-    def test_spawn_no_forward_prompt_skips_parent_post(self) -> None:
+    def test_spawn_no_forward_prompt_skips_all_posts(self) -> None:
         rc = self._invoke([
             "mm-bridge", "spawn", "quiet one", "--no-forward-prompt",
         ])

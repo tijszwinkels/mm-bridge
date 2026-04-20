@@ -330,6 +330,18 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             "Failed to set parent header on %s", new_channel_id, exc_info=True,
         )
 
+    if not args.no_forward_prompt:
+        try:
+            mm.post_message(
+                new_channel_id,
+                spawn_mod.format_spawn_kickoff(parent_name, args.prompt),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to post kickoff message to new channel",
+                exc_info=True,
+            )
+
     if args.invite:
         try:
             _invite_to_channel(mm, new_channel_id, args.invite)
@@ -416,7 +428,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_spawn.add_argument(
         "--no-forward-prompt",
         action="store_true",
-        help="Don't post the spawn announcement to the parent channel.",
+        help="Don't post the prompt to either the new or parent channel.",
     )
     p_spawn.set_defaults(func=cmd_spawn)
 
