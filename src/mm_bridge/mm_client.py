@@ -138,6 +138,10 @@ class MattermostClient:
     def get_channel(self, channel_id: str) -> dict:
         return self._driver.channels.get_channel(channel_id)
 
+    def get_channel_members(self, channel_id: str) -> list[dict]:
+        """Return membership records (user_id + roles) for `channel_id`."""
+        return self._driver.channels.get_channel_members(channel_id)
+
     def remove_self_from_channel(self, channel_id: str) -> None:
         """Remove the bot from a channel."""
         self._driver.channels.remove_channel_member(channel_id, self._bot_user_id)

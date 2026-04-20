@@ -42,6 +42,8 @@ class FakeMattermostClient:
     bot_channel_ids: set = field(default_factory=set)
     public_channels: list = field(default_factory=list)
     joined: list = field(default_factory=list)
+    # First-message preamble support:
+    channel_members: dict = field(default_factory=dict)
 
     def login(self) -> None:
         pass
@@ -123,6 +125,9 @@ class FakeMattermostClient:
         for cid in newly:
             self.join_channel(cid)
         return newly
+
+    def get_channel_members(self, channel_id: str) -> list:
+        return list(self.channel_members.get(channel_id, []))
 
 
 @dataclass
@@ -844,7 +849,11 @@ class FirstMessageConfigTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.sent, [(session_id, "hello world")])
+        # Forwarded — message body may be prefixed with a first-message
+        # preamble; we only assert the tail is correct here.
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        self.assertEqual(self.bridge.vd.sent[0][0], session_id)
+        self.assertTrue(self.bridge.vd.sent[0][1].endswith("hello world"))
         self.assertNotIn("c1", self.bridge.awaiting_first_message)
 
     async def test_flag_only_config_updates_in_place_no_session_restart(self):
@@ -896,8 +905,11 @@ class FirstMessageConfigTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        # Forwarded (with mention stripped).
-        self.assertEqual(self.bridge.vd.sent, [(session_id, "hi")])
+        # Forwarded (with mention stripped). A first-message preamble may
+        # prefix the body; assert only that the tail is "hi".
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        self.assertEqual(self.bridge.vd.sent[0][0], session_id)
+        self.assertTrue(self.bridge.vd.sent[0][1].endswith("hi"))
 
     async def test_only_first_message_is_checked_for_config(self):
         """Once the channel is no longer awaiting, tokens-that-look-like-config
@@ -1292,6 +1304,176 @@ class AutoJoinTests(_BridgeTestCase):
         })
 
         self.assertEqual(self.bridge.vd.created, [])
+
+
+class FirstMessagePreambleTests(_BridgeTestCase):
+    """When a user posts the first message after invite, prepend a short
+    MM-context preamble to the forwarded VD message."""
+
+    async def _prime_channel_with_members(
+        self,
+        channel_id: str,
+        *,
+        display_name: str,
+        members: list[dict],
+    ) -> str:
+        """Set up a mapped channel with `awaiting_first_message` set and the
+        given member roster. Returns the session_id."""
+        self.bridge.mm.channels[channel_id] = {
+            "id": channel_id, "purpose": "", "display_name": display_name,
+        }
+        for m in members:
+            uid = m["user_id"]
+            self.bridge.mm.users[uid] = {
+                "id": uid,
+                "username": m.get("username") or f"u-{uid[:4]}",
+                "is_bot": bool(m.get("is_bot")),
+            }
+        self.bridge.mm.channel_members[channel_id] = [
+            {"user_id": m["user_id"]} for m in members
+        ]
+        session_id = "s-primed"
+        self.bridge.mapping.link(channel_id, session_id)
+        self.bridge.awaiting_first_message.add(channel_id)
+        return session_id
+
+    async def test_single_user_preamble_prepended(self) -> None:
+        session_id = await self._prime_channel_with_members(
+            "c1",
+            display_name="Bug Bash",
+            members=[
+                {"user_id": self.bridge.mm.bot_user_id, "is_bot": True},
+                {"user_id": "u-alice", "username": "alice"},
+            ],
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hi there",
+            "user_id": "u-alice", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        sent = self.bridge.vd.sent[0][1]
+        self.assertTrue(
+            sent.startswith(
+                '[Running inside Mattermost channel "Bug Bash". '
+                "You're talking to @alice. "
+                "@-mention to keep their attention.]"
+            ),
+            f"preamble missing or malformed; got: {sent!r}",
+        )
+        self.assertIn("hi there", sent)
+
+    async def test_multi_user_preamble_lists_humans_only(self) -> None:
+        await self._prime_channel_with_members(
+            "c1",
+            display_name="team-room",
+            members=[
+                {"user_id": self.bridge.mm.bot_user_id, "is_bot": True},
+                {"user_id": "u-alice", "username": "alice"},
+                {"user_id": "u-bob", "username": "bob"},
+                {"user_id": "u-gpt", "username": "gpt", "is_bot": True},
+            ],
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "ping",
+            "user_id": "u-alice", "type": "",
+        })
+
+        sent = self.bridge.vd.sent[0][1]
+        self.assertIn(
+            "Multiple users in this channel (`alice`, `bob`) "
+            "— messages are prefixed with `username:`",
+            sent,
+        )
+        self.assertNotIn("gpt", sent)  # bot excluded
+
+    async def test_zero_humans_omits_user_sentence(self) -> None:
+        await self._prime_channel_with_members(
+            "c1",
+            display_name="bots-only",
+            members=[
+                {"user_id": self.bridge.mm.bot_user_id, "is_bot": True},
+            ],
+        )
+        # A human posts even though they're not (yet) in the member list.
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "stranger here",
+            "user_id": "u-stranger", "type": "",
+        })
+
+        sent = self.bridge.vd.sent[0][1]
+        self.assertTrue(sent.startswith(
+            '[Running inside Mattermost channel "bots-only". '
+            "@-mention to keep their attention.]"
+        ))
+
+    async def test_preamble_not_added_on_second_message(self) -> None:
+        await self._prime_channel_with_members(
+            "c1",
+            display_name="Bug Bash",
+            members=[
+                {"user_id": self.bridge.mm.bot_user_id, "is_bot": True},
+                {"user_id": "u-alice", "username": "alice"},
+            ],
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "first",
+            "user_id": "u-alice", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "second",
+            "user_id": "u-alice", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.vd.sent), 2)
+        self.assertIn("Running inside Mattermost channel", self.bridge.vd.sent[0][1])
+        self.assertNotIn("Running inside Mattermost channel", self.bridge.vd.sent[1][1])
+
+    async def test_config_token_first_message_does_not_forward_preamble(self) -> None:
+        """First-message purpose tokens are consumed as config — nothing goes
+        to VD, so there's no preamble either."""
+        await self._prime_channel_with_members(
+            "c1",
+            display_name="Bug Bash",
+            members=[{"user_id": "u-alice", "username": "alice"}],
+        )
+        # Clear sent from any prior wiring.
+        self.bridge.vd.sent.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "autorespond",
+            "user_id": "u-alice", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_preamble_format_helper_single_user(self) -> None:
+        from mm_bridge.bridge import _format_first_message_preamble
+        out = _format_first_message_preamble("My Chan", ["alice"])
+        self.assertEqual(
+            out,
+            '[Running inside Mattermost channel "My Chan". '
+            "You're talking to @alice. "
+            "@-mention to keep their attention.]",
+        )
+
+    async def test_preamble_format_helper_multi_user(self) -> None:
+        from mm_bridge.bridge import _format_first_message_preamble
+        out = _format_first_message_preamble("My Chan", ["alice", "bob", "carol"])
+        self.assertIn("Multiple users in this channel (`alice`, `bob`, `carol`)", out)
+        self.assertIn("messages are prefixed with `username:`", out)
+
+    async def test_preamble_format_helper_empty(self) -> None:
+        from mm_bridge.bridge import _format_first_message_preamble
+        out = _format_first_message_preamble("My Chan", [])
+        self.assertEqual(
+            out,
+            '[Running inside Mattermost channel "My Chan". '
+            "@-mention to keep their attention.]",
+        )
 
 
 if __name__ == "__main__":

@@ -99,6 +99,34 @@ def _is_mm_system_post(post: dict) -> bool:
     return bool(post.get("type"))
 
 
+def _format_first_message_preamble(
+    channel_name: str, human_usernames: list[str],
+) -> str:
+    """Build the one-line `[...]` preamble for the first forwarded user message.
+
+    The preamble tells the model it's running inside a Mattermost channel,
+    who it's talking to, and how to keep their attention. Shape:
+
+        [Running inside Mattermost channel "<name>". <who>. @-mention to keep their attention.]
+
+    `<who>` varies:
+      - 1 human  → `You're talking to @<u>`
+      - ≥2       → ``Multiple users in this channel (`u1`, `u2`, ...) — messages are prefixed with `username:` ``
+      - 0        → omitted entirely
+    """
+    pieces = [f'Running inside Mattermost channel "{channel_name}".']
+    if len(human_usernames) == 1:
+        pieces.append(f"You're talking to @{human_usernames[0]}.")
+    elif len(human_usernames) > 1:
+        user_list = ", ".join(f"`{u}`" for u in human_usernames)
+        pieces.append(
+            f"Multiple users in this channel ({user_list}) "
+            "— messages are prefixed with `username:`."
+        )
+    pieces.append("@-mention to keep their attention.")
+    return "[" + " ".join(pieces) + "]"
+
+
 MM_INBOX_DIRNAME = ".mattermost-inbox"
 
 
@@ -343,6 +371,10 @@ class Bridge:
             return
 
         # First-message-after-invite: optionally reconfigure via plain tokens.
+        # The flag is consumed here so subsequent messages don't re-trigger
+        # config parsing. `is_first_user_message` carries forward so the
+        # forwarded message (if any) can carry the MM-context preamble.
+        is_first_user_message = False
         if channel_id in self.awaiting_first_message:
             self.awaiting_first_message.discard(channel_id)
             applied = await self._try_apply_first_message_config(
@@ -350,6 +382,7 @@ class Bridge:
             )
             if applied:
                 return
+            is_first_user_message = True
 
         # Runtime toggle (literal `autorespond` / `noautorespond`, nothing else).
         if _RUNTIME_TOGGLE_RE.match(message):
@@ -375,6 +408,7 @@ class Bridge:
 
         await self._forward_user_post(
             channel_id, session_id, post, message, thread_root=None,
+            first_message=is_first_user_message,
         )
 
     async def _on_mm_user_added(self, channel_id: str, user_id: str) -> None:
@@ -963,6 +997,7 @@ class Bridge:
         post: dict,
         message: str,
         thread_root: str | None,
+        first_message: bool = False,
     ) -> None:
         cfg = self.purpose_by_channel.get(channel_id)
         bot_mention = f"@{self.mm.bot_username}"
@@ -1000,6 +1035,11 @@ class Bridge:
             notes_block = "\n".join(attachment_notes)
             body = f"{notes_block}\n\n{body}" if body else notes_block
 
+        if first_message:
+            preamble = await self._compute_first_message_preamble(channel_id)
+            if preamble:
+                body = f"{preamble}\n\n{body}" if body else preamble
+
         logger.info("MM → VD [%s]: %s", session_id[:8], body[:80])
         try:
             await self.vd.send_message(session_id, body)
@@ -1020,6 +1060,55 @@ class Bridge:
             return u.get("username") or user_id[:8]
         except Exception:
             return user_id[:8]
+
+    async def _compute_first_message_preamble(self, channel_id: str) -> str:
+        """Build the MM-context preamble for the first forwarded user message.
+
+        Returns an empty string if the MM lookups fail — we'd rather ship the
+        user's message without a preamble than swallow it entirely.
+        """
+        try:
+            ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
+        except Exception:
+            logger.warning(
+                "Failed to fetch channel %s for first-message preamble",
+                channel_id, exc_info=True,
+            )
+            return ""
+        channel_name = (
+            ch.get("display_name") or ch.get("name") or channel_id
+        ).strip() or channel_id
+
+        try:
+            members = await asyncio.to_thread(
+                self.mm.get_channel_members, channel_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to fetch members for %s (first-message preamble)",
+                channel_id, exc_info=True,
+            )
+            members = []
+
+        human_usernames: list[str] = []
+        for m in members or []:
+            uid = m.get("user_id")
+            if not uid or uid == self.mm.bot_user_id:
+                continue
+            try:
+                u = await asyncio.to_thread(self.mm.get_user, uid)
+            except Exception:
+                logger.debug(
+                    "Failed to resolve user %s for preamble", uid, exc_info=True,
+                )
+                continue
+            if u.get("is_bot"):
+                continue
+            uname = u.get("username")
+            if uname:
+                human_usernames.append(uname)
+
+        return _format_first_message_preamble(channel_name, human_usernames)
 
     # ─────────────────────── Thread forks ──────────────────────────────────
 
