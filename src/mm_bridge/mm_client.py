@@ -190,6 +190,15 @@ class MattermostClient:
     def get_user(self, user_id: str) -> dict:
         return self._driver.users.get_user(user_id)
 
+    def get_user_by_username(self, username: str) -> dict:
+        return self._driver.users.get_user_by_username(username)
+
+    def invite_user(self, channel_id: str, user_id: str) -> dict:
+        """Add a user to a channel (thin wrapper around add_channel_member)."""
+        return self._driver.channels.add_channel_member(channel_id, options={
+            "user_id": user_id,
+        })
+
     def publish_user_typing(
         self, channel_id: str, parent_id: str | None = None
     ) -> None:
