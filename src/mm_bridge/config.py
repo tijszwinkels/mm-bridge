@@ -46,7 +46,7 @@ class Config:
     # Auto-join all public channels (silent presence — sessions start on
     # first engagement, not on join).
     auto_join_public_channels: bool = False
-    auto_join_reconcile_seconds: float = 60.0
+    auto_join_reconcile_seconds: float = 5.0
 
     # State + config file paths
     state_file: str = str(Path.home() / ".config/mm-bridge/state.json")

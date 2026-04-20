@@ -520,7 +520,13 @@ class Bridge:
         return True
 
     async def _on_mm_channel_created(self, channel_id: str) -> None:
-        """New channel appeared — join it if auto-join is enabled."""
+        """New channel appeared — join it if auto-join is enabled.
+
+        Note: Mattermost scopes `channel_created` WS events to the creating
+        user's session only, so this path typically fires only for channels
+        the bot creates itself (e.g. `mm-bridge spawn`). Human-created public
+        channels are picked up by the reconciler.
+        """
         if not self.config.auto_join_public_channels:
             return
         self._self_joined_channels.add(channel_id)
