@@ -1,4 +1,4 @@
-"""CLI subcommand tests — invite / channel / serve dispatch."""
+"""CLI subcommand tests — invite / channel / serve / spawn dispatch."""
 
 from __future__ import annotations
 
@@ -15,7 +15,11 @@ from mm_bridge.config import Config
 @dataclass
 class FakeMM:
     users_by_username: dict = field(default_factory=dict)
+    channels_by_id: dict = field(default_factory=dict)
     invited: list = field(default_factory=list)
+    posts: list = field(default_factory=list)
+    renames: list = field(default_factory=list)
+    headers: list = field(default_factory=list)
     logged_in: bool = False
     missing_users: set = field(default_factory=set)
     invite_failures: set = field(default_factory=set)
@@ -32,6 +36,19 @@ class FakeMM:
         if user_id in self.invite_failures:
             raise RuntimeError(f"invite failed for {user_id}")
         self.invited.append((channel_id, user_id))
+
+    def get_channel(self, channel_id: str) -> dict:
+        return self.channels_by_id[channel_id]
+
+    def post_message(self, channel_id: str, message: str) -> dict:
+        self.posts.append((channel_id, message))
+        return {"id": f"post-{len(self.posts)}"}
+
+    def rename_channel(self, channel_id: str, display_name: str) -> None:
+        self.renames.append((channel_id, display_name))
+
+    def set_channel_header(self, channel_id: str, header: str) -> None:
+        self.headers.append((channel_id, header))
 
 
 class InviteHelperTests(unittest.TestCase):
@@ -165,6 +182,206 @@ class ChannelCommandTests(unittest.TestCase):
                 cli.main()
             self.assertEqual(cm.exception.code, 0)
         self.assertEqual(buf.getvalue().strip(), "my-channel")
+
+
+class WaitForNewSidecarTests(unittest.TestCase):
+    """`_wait_for_new_sidecar` — the polling helper used by `cmd_spawn`."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sdir = Path(self.tmp.name) / "sessions"
+        self.sdir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _fake_clock(self, ticks: list[float]):
+        """Return a clock() that yields successive values from `ticks`."""
+        it = iter(ticks)
+        return lambda: next(it)
+
+    def test_returns_new_sidecar_on_first_poll(self) -> None:
+        sidecar.write(self.sdir, "new-sess", "new-chan")
+        sid, cid = cli._wait_for_new_sidecar(
+            self.sdir, before=set(),
+            timeout=1.0, interval=0.01,
+            clock=lambda: 0.0,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(sid, "new-sess")
+        self.assertEqual(cid, "new-chan")
+
+    def test_ignores_sidecars_present_in_before(self) -> None:
+        sidecar.write(self.sdir, "existing", "existing-chan")
+        sidecar.write(self.sdir, "fresh", "fresh-chan")
+        sid, cid = cli._wait_for_new_sidecar(
+            self.sdir, before={"existing"},
+            timeout=1.0, interval=0.01,
+            clock=lambda: 0.0,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(sid, "fresh")
+        self.assertEqual(cid, "fresh-chan")
+
+    def test_timeout_when_no_new_sidecar(self) -> None:
+        # Clock advances past deadline immediately after the first poll.
+        clock = self._fake_clock([0.0, 0.0, 2.0])  # start, loop 1, loop 2
+        with self.assertRaises(TimeoutError):
+            cli._wait_for_new_sidecar(
+                self.sdir, before=set(),
+                timeout=1.0, interval=0.01,
+                clock=clock,
+                sleep=lambda _: None,
+            )
+
+    def test_empty_sidecar_raises(self) -> None:
+        (self.sdir / "bad-sess").write_text("")
+        with self.assertRaises(RuntimeError):
+            cli._wait_for_new_sidecar(
+                self.sdir, before=set(),
+                timeout=1.0, interval=0.01,
+                clock=lambda: 0.0,
+                sleep=lambda _: None,
+            )
+
+    def test_missing_dir_times_out(self) -> None:
+        missing = Path(self.tmp.name) / "does-not-exist"
+        clock = self._fake_clock([0.0, 0.0, 2.0])
+        with self.assertRaises(TimeoutError):
+            cli._wait_for_new_sidecar(
+                missing, before=set(),
+                timeout=1.0, interval=0.01,
+                clock=clock,
+                sleep=lambda _: None,
+            )
+
+
+class SpawnCommandTests(unittest.TestCase):
+    """End-to-end dispatch of `mm-bridge spawn` with mocked MM/VD/sidecar."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sdir = Path(self.tmp.name) / "sessions"
+        # Parent session's sidecar.
+        sidecar.write(self.sdir, "parent-sess", "parent-chan")
+
+        self.cfg = Config(
+            mm_bot_token="t",
+            sidecar_dir=str(self.sdir),
+            state_file=f"{self.tmp.name}/state.json",
+            vd_url="http://vd.invalid",
+            default_cwd="/tmp",
+            default_backend="claude",
+        )
+
+        self.fake_mm = FakeMM(
+            users_by_username={"alice": {"id": "u-alice"}},
+            channels_by_id={
+                "parent-chan": {"id": "parent-chan", "name": "parent-slug"},
+                "new-chan": {
+                    "id": "new-chan", "name": "s-abc",
+                    "display_name": "Auto-derived Title",
+                },
+            },
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _simulate_daemon_creates_sidecar(
+        self, sess_id: str = "new-sess", chan_id: str = "new-chan",
+    ):
+        """Return an async stub that mimics VD → daemon → sidecar appearance."""
+        async def _stub(vd_url, message, cwd, backend):
+            sidecar.write(self.sdir, sess_id, chan_id)
+            return {"status": "started"}
+        return _stub
+
+    def _invoke(self, argv):
+        with patch("sys.argv", argv), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict(
+                "os.environ", {"CLAUDE_SESSION_ID": "parent-sess"},
+             ), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch(
+                 "mm_bridge.cli._vd_create_session",
+                 side_effect=self._simulate_daemon_creates_sidecar(),
+             ):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            return cm.exception.code
+
+    def test_spawn_happy_path(self) -> None:
+        rc = self._invoke([
+            "mm-bridge", "spawn", "fix the bug",
+            "--title", "Bug Fix", "--cwd", "/repo", "--backend", "claude",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.fake_mm.logged_in)
+        # Rename + header applied to the new channel.
+        self.assertEqual(
+            self.fake_mm.renames, [("new-chan", "Bug Fix")],
+        )
+        self.assertEqual(
+            self.fake_mm.headers, [("new-chan", "Parent: ~parent-slug~")],
+        )
+        # Parent channel announcement posted.
+        self.assertEqual(len(self.fake_mm.posts), 1)
+        parent_post_chan, parent_post_body = self.fake_mm.posts[0]
+        self.assertEqual(parent_post_chan, "parent-chan")
+        self.assertIn("Spawned **Bug Fix** in ~s-abc~", parent_post_body)
+        self.assertIn("> fix the bug", parent_post_body)
+
+    def test_spawn_without_title_does_not_rename(self) -> None:
+        rc = self._invoke(["mm-bridge", "spawn", "ad hoc"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.fake_mm.renames, [])
+        # Header still set.
+        self.assertEqual(len(self.fake_mm.headers), 1)
+        # Parent post uses daemon-derived display_name.
+        self.assertIn(
+            "**Auto-derived Title**", self.fake_mm.posts[0][1],
+        )
+
+    def test_spawn_no_forward_prompt_skips_parent_post(self) -> None:
+        rc = self._invoke([
+            "mm-bridge", "spawn", "quiet one", "--no-forward-prompt",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.fake_mm.posts, [])
+
+    def test_spawn_with_invite_adds_user_to_new_channel(self) -> None:
+        rc = self._invoke([
+            "mm-bridge", "spawn", "need help", "--invite", "alice",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.fake_mm.invited, [("new-chan", "u-alice")])
+
+    def test_spawn_without_session_env_exits_2(self) -> None:
+        with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {}, clear=False) as env:
+            env.pop("CLAUDE_SESSION_ID", None)
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_spawn_vd_failure_exits_3(self) -> None:
+        async def _boom(vd_url, message, cwd, backend):
+            raise RuntimeError("VD down")
+        with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict(
+                "os.environ", {"CLAUDE_SESSION_ID": "parent-sess"},
+             ), \
+             patch(
+                 "mm_bridge.cli._make_mm_client", return_value=self.fake_mm,
+             ), \
+             patch("mm_bridge.cli._vd_create_session", side_effect=_boom):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 3)
 
 
 if __name__ == "__main__":
