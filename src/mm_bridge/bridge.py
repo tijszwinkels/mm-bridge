@@ -169,7 +169,7 @@ class Bridge:
 
     def __init__(self, config: Config):
         self.config = config
-        self.mapping = ChannelMapping.load(config.state_file)
+        self.mapping = ChannelMapping.load(config.state_file, config.sidecar_dir)
         self.mm = MattermostClient(
             url=config.mm_url,
             port=config.mm_port,

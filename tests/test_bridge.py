@@ -199,6 +199,7 @@ class _BridgeTestCase(unittest.IsolatedAsyncioTestCase):
             mm_bot_token="t",
             default_cwd="/tmp/proj",
             state_file=f"{self.tmp.name}/state.json",
+            sidecar_dir=f"{self.tmp.name}/sidecar",
             default_backend="claude",
             default_model="opus",
         )

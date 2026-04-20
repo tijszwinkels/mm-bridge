@@ -10,6 +10,8 @@ import os
 import sys
 import tomllib
 
+from . import sidecar
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,7 @@ class Config:
     # State + config file paths
     state_file: str = str(Path.home() / ".config/mm-bridge/state.json")
     config_file: str = str(_config_file_path())
+    sidecar_dir: str = str(Path.home() / ".mm-bridge/sessions")
 
     # Attachment safety
     allowed_attachment_roots: list[str] = field(default_factory=list)
@@ -95,6 +98,7 @@ class Config:
         cfg._apply_env()
         cfg.default_cwd = _expand(cfg.default_cwd)
         cfg.state_file = _expand(cfg.state_file)
+        cfg.sidecar_dir = _expand(cfg.sidecar_dir)
         cfg.allowed_attachment_roots = [_expand(p) for p in cfg.allowed_attachment_roots]
         return cfg
 
@@ -109,6 +113,7 @@ class Config:
             "auto_join_public_channels",
             "auto_join_reconcile_seconds",
             "state_file",
+            "sidecar_dir",
             "allowed_attachment_roots",
             "catch_up_default_n",
             "catch_up_max_n",
@@ -165,6 +170,8 @@ class Config:
             )
         if "MM_BRIDGE_STATE" in env:
             self.state_file = env["MM_BRIDGE_STATE"]
+        if "MM_BRIDGE_SIDECAR_DIR" in env:
+            self.sidecar_dir = env["MM_BRIDGE_SIDECAR_DIR"]
 
 
 @dataclass
@@ -181,18 +188,25 @@ class ChannelMapping:
     thread_mapping: dict[str, str] = field(default_factory=dict)
     session_to_thread: dict[str, str] = field(default_factory=dict)
     _path: str = ""
+    _sidecar_dir: Path | None = None
 
     @classmethod
-    def load(cls, path: str) -> "ChannelMapping":
+    def load(
+        cls,
+        path: str,
+        sidecar_dir: Path | str | None = None,
+    ) -> "ChannelMapping":
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        m = cls(_path=path)
+        sd = Path(sidecar_dir) if sidecar_dir else sidecar.DEFAULT_DIR
+        m = cls(_path=path, _sidecar_dir=sd)
         if p.exists():
             data = json.loads(p.read_text())
             m.channel_to_session = data.get("channel_to_session", {})
             m.thread_mapping = data.get("thread_mapping", {})
             m.session_to_channel = {v: k for k, v in m.channel_to_session.items()}
             m.session_to_thread = {v: k for k, v in m.thread_mapping.items()}
+        sidecar.reconcile(sd, m.session_to_channel)
         return m
 
     def save(self) -> None:
@@ -211,12 +225,16 @@ class ChannelMapping:
         self.channel_to_session[channel_id] = session_id
         self.session_to_channel[session_id] = channel_id
         self.save()
+        if self._sidecar_dir is not None:
+            sidecar.write(self._sidecar_dir, session_id, channel_id)
 
     def unlink_channel(self, channel_id: str) -> str | None:
         session_id = self.channel_to_session.pop(channel_id, None)
         if session_id:
             self.session_to_channel.pop(session_id, None)
             self.save()
+            if self._sidecar_dir is not None:
+                sidecar.delete(self._sidecar_dir, session_id)
         return session_id
 
     def get_session(self, channel_id: str) -> str | None:
