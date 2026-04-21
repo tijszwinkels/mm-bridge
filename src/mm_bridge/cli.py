@@ -319,9 +319,20 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 "Failed to set display_name on %s", new_channel_id, exc_info=True,
             )
 
+    thread_permalink: str | None = None
+    if parent_anchor.is_thread:
+        base_url = cfg.mm_public_url or spawn_mod.build_mm_base_url(
+            cfg.mm_scheme, cfg.mm_url, cfg.mm_port,
+        )
+        thread_permalink = spawn_mod.format_post_permalink(
+            base_url, cfg.mm_team, parent_anchor.root_id or "",
+        )
     try:
         mm.set_channel_header(
-            new_channel_id, spawn_mod.format_parent_header(parent_name),
+            new_channel_id,
+            spawn_mod.format_parent_header(
+                parent_name, thread_permalink=thread_permalink,
+            ),
         )
     except Exception:
         logger.warning(

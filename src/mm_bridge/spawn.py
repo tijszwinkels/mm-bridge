@@ -11,14 +11,47 @@ from __future__ import annotations
 MM_DISPLAY_NAME_MAX = 64
 
 
-def format_parent_header(parent_channel_name: str) -> str:
+def format_parent_header(
+    parent_channel_name: str,
+    thread_permalink: str | None = None,
+) -> str:
     """Header for a spawned channel pointing back to its parent.
 
     Uses Mattermost's ``~channel-name~`` mention syntax so the header
-    renders as a clickable link (behaviour varies by MM version — see
-    the spec's "Open questions" section).
+    renders as a clickable link. When ``thread_permalink`` is supplied
+    (spawn from a thread-fork session), a ``[thread](url)`` link is
+    appended so the child can jump directly into the parent thread —
+    the bare channel mention would only land at the channel root and
+    lose the thread context.
     """
-    return f"Parent: ~{parent_channel_name}~"
+    base = f"Parent: ~{parent_channel_name}~"
+    if thread_permalink:
+        return f"{base} ([thread]({thread_permalink}))"
+    return base
+
+
+def build_mm_base_url(scheme: str, host: str, port: int) -> str:
+    """Assemble ``scheme://host[:port]``, omitting default ports.
+
+    Used as the fallback base for permalinks when ``mm_public_url`` is
+    not configured.
+    """
+    default = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    host_port = host if default else f"{host}:{port}"
+    return f"{scheme}://{host_port}"
+
+
+def format_post_permalink(base_url: str, team: str, post_id: str) -> str:
+    """Build a Mattermost post-permalink URL from a pre-resolved base.
+
+    MM renders ``<base>/<team>/pl/<post_id>`` as a deep link that opens
+    the post (and its thread, if any) in the web client. A trailing slash
+    on ``base_url`` is tolerated so operators can set
+    ``MM_PUBLIC_URL=http://host:port/`` without producing a doubled slash.
+    """
+    return f"{base_url.rstrip('/')}/{team}/pl/{post_id}"
 
 
 def format_spawn_announcement(

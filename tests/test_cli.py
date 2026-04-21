@@ -424,6 +424,33 @@ class SpawnCommandTests(unittest.TestCase):
                 cli.main()
             self.assertEqual(cm.exception.code, 2)
 
+    def test_spawn_from_thread_fork_uses_public_url_for_header_permalink(
+        self,
+    ) -> None:
+        """When ``mm_public_url`` is set, the Parent: header permalink
+        uses that base URL — not the daemon-internal ``mm_url``."""
+        self.cfg.mm_public_url = "http://pillar.tail72f2bc.ts.net:8065"
+        self.cfg.mm_team = "workspace"
+        sidecar.write(self.sdir, "fork-sess", "parent-chan", "root-9")
+        with patch("sys.argv", ["mm-bridge", "spawn", "carry on"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict(
+                "os.environ", {"CLAUDE_SESSION_ID": "fork-sess"},
+             ), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch(
+                 "mm_bridge.cli._vd_create_session",
+                 side_effect=self._simulate_daemon_creates_sidecar(),
+             ):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+        header_text = self.fake_mm.headers[0][1]
+        self.assertIn(
+            "http://pillar.tail72f2bc.ts.net:8065/workspace/pl/root-9",
+            header_text,
+        )
+
     def test_spawn_from_thread_fork_creates_sibling_channel(self) -> None:
         """Spawning from a thread-fork session must succeed. The sub-session
         lives in a fresh sibling channel (not nested thread) and the parent
@@ -449,6 +476,13 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertIsNone(posts_by_chan["new-chan"]["root_id"])
         # Announcement lands in the parent thread, not at the channel root.
         self.assertEqual(posts_by_chan["parent-chan"]["root_id"], "root-9")
+        # Child channel's Parent: header carries a permalink back into
+        # the parent thread, not just the channel mention.
+        self.assertEqual(len(self.fake_mm.headers), 1)
+        header_text = self.fake_mm.headers[0][1]
+        self.assertIn("Parent: ~parent-slug~", header_text)
+        self.assertIn("[thread](", header_text)
+        self.assertIn("/pl/root-9", header_text)
 
     def test_spawn_vd_failure_exits_3(self) -> None:
         async def _boom(vd_url, message, cwd, backend):

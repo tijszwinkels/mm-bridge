@@ -65,5 +65,36 @@ class ApplyEnvMmUrlTests(unittest.TestCase):
         self.assertEqual(cfg.mm_scheme, "https")
 
 
+class PublicUrlTests(unittest.TestCase):
+    """``mm_public_url`` — optional user-facing base URL for permalinks.
+
+    The daemon talks to MM over ``mm_url`` (often ``localhost``); permalinks
+    rendered in channel headers must point at a URL humans can reach from
+    their browsers. ``MM_PUBLIC_URL`` / ``[mattermost].public_url`` decouples
+    the two. Falls back to empty (callers construct from ``mm_url``).
+    """
+
+    def test_default_is_empty(self) -> None:
+        cfg = Config()
+        self.assertEqual(cfg.mm_public_url, "")
+
+    def test_env_var_sets_public_url(self) -> None:
+        cfg = Config()
+        with patch.dict(
+            "os.environ",
+            {"MM_PUBLIC_URL": "http://pillar.tail72f2bc.ts.net:8065"},
+            clear=True,
+        ):
+            cfg._apply_env()
+        self.assertEqual(
+            cfg.mm_public_url, "http://pillar.tail72f2bc.ts.net:8065",
+        )
+
+    def test_toml_mattermost_public_url_sets_field(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"mattermost": {"public_url": "https://mm.example.com"}})
+        self.assertEqual(cfg.mm_public_url, "https://mm.example.com")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,60 @@ class FormatParentHeaderTests(unittest.TestCase):
             "Parent: ~my-parent~",
         )
 
+    def test_appends_thread_permalink_when_forked(self) -> None:
+        self.assertEqual(
+            spawn.format_parent_header(
+                "my-parent",
+                thread_permalink="http://localhost:8065/workspace/pl/root-9",
+            ),
+            "Parent: ~my-parent~ "
+            "([thread](http://localhost:8065/workspace/pl/root-9))",
+        )
+
+    def test_ignores_empty_permalink(self) -> None:
+        self.assertEqual(
+            spawn.format_parent_header("my-parent", thread_permalink=""),
+            "Parent: ~my-parent~",
+        )
+
+
+class FormatPostPermalinkTests(unittest.TestCase):
+    def test_standard_url(self) -> None:
+        self.assertEqual(
+            spawn.format_post_permalink(
+                "http://localhost:8065", "workspace", "abc123",
+            ),
+            "http://localhost:8065/workspace/pl/abc123",
+        )
+
+    def test_trailing_slash_on_base_is_stripped(self) -> None:
+        self.assertEqual(
+            spawn.format_post_permalink(
+                "https://mm.example.com/", "team", "abc",
+            ),
+            "https://mm.example.com/team/pl/abc",
+        )
+
+
+class BuildMmBaseUrlTests(unittest.TestCase):
+    def test_standard_url(self) -> None:
+        self.assertEqual(
+            spawn.build_mm_base_url("http", "localhost", 8065),
+            "http://localhost:8065",
+        )
+
+    def test_omits_default_http_port(self) -> None:
+        self.assertEqual(
+            spawn.build_mm_base_url("http", "mm.example.com", 80),
+            "http://mm.example.com",
+        )
+
+    def test_omits_default_https_port(self) -> None:
+        self.assertEqual(
+            spawn.build_mm_base_url("https", "mm.example.com", 443),
+            "https://mm.example.com",
+        )
+
 
 class FormatSpawnAnnouncementTests(unittest.TestCase):
     def test_header_line_uses_title_and_channel_name(self) -> None:

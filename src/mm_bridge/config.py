@@ -35,6 +35,11 @@ class Config:
     mm_bot_token: str = ""
     mm_team: str = "workspace"
 
+    # User-facing MM base URL (e.g. a Tailscale hostname) used for
+    # permalinks embedded in channel headers / messages. Empty = fall back
+    # to the daemon's own ``mm_scheme://mm_url:mm_port``.
+    mm_public_url: str = ""
+
     # VibeDeck
     vd_url: str = "http://localhost:8765"
 
@@ -155,6 +160,8 @@ class Config:
             self.mm_scheme = mm["scheme"]
         if "team" in mm:
             self.mm_team = mm["team"]
+        if "public_url" in mm:
+            self.mm_public_url = mm["public_url"]
 
         vd = data.get("vibedeck", {}) or {}
         if "url" in vd:
@@ -172,6 +179,8 @@ class Config:
             self.mm_bot_token = env["MM_BOT_TOKEN"]
         if "MM_TEAM" in env:
             self.mm_team = env["MM_TEAM"]
+        if "MM_PUBLIC_URL" in env:
+            self.mm_public_url = env["MM_PUBLIC_URL"]
         if "VD_URL" in env:
             self.vd_url = env["VD_URL"]
         if "VD_DEFAULT_CWD" in env:
