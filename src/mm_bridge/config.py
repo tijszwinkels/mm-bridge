@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 import json
 import logging
 import os
@@ -104,6 +105,25 @@ class Config:
 
     # ----- internals -----
 
+    def _apply_mm_url(self, raw: str) -> None:
+        """Accept either a bare hostname or a full URL for MM_URL.
+
+        A full URL (``http://host[:port]`` / ``https://host[:port]``) is
+        split into scheme/host/port so callers can keep a single canonical
+        value in their .env files. Explicit ``MM_PORT`` / ``MM_SCHEME``
+        still override (applied after this by the caller).
+        """
+        if not (raw.startswith("http://") or raw.startswith("https://")):
+            self.mm_url = raw
+            return
+        parsed = urlparse(raw)
+        self.mm_scheme = parsed.scheme
+        self.mm_url = parsed.hostname or raw
+        if parsed.port is not None:
+            self.mm_port = parsed.port
+        else:
+            self.mm_port = 443 if parsed.scheme == "https" else 80
+
     def _apply_toml(self, data: dict) -> None:
         for key in (
             "default_backend",
@@ -143,7 +163,7 @@ class Config:
     def _apply_env(self) -> None:
         env = os.environ
         if "MM_URL" in env:
-            self.mm_url = env["MM_URL"]
+            self._apply_mm_url(env["MM_URL"])
         if "MM_PORT" in env:
             self.mm_port = int(env["MM_PORT"])
         if "MM_SCHEME" in env:
