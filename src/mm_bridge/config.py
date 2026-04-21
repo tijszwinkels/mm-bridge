@@ -258,14 +258,10 @@ class ChannelMapping:
         if p.exists():
             data = json.loads(p.read_text())
             m._ingest(data)
-        # Sidecars currently only track channel-level anchors — thread-fork
-        # roots land on disk once sidecar.py gains its optional second line.
-        channel_only = {
-            sid: a.channel_id
-            for sid, a in m.session_to_anchor.items()
-            if a.root_id is None
-        }
-        sidecar.reconcile(sd, channel_only)
+        sidecar.reconcile(
+            sd,
+            {sid: (a.channel_id, a.root_id) for sid, a in m.session_to_anchor.items()},
+        )
         return m
 
     def _ingest(self, data: dict) -> None:
@@ -321,8 +317,10 @@ class ChannelMapping:
         """Bind `session_id` to `anchor`, replacing any prior binding."""
         self._add(anchor, session_id)
         self.save()
-        if self._sidecar_dir is not None and anchor.root_id is None:
-            sidecar.write(self._sidecar_dir, session_id, anchor.channel_id)
+        if self._sidecar_dir is not None:
+            sidecar.write(
+                self._sidecar_dir, session_id, anchor.channel_id, anchor.root_id,
+            )
 
     def unlink(self, anchor: Anchor) -> str | None:
         """Remove `anchor`'s binding; return the session_id it held, or None."""
@@ -330,7 +328,7 @@ class ChannelMapping:
         if session_id:
             self.session_to_anchor.pop(session_id, None)
             self.save()
-            if self._sidecar_dir is not None and anchor.root_id is None:
+            if self._sidecar_dir is not None:
                 sidecar.delete(self._sidecar_dir, session_id)
         return session_id
 
