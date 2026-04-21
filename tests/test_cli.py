@@ -41,7 +41,22 @@ class FakeMM:
         return self.channels_by_id[channel_id]
 
     def post_message(self, channel_id: str, message: str) -> dict:
-        self.posts.append((channel_id, message))
+        self.posts.append(
+            {"channel_id": channel_id, "message": message, "root_id": None},
+        )
+        return {"id": f"post-{len(self.posts)}"}
+
+    def post(
+        self,
+        channel_id: str,
+        message: str,
+        *,
+        file_ids: list | None = None,
+        root_id: str | None = None,
+    ) -> dict:
+        self.posts.append(
+            {"channel_id": channel_id, "message": message, "root_id": root_id},
+        )
         return {"id": f"post-{len(self.posts)}"}
 
     def rename_channel(self, channel_id: str, display_name: str) -> None:
@@ -362,15 +377,17 @@ class SpawnCommandTests(unittest.TestCase):
         )
         # Two posts: kickoff in sub-channel, announcement in parent.
         self.assertEqual(len(self.fake_mm.posts), 2)
-        posts_by_chan = dict(self.fake_mm.posts)
+        posts_by_chan = {p["channel_id"]: p for p in self.fake_mm.posts}
         self.assertIn("new-chan", posts_by_chan)
         self.assertIn("parent-chan", posts_by_chan)
-        sub_body = posts_by_chan["new-chan"]
-        parent_body = posts_by_chan["parent-chan"]
+        sub_body = posts_by_chan["new-chan"]["message"]
+        parent_body = posts_by_chan["parent-chan"]["message"]
         self.assertIn("Spawned from ~parent-slug~", sub_body)
         self.assertIn("> fix the bug", sub_body)
         self.assertIn("Spawned **Bug Fix** in ~s-abc~", parent_body)
         self.assertIn("> fix the bug", parent_body)
+        # Spawning from a channel-level session: announcement is not threaded.
+        self.assertIsNone(posts_by_chan["parent-chan"]["root_id"])
 
     def test_spawn_without_title_does_not_rename(self) -> None:
         rc = self._invoke(["mm-bridge", "spawn", "ad hoc"])
@@ -379,9 +396,9 @@ class SpawnCommandTests(unittest.TestCase):
         # Header still set.
         self.assertEqual(len(self.fake_mm.headers), 1)
         # Parent post uses daemon-derived display_name.
-        posts_by_chan = dict(self.fake_mm.posts)
+        posts_by_chan = {p["channel_id"]: p for p in self.fake_mm.posts}
         self.assertIn(
-            "**Auto-derived Title**", posts_by_chan["parent-chan"],
+            "**Auto-derived Title**", posts_by_chan["parent-chan"]["message"],
         )
 
     def test_spawn_no_forward_prompt_skips_all_posts(self) -> None:
@@ -410,7 +427,7 @@ class SpawnCommandTests(unittest.TestCase):
     def test_spawn_from_thread_fork_creates_sibling_channel(self) -> None:
         """Spawning from a thread-fork session must succeed. The sub-session
         lives in a fresh sibling channel (not nested thread) and the parent
-        announcement goes to the fork's parent channel."""
+        announcement goes into the fork's thread (not the channel root)."""
         sidecar.write(self.sdir, "fork-sess", "parent-chan", "root-9")
         with patch("sys.argv", ["mm-bridge", "spawn", "carry on"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
@@ -425,9 +442,13 @@ class SpawnCommandTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 cli.main()
             self.assertEqual(cm.exception.code, 0)
-        posts_by_chan = dict(self.fake_mm.posts)
+        posts_by_chan = {p["channel_id"]: p for p in self.fake_mm.posts}
         self.assertIn("new-chan", posts_by_chan)
         self.assertIn("parent-chan", posts_by_chan)
+        # Kickoff in the sub-channel is never threaded.
+        self.assertIsNone(posts_by_chan["new-chan"]["root_id"])
+        # Announcement lands in the parent thread, not at the channel root.
+        self.assertEqual(posts_by_chan["parent-chan"]["root_id"], "root-9")
 
     def test_spawn_vd_failure_exits_3(self) -> None:
         async def _boom(vd_url, message, cwd, backend):

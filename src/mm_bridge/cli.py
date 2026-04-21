@@ -242,12 +242,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     try:
         parent_session_id = _current_session_id()
-        parent_channel_id = _resolve_anchor_from_session(
+        parent_anchor = _resolve_anchor_from_session(
             cfg.sidecar_dir, parent_session_id,
-        ).channel_id
+        )
     except NotInMattermostChannel as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
+    parent_channel_id = parent_anchor.channel_id
 
     mm = _make_mm_client(cfg)
     try:
@@ -350,11 +351,12 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     if not args.no_forward_prompt:
         try:
-            mm.post_message(
+            mm.post(
                 parent_channel_id,
                 spawn_mod.format_spawn_announcement(
                     display_name, new_channel_name, args.prompt,
                 ),
+                root_id=parent_anchor.root_id,
             )
         except Exception:
             logger.warning(
