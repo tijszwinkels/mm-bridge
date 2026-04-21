@@ -8,7 +8,7 @@ import unittest
 from dataclasses import dataclass, field
 
 from mm_bridge.bridge import Bridge
-from mm_bridge.config import Config
+from mm_bridge.config import Anchor, Config
 
 
 # ───────────────────── Fakes ──────────────────────────────────────────────
@@ -255,7 +255,7 @@ class InviteFlowTests(_BridgeTestCase):
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
-        self.assertEqual(self.bridge.mapping.get_session("c1"), "s-new")
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-new")
 
     async def test_invite_claim_normalises_claude_to_claude_code(self):
         """Purpose token 'claude' and VD's 'Claude Code' must be treated as the
@@ -277,7 +277,7 @@ class InviteFlowTests(_BridgeTestCase):
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
-        self.assertEqual(self.bridge.mapping.get_session("c1"), "s-claude")
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-claude")
 
     async def test_invite_claimed_when_session_added_fires_during_create(self):
         """Regression: VD emits session_added SSE before create_session HTTP
@@ -300,7 +300,7 @@ class InviteFlowTests(_BridgeTestCase):
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
-        self.assertEqual(self.bridge.mapping.get_session("c1"), "s-new")
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-new")
         # No orphan auto-channel created by _create_channel_for_session
         self.assertEqual(self.bridge.mm.channels, {"c1": {"id": "c1", "purpose": ""}})
 
@@ -351,7 +351,7 @@ class InviteFlowTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.titles, [])
 
     async def test_bot_invited_to_mapped_channel_is_noop(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
@@ -426,7 +426,7 @@ class InviteFlowTests(_BridgeTestCase):
 
 class ForwardingTests(_BridgeTestCase):
     async def test_posted_in_mapped_channel_forwards_to_session(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "hi", "user_id": "u1", "type": "",
@@ -460,7 +460,7 @@ class ForwardingTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_attribution_kicks_in_on_second_user(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "first", "user_id": "u1", "type": "",
@@ -473,7 +473,7 @@ class ForwardingTests(_BridgeTestCase):
         self.assertTrue(self.bridge.vd.sent[1][1].startswith("u-u2: second"))
 
     async def test_mention_only_filters_non_mentions(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         from mm_bridge.purpose import PurposeConfig
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model=None, mention_only=True,
@@ -516,7 +516,7 @@ class InboundAttachmentTests(_BridgeTestCase):
 
     async def test_attachment_saved_to_inbox_and_note_prepended(self):
         from pathlib import Path
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self._set_session_cwd("s1", self.tmp.name)
 
         post = self._post_with_attachment(
@@ -535,7 +535,7 @@ class InboundAttachmentTests(_BridgeTestCase):
 
     async def test_attachment_only_post_still_forwards(self):
         from pathlib import Path
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self._set_session_cwd("s1", self.tmp.name)
 
         post = self._post_with_attachment("c1", "fid-1", "photo.png", b"\x89PNG...")
@@ -548,7 +548,7 @@ class InboundAttachmentTests(_BridgeTestCase):
 
     async def test_filename_conflict_gets_suffix(self):
         from pathlib import Path
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self._set_session_cwd("s1", self.tmp.name)
         existing = Path(self.tmp.name) / ".mattermost-inbox"
         existing.mkdir()
@@ -563,7 +563,7 @@ class InboundAttachmentTests(_BridgeTestCase):
 
     async def test_traversal_filename_is_sanitized(self):
         from pathlib import Path
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self._set_session_cwd("s1", self.tmp.name)
 
         post = self._post_with_attachment(
@@ -578,7 +578,7 @@ class InboundAttachmentTests(_BridgeTestCase):
         self.assertEqual(saved[0].read_bytes(), b"evil")
 
     async def test_download_failure_yields_skipped_note(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self._set_session_cwd("s1", self.tmp.name)
         self.bridge.mm.download_failures.add("fid-bad")
 
@@ -594,7 +594,7 @@ class InboundAttachmentTests(_BridgeTestCase):
 
     async def test_thread_fork_downloads_to_parent_cwd(self):
         from pathlib import Path
-        self.bridge.mapping.link("c1", "s-parent")
+        self.bridge.mapping.link(Anchor("c1"), "s-parent")
         self._set_session_cwd("s-parent", self.tmp.name)
         self.bridge.mm.posts_by_id["root-post"] = {"message": "original msg"}
 
@@ -617,7 +617,7 @@ class InboundAttachmentTests(_BridgeTestCase):
 
 class CatchUpTests(_BridgeTestCase):
     async def test_catch_up_command_sends_block_to_session(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.mm.posts_by_channel["c1"] = [
             {"user_id": "u1", "message": "m1", "type": ""},
             {"user_id": self.bridge.mm.bot_user_id, "message": "bot echo", "type": ""},
@@ -703,7 +703,7 @@ class InitialCatchUpTests(_BridgeTestCase):
 
 class LeaveTests(_BridgeTestCase):
     async def test_leave_command_removes_bot_and_unlinks(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@claude leave done",
@@ -711,19 +711,19 @@ class LeaveTests(_BridgeTestCase):
         })
 
         self.assertIn("c1", self.bridge.mm.removed)
-        self.assertIsNone(self.bridge.mapping.get_session("c1"))
+        self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
 
     async def test_user_removed_unlinks_mapping(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
 
-        self.assertIsNone(self.bridge.mapping.get_session("c1"))
+        self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
 
 
 class StopCommandTests(_BridgeTestCase):
     async def test_stop_command_in_channel_interrupts_session(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@claude stop",
@@ -734,7 +734,7 @@ class StopCommandTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_stop_command_case_insensitive(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@Claude STOP",
@@ -744,8 +744,8 @@ class StopCommandTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.interrupted, ["s1"])
 
     async def test_stop_command_in_thread_interrupts_thread_session(self):
-        self.bridge.mapping.link("c1", "parent-s")
-        self.bridge.mapping.link_thread("c1", "r1", "fork-s")
+        self.bridge.mapping.link(Anchor("c1"), "parent-s")
+        self.bridge.mapping.link(Anchor("c1", "r1"), "fork-s")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@claude stop",
@@ -755,7 +755,7 @@ class StopCommandTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.interrupted, ["fork-s"])
 
     async def test_stop_with_trailing_text_is_regular_message(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@claude stop doing that",
@@ -775,7 +775,7 @@ class StopCommandTests(_BridgeTestCase):
 
     async def test_bare_stop_in_autorespond_mode_interrupts(self):
         from mm_bridge.purpose import PurposeConfig
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model=None, mention_only=False,
         )
@@ -789,7 +789,7 @@ class StopCommandTests(_BridgeTestCase):
 
     async def test_bare_stop_in_mention_only_mode_is_not_interrupt(self):
         from mm_bridge.purpose import PurposeConfig
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model=None, mention_only=True,
         )
@@ -803,8 +803,8 @@ class StopCommandTests(_BridgeTestCase):
 
     async def test_bare_stop_in_thread_autorespond_interrupts_thread_session(self):
         from mm_bridge.purpose import PurposeConfig
-        self.bridge.mapping.link("c1", "parent-s")
-        self.bridge.mapping.link_thread("c1", "r1", "fork-s")
+        self.bridge.mapping.link(Anchor("c1"), "parent-s")
+        self.bridge.mapping.link(Anchor("c1", "r1"), "fork-s")
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model=None, mention_only=False,
         )
@@ -833,7 +833,7 @@ class FirstMessageConfigTests(_BridgeTestCase):
         pending = self.bridge.pending_mm_sessions.pop(channel_id, None)
         assert pending is not None
         session_id = "s-primed"
-        self.bridge.mapping.link(channel_id, session_id)
+        self.bridge.mapping.link(Anchor(channel_id), session_id)
         self.bridge.awaiting_first_message.add(channel_id)
         return session_id
 
@@ -868,7 +868,7 @@ class FirstMessageConfigTests(_BridgeTestCase):
         # Session is NOT restarted.
         self.assertEqual(self.bridge.vd.created, [])
         # Still mapped.
-        self.assertEqual(self.bridge.mapping.get_session("c1"), session_id)
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), session_id)
         # Config updated: mention_only now False.
         self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
         # Persisted back to Channel Purpose.
@@ -890,7 +890,7 @@ class FirstMessageConfigTests(_BridgeTestCase):
         self.assertEqual(len(self.bridge.vd.created), 1)
         self.assertEqual(self.bridge.vd.created[0]["model_index"], 1)  # sonnet=1
         # Original session no longer linked.
-        self.assertNotEqual(self.bridge.mapping.get_session("c1"), session_id)
+        self.assertNotEqual(self.bridge.mapping.get_session(Anchor("c1")), session_id)
         # Persisted.
         self.assertIn("sonnet", self.bridge.mm.channels["c1"]["purpose"])
 
@@ -936,7 +936,7 @@ class RuntimeToggleTests(_BridgeTestCase):
     `noautorespond` toggle the mention_only flag — nothing else."""
 
     async def test_literal_noautorespond_toggles_mention_only_on(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         from mm_bridge.purpose import PurposeConfig
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model="opus", mention_only=False,
@@ -954,7 +954,7 @@ class RuntimeToggleTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_literal_autorespond_toggles_mention_only_off(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         from mm_bridge.purpose import PurposeConfig
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model="opus", mention_only=True,
@@ -974,7 +974,7 @@ class RuntimeToggleTests(_BridgeTestCase):
 
     async def test_autorespond_with_trailing_text_is_regular_message(self):
         """`autorespond now` must NOT toggle — only the literal word alone does."""
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
         await self.bridge._on_mm_posted({
@@ -989,7 +989,7 @@ class PurposeUpdateNoticeTests(_BridgeTestCase):
     async def test_self_triggered_purpose_change_suppresses_notice(self):
         """When the bridge writes the purpose (e.g. after a runtime toggle),
         the incoming `channel_updated` event must not spawn a user notice."""
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.last_channel_state["c1"] = {
             "display_name": "", "purpose": "claude, opus",
         }
@@ -1006,7 +1006,7 @@ class PurposeUpdateNoticeTests(_BridgeTestCase):
         )
 
     async def test_external_purpose_change_still_posts_notice(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.last_channel_state["c1"] = {
             "display_name": "", "purpose": "claude, opus",
         }
@@ -1035,7 +1035,7 @@ class SessionAddedClaimTests(_BridgeTestCase):
             "firstMessage": "placeholder", "backend": "claude",
         })
 
-        self.assertEqual(self.bridge.mapping.get_session("c1"), "sess-new")
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "sess-new")
         self.assertNotIn("c1", self.bridge.pending_mm_sessions)
 
     async def test_session_added_without_pending_creates_channel(self):
@@ -1044,13 +1044,13 @@ class SessionAddedClaimTests(_BridgeTestCase):
             "projectName": "my-project", "firstMessage": "hi from CLI",
         })
 
-        self.assertTrue(self.bridge.mapping.get_channel("sess-cli"))
+        self.assertTrue(self.bridge.mapping.get_anchor("sess-cli"))
         self.assertTrue(self.bridge.mm.channels)
 
 
 class ThreadForkTests(_BridgeTestCase):
     async def test_thread_post_in_mapped_channel_calls_fork(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.vd.sessions_meta = [
             {"id": "s1", "projectPath": "/tmp/proj", "backend": "claude"},
         ]
@@ -1070,7 +1070,7 @@ class ThreadForkTests(_BridgeTestCase):
         self.assertEqual(len(self.bridge.pending_forks), 1)
 
     async def test_thread_fork_unavailable_marks_dead(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.vd.fork_response = {
             "status": "fork_unavailable", "reason": "opencode", "http_status": 501,
         }
@@ -1086,7 +1086,7 @@ class ThreadForkTests(_BridgeTestCase):
     async def test_session_added_claims_fork_then_posts_disclaimer(self):
         from mm_bridge.bridge import PendingMattermostSession
         import time as _time
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.pending_forks.append(PendingMattermostSession(
             channel_id="c1", cwd="/tmp/proj", backend="claude",
             initial_message="thread starter", requested_at=_time.monotonic(),
@@ -1104,7 +1104,7 @@ class ThreadForkTests(_BridgeTestCase):
         })
 
         self.assertEqual(
-            self.bridge.mapping.get_thread_session("c1", "r1"), "sess-fork",
+            self.bridge.mapping.get_session(Anchor("c1", "r1")), "sess-fork",
         )
         disclaimer = [p for p in self.bridge.mm.posted if "Forked conversation" in p.message]
         self.assertEqual(len(disclaimer), 1)
@@ -1113,7 +1113,7 @@ class ThreadForkTests(_BridgeTestCase):
 
 class AssistantMessageTests(_BridgeTestCase):
     async def test_plain_text_posts_to_channel(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_vd_event("message", {
             "session_id": "s1",
@@ -1126,7 +1126,7 @@ class AssistantMessageTests(_BridgeTestCase):
         self.assertTrue(any(p.message == "hello there" for p in self.bridge.mm.posted))
 
     async def test_leave_channel_directive_removes_bot(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_vd_event("message", {
             "session_id": "s1",
@@ -1139,12 +1139,12 @@ class AssistantMessageTests(_BridgeTestCase):
         })
 
         self.assertIn("c1", self.bridge.mm.removed)
-        self.assertIsNone(self.bridge.mapping.get_session("c1"))
+        self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
 
 
 class NameSyncTests(_BridgeTestCase):
     async def test_channel_renamed_syncs_title_to_vibedeck(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.last_channel_state["c1"] = {
             "display_name": "old", "purpose": "",
         }
@@ -1156,7 +1156,7 @@ class NameSyncTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.titles, [("s1", "new-name")])
 
     async def test_summary_updated_renames_channel(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_vd_event("session_summary_updated", {
             "session_id": "s1", "summaryTitle": "Great Session",
@@ -1165,7 +1165,7 @@ class NameSyncTests(_BridgeTestCase):
         self.assertEqual(self.bridge.mm.renames, [("c1", "Great Session")])
 
     async def test_name_sync_prevents_ping_pong(self):
-        self.bridge.mapping.link("c1", "s1")
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.name_sync.note_remote_update("mm", "c1")
         self.bridge.last_channel_state["c1"] = {
             "display_name": "old", "purpose": "",
@@ -1333,7 +1333,7 @@ class FirstMessagePreambleTests(_BridgeTestCase):
             {"user_id": m["user_id"]} for m in members
         ]
         session_id = "s-primed"
-        self.bridge.mapping.link(channel_id, session_id)
+        self.bridge.mapping.link(Anchor(channel_id), session_id)
         self.bridge.awaiting_first_message.add(channel_id)
         return session_id
 

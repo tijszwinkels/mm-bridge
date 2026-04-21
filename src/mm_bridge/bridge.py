@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import attribution, directives, name_sync, purpose, vd_client
-from .config import ChannelMapping, Config
+from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .typing_indicator import TypingIndicator
 from .vd_client import VibeDeckClient
@@ -355,7 +355,7 @@ class Bridge:
             await self._handle_thread_post(channel_id, root_id, post, message)
             return
 
-        session_id = self.mapping.get_session(channel_id)
+        session_id = self.mapping.get_session(Anchor(channel_id))
         if not session_id:
             # v1's "create on first message" path is gone (§1.3). If a pending
             # session for this channel is still warming up, queue the message.
@@ -419,7 +419,7 @@ class Bridge:
             self._self_joined_channels.discard(channel_id)
             logger.info("Auto-joined %s — silent presence (no session until engagement)", channel_id)
             return
-        if self.mapping.get_session(channel_id):
+        if self.mapping.get_session(Anchor(channel_id)):
             logger.info("Bot already mapped for channel %s — skipping", channel_id)
             return
         if channel_id in self.pending_mm_sessions:
@@ -543,7 +543,7 @@ class Bridge:
     async def _on_mm_user_removed(self, channel_id: str, user_id: str) -> None:
         if user_id != self.mm.bot_user_id:
             return
-        session_id = self.mapping.unlink_channel(channel_id)
+        session_id = self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
         self.pending_mm_sessions.pop(channel_id, None)
         if session_id:
@@ -564,7 +564,7 @@ class Bridge:
             "display_name": new_display, "purpose": new_purpose,
         }
 
-        session_id = self.mapping.get_session(channel_id)
+        session_id = self.mapping.get_session(Anchor(channel_id))
         if not session_id:
             return
 
@@ -842,7 +842,7 @@ class Bridge:
         We keep the MM channel and mapping slot; only the VD session is
         replaced. The old session is abandoned (no explicit VD-side delete).
         """
-        self.mapping.unlink_channel(channel_id)
+        self.mapping.unlink(Anchor(channel_id))
         self.posters.forget(old_session_id)
         if self.typing:
             await self.typing.stop(old_session_id)
@@ -1136,7 +1136,7 @@ class Bridge:
             )
             return
 
-        thread_session = self.mapping.get_thread_session(channel_id, root_id)
+        thread_session = self.mapping.get_session(Anchor(channel_id, root_id))
         if thread_session:
             if cm := _CATCH_UP_RE.match(message):
                 await self._run_catch_up(channel_id, thread_session, root_id, cm)
@@ -1154,7 +1154,7 @@ class Bridge:
             return
 
         # No mapping yet — try to fork.
-        parent_session = self.mapping.get_session(channel_id)
+        parent_session = self.mapping.get_session(Anchor(channel_id))
         if not parent_session:
             return  # thread in an unmapped channel
 
@@ -1340,7 +1340,7 @@ class Bridge:
         reason: str,
     ) -> None:
         if thread_root:
-            removed = self.mapping.unlink_thread(channel_id, thread_root)
+            removed = self.mapping.unlink(Anchor(channel_id, thread_root))
             self.dead_threads.add((channel_id, thread_root))
             if removed:
                 self.posters.forget(removed)
@@ -1414,7 +1414,7 @@ class Bridge:
             except Exception:
                 pass
             return
-        self.mapping.unlink_channel(channel_id)
+        self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
         self.posters.forget(session_id)
         if self.typing:
@@ -1436,7 +1436,7 @@ class Bridge:
         session_id = data.get("id") or data.get("session_id") or ""
         if not session_id:
             return
-        if self.mapping.get_channel(session_id):
+        if self.mapping.get_anchor(session_id):
             return  # already mapped
 
         # First try fork-pending (thread invites).
@@ -1493,7 +1493,7 @@ class Bridge:
             return False
 
         channel_id, pending = candidates[0]
-        self.mapping.link(channel_id, session_id)
+        self.mapping.link(Anchor(channel_id), session_id)
         self.pending_mm_sessions.pop(channel_id, None)
         if pending.allow_first_message_config:
             self.awaiting_first_message.add(channel_id)
@@ -1534,7 +1534,7 @@ class Bridge:
         root_id = pending.fork_thread_root or ""
         if not ch_id or not root_id:
             return False
-        self.mapping.link_thread(ch_id, root_id, session_id)
+        self.mapping.link(Anchor(ch_id, root_id), session_id)
         logger.info("Claimed pending fork: thread %s:%s → session %s",
                     ch_id, root_id[:8], session_id[:8])
         try:
@@ -1588,7 +1588,7 @@ class Bridge:
                 purpose=f"VibeDeck session {session_id}",
             )
             channel_id = ch["id"]
-            self.mapping.link(channel_id, session_id)
+            self.mapping.link(Anchor(channel_id), session_id)
             logger.info(
                 "Created channel %s (%s) for VD session %s",
                 display_name, channel_name, session_id[:12],
@@ -1606,12 +1606,9 @@ class Bridge:
         if msg.get("role") != "assistant":
             return
 
-        thread_loc = self.mapping.get_thread_location(session_id)
-        if thread_loc:
-            channel_id, thread_root = thread_loc
-        else:
-            channel_id = self.mapping.get_channel(session_id) or ""
-            thread_root = None
+        anchor = self.mapping.get_anchor(session_id)
+        channel_id = anchor.channel_id if anchor else ""
+        thread_root = anchor.root_id if anchor else None
         if not channel_id:
             return
 
@@ -1636,7 +1633,7 @@ class Bridge:
                     self.mm.post(channel_id, _truncate_for_mm(body), root_id=thread_root)
                 except Exception:
                     pass
-                self.mapping.unlink_thread(channel_id, thread_root)
+                self.mapping.unlink(Anchor(channel_id, thread_root))
                 self.posters.forget(session_id)
                 if self.typing:
                     await self.typing.stop(session_id)
@@ -1772,9 +1769,12 @@ class Bridge:
         title = data.get("summaryTitle", "") or ""
         if not session_id or not title:
             return
-        channel_id = self.mapping.get_channel(session_id)
-        if not channel_id:
+        anchor = self.mapping.get_anchor(session_id)
+        # Only rename the MM channel for top-level channel sessions — for
+        # thread forks there's no channel rename to perform.
+        if not anchor or anchor.is_thread:
             return
+        channel_id = anchor.channel_id
         if not self.name_sync.should_sync("vd", session_id):
             return
         try:
@@ -1798,12 +1798,7 @@ class Bridge:
             await self.typing.stop(session_id)
             return
 
-        thread_loc = self.mapping.get_thread_location(session_id)
-        if thread_loc:
-            channel_id, root_id = thread_loc
-        else:
-            channel_id = self.mapping.get_channel(session_id) or ""
-            root_id = None
-        if not channel_id:
+        anchor = self.mapping.get_anchor(session_id)
+        if not anchor:
             return
-        await self.typing.start(session_id, channel_id, root_id)
+        await self.typing.start(session_id, anchor.channel_id, anchor.root_id)

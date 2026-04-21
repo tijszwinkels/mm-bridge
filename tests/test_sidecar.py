@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from mm_bridge import sidecar
-from mm_bridge.config import ChannelMapping
+from mm_bridge.config import Anchor, ChannelMapping
 
 
 class SidecarTests(unittest.TestCase):
@@ -79,13 +79,13 @@ class ChannelMappingSidecarTests(unittest.TestCase):
 
     def test_link_writes_sidecar(self) -> None:
         m = ChannelMapping.load(self.state, self.sdir)
-        m.link("c1", "s1")
+        m.link(Anchor("c1"), "s1")
         self.assertEqual((self.sdir / "s1").read_text(), "c1")
 
     def test_unlink_removes_sidecar(self) -> None:
         m = ChannelMapping.load(self.state, self.sdir)
-        m.link("c1", "s1")
-        m.unlink_channel("c1")
+        m.link(Anchor("c1"), "s1")
+        m.unlink(Anchor("c1"))
         self.assertFalse((self.sdir / "s1").exists())
 
     def test_load_reconciles_stale_sidecars(self) -> None:
@@ -100,7 +100,7 @@ class ChannelMappingSidecarTests(unittest.TestCase):
     def test_load_writes_missing_sidecars(self) -> None:
         """A session already in state.json gets a sidecar on load."""
         m1 = ChannelMapping.load(self.state, self.sdir)
-        m1.link("c1", "s1")
+        m1.link(Anchor("c1"), "s1")
         (self.sdir / "s1").unlink()
 
         ChannelMapping.load(self.state, self.sdir)

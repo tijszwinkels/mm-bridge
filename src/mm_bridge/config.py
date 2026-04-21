@@ -194,19 +194,54 @@ class Config:
             self.sidecar_dir = env["MM_BRIDGE_SIDECAR_DIR"]
 
 
-@dataclass
-class ChannelMapping:
-    """Persistent mapping: MM channel ↔ VD session, plus thread-fork mappings.
+@dataclass(frozen=True)
+class Anchor:
+    """A conversation anchor: a channel, optionally narrowed to a thread root.
 
-    Schema v1 (legacy) only had `channel_to_session`. Schema v2 adds
-    `thread_mapping` keyed by `f"{channel_id}:{root_post_id}"`.
-    Loading a v1 file initialises `thread_mapping` as empty.
+    Channel sessions carry ``root_id=None``; thread-fork sessions carry the
+    root post id of the thread they inhabit. The class is frozen so it's
+    hashable and safe as a dict key.
+
+    Empty-string ``root_id`` is normalised to ``None`` so JSON round-trips
+    and caller shortcuts (``Anchor(ch, "")``) produce canonical anchors.
     """
 
-    channel_to_session: dict[str, str] = field(default_factory=dict)
-    session_to_channel: dict[str, str] = field(default_factory=dict)
-    thread_mapping: dict[str, str] = field(default_factory=dict)
-    session_to_thread: dict[str, str] = field(default_factory=dict)
+    channel_id: str
+    root_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.root_id == "":
+            # dataclass is frozen — bypass __setattr__ for normalisation.
+            object.__setattr__(self, "root_id", None)
+
+    @property
+    def is_thread(self) -> bool:
+        return self.root_id is not None
+
+
+# JSON state-file schema version. Bumped from v2 when the asymmetric
+# channel_to_session / thread_mapping pair was collapsed into `entries`.
+STATE_SCHEMA_VERSION = 3
+
+
+@dataclass
+class ChannelMapping:
+    """Persistent mapping: session ↔ conversation anchor.
+
+    Every session has exactly one :class:`Anchor`. Channel sessions have
+    ``root_id=None``; thread-fork sessions carry the root post id. One
+    forward map (``anchor → session``) and one reverse (``session → anchor``)
+    keep both kinds of session discoverable through the same API.
+
+    On-disk schema:
+
+    * v2 (legacy): ``{"channel_to_session": {...}, "thread_mapping": {...}}``
+      — read transparently on load and re-emitted as v3 on the next save.
+    * v3: ``{"version": 3, "entries": [{"channel_id", "root_id", "session_id"}]}``.
+    """
+
+    anchor_to_session: dict[Anchor, str] = field(default_factory=dict)
+    session_to_anchor: dict[str, Anchor] = field(default_factory=dict)
     _path: str = ""
     _sidecar_dir: Path | None = None
 
@@ -222,73 +257,85 @@ class ChannelMapping:
         m = cls(_path=path, _sidecar_dir=sd)
         if p.exists():
             data = json.loads(p.read_text())
-            m.channel_to_session = data.get("channel_to_session", {})
-            m.thread_mapping = data.get("thread_mapping", {})
-            m.session_to_channel = {v: k for k, v in m.channel_to_session.items()}
-            m.session_to_thread = {v: k for k, v in m.thread_mapping.items()}
-        sidecar.reconcile(sd, m.session_to_channel)
+            m._ingest(data)
+        # Sidecars currently only track channel-level anchors — thread-fork
+        # roots land on disk once sidecar.py gains its optional second line.
+        channel_only = {
+            sid: a.channel_id
+            for sid, a in m.session_to_anchor.items()
+            if a.root_id is None
+        }
+        sidecar.reconcile(sd, channel_only)
         return m
 
+    def _ingest(self, data: dict) -> None:
+        """Populate in-memory maps from either a v2 or v3 JSON payload."""
+        version = data.get("version")
+        if version == STATE_SCHEMA_VERSION and isinstance(data.get("entries"), list):
+            for entry in data["entries"]:
+                sid = entry.get("session_id")
+                cid = entry.get("channel_id")
+                if not sid or not cid:
+                    continue
+                rid = entry.get("root_id") or None
+                self._add(Anchor(cid, rid), sid)
+            return
+        # Legacy v2 (or the even older v1 that lacked thread_mapping).
+        for cid, sid in (data.get("channel_to_session") or {}).items():
+            if cid and sid:
+                self._add(Anchor(cid), sid)
+        for key, sid in (data.get("thread_mapping") or {}).items():
+            if not sid or not key:
+                continue
+            cid, _, rid = key.partition(":")
+            if cid and rid:
+                self._add(Anchor(cid, rid), sid)
+
+    def _add(self, anchor: Anchor, session_id: str) -> None:
+        """Insert an (anchor, session) pair, clearing any stale reverse row."""
+        prev_session = self.anchor_to_session.get(anchor)
+        if prev_session and prev_session != session_id:
+            self.session_to_anchor.pop(prev_session, None)
+        self.anchor_to_session[anchor] = session_id
+        self.session_to_anchor[session_id] = anchor
+
     def save(self) -> None:
+        entries = [
+            {
+                "channel_id": a.channel_id,
+                "root_id": a.root_id,
+                "session_id": sid,
+            }
+            for a, sid in self.anchor_to_session.items()
+        ]
         Path(self._path).write_text(
             json.dumps(
-                {
-                    "channel_to_session": self.channel_to_session,
-                    "thread_mapping": self.thread_mapping,
-                },
+                {"version": STATE_SCHEMA_VERSION, "entries": entries},
                 indent=2,
             )
         )
 
-    # channel ↔ session
-    def link(self, channel_id: str, session_id: str) -> None:
-        self.channel_to_session[channel_id] = session_id
-        self.session_to_channel[session_id] = channel_id
-        self.save()
-        if self._sidecar_dir is not None:
-            sidecar.write(self._sidecar_dir, session_id, channel_id)
+    # ----- anchor API -----
 
-    def unlink_channel(self, channel_id: str) -> str | None:
-        session_id = self.channel_to_session.pop(channel_id, None)
+    def link(self, anchor: Anchor, session_id: str) -> None:
+        """Bind `session_id` to `anchor`, replacing any prior binding."""
+        self._add(anchor, session_id)
+        self.save()
+        if self._sidecar_dir is not None and anchor.root_id is None:
+            sidecar.write(self._sidecar_dir, session_id, anchor.channel_id)
+
+    def unlink(self, anchor: Anchor) -> str | None:
+        """Remove `anchor`'s binding; return the session_id it held, or None."""
+        session_id = self.anchor_to_session.pop(anchor, None)
         if session_id:
-            self.session_to_channel.pop(session_id, None)
+            self.session_to_anchor.pop(session_id, None)
             self.save()
-            if self._sidecar_dir is not None:
+            if self._sidecar_dir is not None and anchor.root_id is None:
                 sidecar.delete(self._sidecar_dir, session_id)
         return session_id
 
-    def get_session(self, channel_id: str) -> str | None:
-        return self.channel_to_session.get(channel_id)
+    def get_session(self, anchor: Anchor) -> str | None:
+        return self.anchor_to_session.get(anchor)
 
-    def get_channel(self, session_id: str) -> str | None:
-        return self.session_to_channel.get(session_id)
-
-    # thread fork mapping
-    @staticmethod
-    def _thread_key(channel_id: str, root_id: str) -> str:
-        return f"{channel_id}:{root_id}"
-
-    def link_thread(self, channel_id: str, root_id: str, session_id: str) -> None:
-        key = self._thread_key(channel_id, root_id)
-        self.thread_mapping[key] = session_id
-        self.session_to_thread[session_id] = key
-        self.save()
-
-    def unlink_thread(self, channel_id: str, root_id: str) -> str | None:
-        key = self._thread_key(channel_id, root_id)
-        session_id = self.thread_mapping.pop(key, None)
-        if session_id:
-            self.session_to_thread.pop(session_id, None)
-            self.save()
-        return session_id
-
-    def get_thread_session(self, channel_id: str, root_id: str) -> str | None:
-        return self.thread_mapping.get(self._thread_key(channel_id, root_id))
-
-    def get_thread_location(self, session_id: str) -> tuple[str, str] | None:
-        """Returns (channel_id, root_id) if session_id is a thread-fork session."""
-        key = self.session_to_thread.get(session_id)
-        if not key:
-            return None
-        channel_id, _, root_id = key.partition(":")
-        return channel_id, root_id
+    def get_anchor(self, session_id: str) -> Anchor | None:
+        return self.session_to_anchor.get(session_id)
