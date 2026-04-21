@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mm_bridge import cli, sidecar
-from mm_bridge.config import Config
+from mm_bridge.config import Anchor, Config
 
 
 @dataclass
@@ -70,8 +70,8 @@ class InviteHelperTests(unittest.TestCase):
             cli._invite_to_channel(mm, "c1", "nobody")
 
 
-class SidecarLookupTests(unittest.TestCase):
-    """`cli._resolve_channel_from_session` — session_id → channel_id."""
+class AnchorLookupTests(unittest.TestCase):
+    """`cli._resolve_anchor_from_session` — session_id → Anchor."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -80,22 +80,29 @@ class SidecarLookupTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_reads_channel_id_from_sidecar(self) -> None:
+    def test_single_line_sidecar_resolves_to_channel_anchor(self) -> None:
         sidecar.write(self.sdir, "sess-1", "chan-42")
         self.assertEqual(
-            cli._resolve_channel_from_session(self.sdir, "sess-1"),
-            "chan-42",
+            cli._resolve_anchor_from_session(self.sdir, "sess-1"),
+            Anchor("chan-42"),
+        )
+
+    def test_two_line_sidecar_resolves_to_thread_anchor(self) -> None:
+        sidecar.write(self.sdir, "sess-fork", "chan-42", "root-7")
+        self.assertEqual(
+            cli._resolve_anchor_from_session(self.sdir, "sess-fork"),
+            Anchor("chan-42", "root-7"),
         )
 
     def test_raises_when_sidecar_missing(self) -> None:
         with self.assertRaises(cli.NotInMattermostChannel):
-            cli._resolve_channel_from_session(self.sdir, "sess-unknown")
+            cli._resolve_anchor_from_session(self.sdir, "sess-unknown")
 
     def test_raises_when_sidecar_empty(self) -> None:
         self.sdir.mkdir(parents=True)
         (self.sdir / "sess-empty").write_text("")
         with self.assertRaises(cli.NotInMattermostChannel):
-            cli._resolve_channel_from_session(self.sdir, "sess-empty")
+            cli._resolve_anchor_from_session(self.sdir, "sess-empty")
 
 
 class BareInvocationTests(unittest.TestCase):
@@ -154,6 +161,19 @@ class InviteCommandTests(unittest.TestCase):
                 cli.main()
             self.assertNotEqual(cm.exception.code, 0)
 
+    def test_invite_from_thread_fork_session_invites_to_channel(self) -> None:
+        """The bug the anchor refactor fixes: inviting from a thread-fork
+        session must succeed and invite to the fork's channel."""
+        sidecar.write(self.sdir, "fork-sess", "fork-chan", "root-9")
+        with patch("sys.argv", ["mm-bridge", "invite", "tijs"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "fork-sess"}), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(self.fake_mm.invited, [("fork-chan", "u-tijs")])
+
 
 class ChannelCommandTests(unittest.TestCase):
     """`mm-bridge channel` prints the channel_id for the current session."""
@@ -182,6 +202,20 @@ class ChannelCommandTests(unittest.TestCase):
                 cli.main()
             self.assertEqual(cm.exception.code, 0)
         self.assertEqual(buf.getvalue().strip(), "my-channel")
+
+    def test_channel_from_thread_fork_session_prints_channel_id(self) -> None:
+        """Thread-fork sessions must self-identify too (was broken before)."""
+        import io
+        sidecar.write(self.sdir, "fork-sess", "fork-chan", "root-9")
+        buf = io.StringIO()
+        with patch("sys.argv", ["mm-bridge", "channel"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "fork-sess"}), \
+             patch("sys.stdout", buf):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(buf.getvalue().strip(), "fork-chan")
 
 
 class WaitForNewSidecarTests(unittest.TestCase):
@@ -372,6 +406,28 @@ class SpawnCommandTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 cli.main()
             self.assertEqual(cm.exception.code, 2)
+
+    def test_spawn_from_thread_fork_creates_sibling_channel(self) -> None:
+        """Spawning from a thread-fork session must succeed. The sub-session
+        lives in a fresh sibling channel (not nested thread) and the parent
+        announcement goes to the fork's parent channel."""
+        sidecar.write(self.sdir, "fork-sess", "parent-chan", "root-9")
+        with patch("sys.argv", ["mm-bridge", "spawn", "carry on"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict(
+                "os.environ", {"CLAUDE_SESSION_ID": "fork-sess"},
+             ), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch(
+                 "mm_bridge.cli._vd_create_session",
+                 side_effect=self._simulate_daemon_creates_sidecar(),
+             ):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+        posts_by_chan = dict(self.fake_mm.posts)
+        self.assertIn("new-chan", posts_by_chan)
+        self.assertIn("parent-chan", posts_by_chan)
 
     def test_spawn_vd_failure_exits_3(self) -> None:
         async def _boom(vd_url, message, cwd, backend):

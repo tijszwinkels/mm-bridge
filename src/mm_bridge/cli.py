@@ -22,9 +22,9 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import spawn as spawn_mod
+from . import sidecar, spawn as spawn_mod
 from .bridge import Bridge
-from .config import Config
+from .config import Anchor, Config
 from .mm_client import MattermostClient
 from .vd_client import VibeDeckClient
 
@@ -38,25 +38,24 @@ class NotInMattermostChannel(RuntimeError):
 # ─────────────────────── Helpers (unit-tested) ────────────────────────────
 
 
-def _resolve_channel_from_session(
+def _resolve_anchor_from_session(
     sidecar_dir: Path | str, session_id: str,
-) -> str:
-    """Return the channel_id for `session_id` by reading its sidecar file.
+) -> Anchor:
+    """Return the :class:`Anchor` for `session_id` by reading its sidecar.
 
-    Raises `NotInMattermostChannel` if the sidecar is missing or empty.
+    Channel-level sidecars yield ``Anchor(channel_id)``; thread-fork
+    sidecars (two-line files) yield ``Anchor(channel_id, root_id)``.
+    Raises :class:`NotInMattermostChannel` when the sidecar is missing
+    or unreadable.
     """
-    path = Path(sidecar_dir) / session_id
-    if not path.exists():
+    result = sidecar.read(Path(sidecar_dir), session_id)
+    if result is None:
+        path = Path(sidecar_dir) / session_id
         raise NotInMattermostChannel(
             f"not running inside a Mattermost channel (no sidecar at {path})",
         )
-    try:
-        channel_id = path.read_text().strip()
-    except OSError as exc:
-        raise NotInMattermostChannel(f"could not read sidecar {path}: {exc}") from exc
-    if not channel_id:
-        raise NotInMattermostChannel(f"sidecar {path} is empty")
-    return channel_id
+    channel_id, root_id = result
+    return Anchor(channel_id, root_id)
 
 
 def _invite_to_channel(mm, channel_id: str, username: str) -> None:
@@ -140,14 +139,10 @@ def _wait_for_new_sidecar(
                     new,
                     key=lambda n: (Path(sidecar_dir) / n).stat().st_mtime,
                 )
-            try:
-                channel_id = (Path(sidecar_dir) / sid).read_text().strip()
-            except OSError as exc:
-                raise RuntimeError(
-                    f"could not read new sidecar {sid}: {exc}",
-                ) from exc
-            if not channel_id:
-                raise RuntimeError(f"new sidecar {sid} is empty")
+            result = sidecar.read(Path(sidecar_dir), sid)
+            if result is None:
+                raise RuntimeError(f"new sidecar {sid} is empty or unreadable")
+            channel_id, _root_id = result
             return sid, channel_id
         if clock() >= deadline:
             raise TimeoutError(
@@ -186,11 +181,11 @@ def cmd_channel(args: argparse.Namespace) -> int:
     cfg = Config.load()
     try:
         session_id = _current_session_id()
-        channel_id = _resolve_channel_from_session(cfg.sidecar_dir, session_id)
+        anchor = _resolve_anchor_from_session(cfg.sidecar_dir, session_id)
     except NotInMattermostChannel as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-    print(channel_id)
+    print(anchor.channel_id)
     return 0
 
 
@@ -200,7 +195,9 @@ def cmd_invite(args: argparse.Namespace) -> int:
 
     try:
         session_id = _current_session_id()
-        channel_id = _resolve_channel_from_session(cfg.sidecar_dir, session_id)
+        channel_id = _resolve_anchor_from_session(
+            cfg.sidecar_dir, session_id,
+        ).channel_id
     except NotInMattermostChannel as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -245,9 +242,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     try:
         parent_session_id = _current_session_id()
-        parent_channel_id = _resolve_channel_from_session(
+        parent_channel_id = _resolve_anchor_from_session(
             cfg.sidecar_dir, parent_session_id,
-        )
+        ).channel_id
     except NotInMattermostChannel as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
