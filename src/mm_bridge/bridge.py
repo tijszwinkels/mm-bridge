@@ -74,7 +74,7 @@ class ToolUseRun:
 def _format_tool_run(run: ToolUseRun) -> str:
     parts: list[str] = []
     for tool, count in run.lines:
-        suffix = f" x{count}" if count > 1 else ""
+        suffix = f" (x{count})" if count > 1 else ""
         parts.append(f"_Using tool: {tool}{suffix}_")
     return "\n".join(parts)
 
@@ -254,11 +254,10 @@ class Bridge:
         self._self_joined_channels: set[str] = set()
         self._max_file_size: int | None = None
         # Per-session coalesced tool-use placeholder posts. Created on the
-        # first tool_use block of a turn, edited on subsequent ones, soft-
-        # deleted when the turn ends (real text reply, tool error, session
-        # stop, or any cleanup path). Soft-delete is intentional — we want
-        # edit history retained rather than require `system_admin` on the
-        # bot for permanent-delete.
+        # first tool_use block of a turn, edited on subsequent ones; the
+        # state is dropped (but the post is left intact) on turn end so
+        # the next turn starts a fresh placeholder. The post remains as a
+        # compact summary of that turn's tool usage.
         self.tool_use_runs: dict[str, ToolUseRun] = {}
 
     # ----- lifecycle -----
@@ -579,7 +578,7 @@ class Bridge:
         self.purpose_by_channel.pop(channel_id, None)
         self.pending_mm_sessions.pop(channel_id, None)
         if session_id:
-            self._clear_tool_use_run(session_id)
+            self._end_tool_use_run(session_id)
             self.posters.forget(session_id)
             if self.typing:
                 await self.typing.stop(session_id)
@@ -876,7 +875,7 @@ class Bridge:
         replaced. The old session is abandoned (no explicit VD-side delete).
         """
         self.mapping.unlink(Anchor(channel_id))
-        self._clear_tool_use_run(old_session_id)
+        self._end_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
         if self.typing:
             await self.typing.stop(old_session_id)
@@ -1377,7 +1376,7 @@ class Bridge:
             removed = self.mapping.unlink(Anchor(channel_id, thread_root))
             self.dead_threads.add((channel_id, thread_root))
             if removed:
-                self._clear_tool_use_run(removed)
+                self._end_tool_use_run(removed)
                 self.posters.forget(removed)
                 if self.typing:
                     await self.typing.stop(removed)
@@ -1419,7 +1418,7 @@ class Bridge:
             except Exception:
                 pass
             return
-        self._clear_tool_use_run(session_id)
+        self._end_tool_use_run(session_id)
         if self.typing:
             await self.typing.stop(session_id)
         logger.info("MM → VD [%s]: stop (interrupt)", session_id[:8])
@@ -1452,7 +1451,7 @@ class Bridge:
             return
         self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
-        self._clear_tool_use_run(session_id)
+        self._end_tool_use_run(session_id)
         self.posters.forget(session_id)
         if self.typing:
             await self.typing.stop(session_id)
@@ -1657,7 +1656,7 @@ class Bridge:
                 tool = block.get("tool_name", "unknown")
                 self._upsert_tool_use(session_id, channel_id, thread_root, tool)
             elif btype == "tool_result" and block.get("is_error"):
-                self._clear_tool_use_run(session_id)
+                self._end_tool_use_run(session_id)
                 err_text = f"**Tool error:** {str(block.get('content',''))[:500]}"
                 try:
                     self.mm.post(
@@ -1685,7 +1684,7 @@ class Bridge:
         """Real assistant response — clear the tool-use placeholder, then
         run the existing directives / attachments / post pipeline.
         """
-        self._clear_tool_use_run(session_id)
+        self._end_tool_use_run(session_id)
 
         cleaned, dirs = directives.extract(text)
 
@@ -1811,22 +1810,14 @@ class Bridge:
                 "Failed to edit tool-use placeholder for %s", session_id[:8],
             )
 
-    def _clear_tool_use_run(self, session_id: str) -> None:
-        """Soft-delete the tool-use placeholder (if any) and drop state.
-        Soft-delete is deliberate: it hides the post from channel views
-        while preserving edit history in the DB. Permanent-delete would
-        require promoting the bot to `system_admin`, which we don't do.
+    def _end_tool_use_run(self, session_id: str) -> None:
+        """Drop per-session state so the next turn starts a fresh
+        placeholder. The existing placeholder post is left in the channel
+        as a compact, permanent record of the tools used this turn —
+        intentionally not deleted (avoids tombstones, no system_admin
+        permission needed).
         """
-        run = self.tool_use_runs.pop(session_id, None)
-        if run is None:
-            return
-        try:
-            self.mm.delete_post(run.post_id)
-        except Exception:
-            logger.warning(
-                "Failed to delete tool-use placeholder %s for session %s",
-                run.post_id, session_id[:8], exc_info=True,
-            )
+        self.tool_use_runs.pop(session_id, None)
 
     async def _project_path_for(self, session_id: str) -> str | None:
         meta = await self.vd.get_session_meta(session_id)
@@ -1924,7 +1915,7 @@ class Bridge:
         if not running:
             # Safety net: clear any lingering tool-use placeholder when the
             # turn ends without a final assistant text (interrupt, crash).
-            self._clear_tool_use_run(session_id)
+            self._end_tool_use_run(session_id)
             if self.typing:
                 await self.typing.stop(session_id)
             return
