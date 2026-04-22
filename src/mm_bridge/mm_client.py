@@ -196,10 +196,14 @@ class MattermostClient:
 
     def get_bot_channel_ids(self) -> set[str]:
         """Return the set of channel IDs the bot currently belongs to in its team."""
-        channels = self._driver.channels.get_channels_for_team_for_user(
+        channels = self.list_bot_channels()
+        return {c["id"] for c in channels}
+
+    def list_bot_channels(self) -> list[dict]:
+        """Return the full channel records for the bot's team memberships."""
+        return self._driver.channels.get_channels_for_team_for_user(
             self._bot_user_id, self._team_id,
         )
-        return {c["id"] for c in channels}
 
     def list_public_team_channels(self) -> list[dict]:
         """List all public channels in the bot's team."""

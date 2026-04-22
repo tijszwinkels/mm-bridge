@@ -22,9 +22,11 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import json
+
 from . import sidecar, spawn as spawn_mod
 from .bridge import Bridge
-from .config import Anchor, Config
+from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .vd_client import VibeDeckClient
 
@@ -236,6 +238,95 @@ async def _vd_create_session(
         await vd.close()
 
 
+_PURPOSE_BADGE_CAP = 40
+
+
+def _sanitise_badge(text: str) -> str:
+    """Collapse tabs and newlines to single spaces for tab-separated output."""
+    return " ".join(text.split())
+
+
+def _format_channels_text(rows: list[dict]) -> str:
+    lines: list[str] = []
+    for row in rows:
+        display = row["display_name"] or row["name"]
+        badges: list[str] = []
+        if row.get("session_id"):
+            badges.append("[session]")
+        purpose = _sanitise_badge(row.get("purpose") or "")
+        if purpose:
+            if len(purpose) > _PURPOSE_BADGE_CAP:
+                purpose = purpose[: _PURPOSE_BADGE_CAP - 1] + "…"
+            badges.append(f"[purpose: {purpose}]")
+        lines.append("\t".join([row["id"], display, " ".join(badges)]))
+    return "\n".join(lines)
+
+
+def cmd_channels(args: argparse.Namespace) -> int:
+    cfg = Config.load()
+    _require_bot_token(cfg)
+
+    mm = _make_mm_client(cfg)
+    try:
+        mm.login()
+        channels = mm.list_bot_channels()
+    except Exception as exc:
+        print(f"Error: could not list channels: {exc}", file=sys.stderr)
+        return 3
+
+    channels = [c for c in channels if c.get("type") != "D"]
+
+    if args.title:
+        kw = args.title.lower()
+        channels = [
+            c for c in channels
+            if kw in (
+                (c.get("display_name") or "") + " " + (c.get("name") or "")
+            ).lower()
+        ]
+
+    channels.sort(
+        key=lambda c: (c.get("last_post_at") or 0, c.get("create_at") or 0),
+        reverse=True,
+    )
+
+    try:
+        mapping = ChannelMapping.load(cfg.state_file, sidecar_dir=cfg.sidecar_dir)
+        channel_to_session = {
+            a.channel_id: sid
+            for a, sid in mapping.anchor_to_session.items()
+            if a.root_id is None
+        }
+    except Exception:
+        logger.warning("Failed to load channel mapping", exc_info=True)
+        channel_to_session = {}
+
+    if args.n and args.n > 0:
+        channels = channels[: args.n]
+
+    rows = [
+        {
+            "id": c["id"],
+            "name": c.get("name") or "",
+            "display_name": c.get("display_name") or "",
+            "last_post_at": c.get("last_post_at") or 0,
+            "create_at": c.get("create_at") or 0,
+            "purpose": c.get("purpose") or "",
+            "header": c.get("header") or "",
+            "session_id": channel_to_session.get(c["id"]),
+        }
+        for c in channels
+    ]
+
+    if args.format == "json":
+        print(json.dumps(rows, indent=2))
+    else:
+        text = _format_channels_text(rows)
+        if text:
+            print(text)
+    return 0
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
@@ -409,6 +500,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the Mattermost channel_id for the current session.",
     )
     p_channel.set_defaults(func=cmd_channel)
+
+    p_channels = sub.add_parser(
+        "channels",
+        help="List Mattermost channels the bot can see.",
+    )
+    p_channels.add_argument(
+        "--title",
+        help="Case-insensitive substring filter on display_name or name.",
+    )
+    p_channels.add_argument(
+        "-n", type=int, default=20,
+        help="Max rows to display (0 = unlimited). Default 20.",
+    )
+    p_channels.add_argument(
+        "--format", choices=["text", "json"], default="text",
+    )
+    p_channels.set_defaults(func=cmd_channels)
 
     p_spawn = sub.add_parser(
         "spawn",
