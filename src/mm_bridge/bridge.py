@@ -1649,10 +1649,13 @@ class Bridge:
             return
 
         # Walk blocks in order. tool_use blocks coalesce into a per-session
-        # placeholder; text/error blocks end the run and post normally.
+        # placeholder (unless `show_tool_use` is off, in which case they're
+        # silently dropped); text/error blocks end the run and post normally.
         for block in msg.get("blocks", []):
             btype = block.get("type")
             if btype == "tool_use":
+                if not self.config.show_tool_use:
+                    continue
                 tool = block.get("tool_name", "unknown")
                 self._upsert_tool_use(session_id, channel_id, thread_root, tool)
             elif btype == "tool_result" and block.get("is_error"):

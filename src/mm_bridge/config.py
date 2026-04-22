@@ -49,6 +49,11 @@ class Config:
     default_cwd: str = str(Path.home())
     default_autorespond: bool = False
 
+    # Surface tool-use notifications in channel as a coalesced placeholder
+    # post. On by default — gives visibility into what Claude is doing.
+    # Disable to keep channels to only real assistant replies.
+    show_tool_use: bool = True
+
     # Auto-join all public channels (silent presence — sessions start on
     # first engagement, not on join).
     auto_join_public_channels: bool = False
@@ -135,6 +140,7 @@ class Config:
             "default_model",
             "default_cwd",
             "default_autorespond",
+            "show_tool_use",
             "auto_join_public_channels",
             "auto_join_reconcile_seconds",
             "state_file",
@@ -191,6 +197,10 @@ class Config:
             self.default_model = env["VD_DEFAULT_MODEL"] or None
         if "VD_DEFAULT_AUTORESPOND" in env:
             self.default_autorespond = env["VD_DEFAULT_AUTORESPOND"].lower() in (
+                "1", "true", "yes", "on",
+            )
+        if "MM_SHOW_TOOL_USE" in env:
+            self.show_tool_use = env["MM_SHOW_TOOL_USE"].lower() in (
                 "1", "true", "yes", "on",
             )
         if "MM_AUTO_JOIN" in env:

@@ -121,6 +121,10 @@ Update `specs/20260417-mattermost-bridge-v2/design.md` (if it covers the assista
 - **Thread forks.** Placeholder lives on whichever anchor (channel or thread) the session is mapped to, same as today's tool-use posts. No special handling.
 - **Very long runs.** Lines grow unbounded (one per tool switch). In practice turns are short, but we could cap at e.g. 20 lines with an ellipsis if this ever becomes a problem. Out of scope now.
 
+## Configuration
+
+`show_tool_use` (bool, default `true`) — when `false`, the bridge silently drops every `tool_use` block and never posts a placeholder. Channels see only real assistant replies and tool errors. Settable via TOML (`show_tool_use = false`) or env var (`MM_SHOW_TOOL_USE=false`). Global; not per-channel (yet).
+
 ## Non-goals
 
 - Persisting run state across bridge restarts.
