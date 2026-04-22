@@ -1202,7 +1202,7 @@ class ToolUseCoalescingTests(_BridgeTestCase):
 
         tool_posts = [p for p in self.bridge.mm.posted if "Using tool" in p.message]
         self.assertEqual(len(tool_posts), 1, "only one placeholder post should be created")
-        self.assertEqual(self.bridge.mm.edits[-1][1], "_Using tool: Bash x3_")
+        self.assertEqual(self.bridge.mm.edits[-1][1], "_Using tool: Bash (x3)_")
 
     async def test_different_tool_adds_new_line(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
@@ -1215,25 +1215,38 @@ class ToolUseCoalescingTests(_BridgeTestCase):
         final = self.bridge.mm.edits[-1][1]
         self.assertEqual(
             final,
-            "_Using tool: Bash x2_\n_Using tool: Read_\n_Using tool: Bash x2_",
+            "_Using tool: Bash (x2)_\n_Using tool: Read_\n_Using tool: Bash (x2)_",
         )
         # Still one underlying post.
         tool_posts = [p for p in self.bridge.mm.posted if "Using tool" in p.message]
         self.assertEqual(len(tool_posts), 1)
 
-    async def test_real_text_deletes_placeholder_permanently(self):
+    async def test_real_text_ends_run_without_deleting(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
         await self._tool_use("s1", "Bash")
         await self._tool_use("s1", "Bash")
-        placeholder_id = self.bridge.mm.posted[0].message
-        placeholder_post_id = self.bridge.tool_use_runs["s1"].post_id
 
         await self._text("s1", "here is the answer")
 
-        self.assertIn((placeholder_post_id, False), self.bridge.mm.deletes)
+        # Placeholder is NOT deleted — it stays in the channel as a
+        # compact record of the tools used this turn.
+        self.assertEqual(self.bridge.mm.deletes, [])
+        # But state is dropped so the next turn starts fresh.
         self.assertNotIn("s1", self.bridge.tool_use_runs)
         self.assertTrue(
             any(p.message == "here is the answer" for p in self.bridge.mm.posted),
+        )
+
+    async def test_next_turn_creates_fresh_placeholder(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self._tool_use("s1", "Bash")
+        first_placeholder_id = self.bridge.tool_use_runs["s1"].post_id
+        await self._text("s1", "ok done")
+        await self._tool_use("s1", "Read")
+
+        # Different post id — a new placeholder, not an edit of the old.
+        self.assertNotEqual(
+            self.bridge.tool_use_runs["s1"].post_id, first_placeholder_id,
         )
 
     async def test_mixed_block_event_text_then_tool(self):
@@ -1258,10 +1271,9 @@ class ToolUseCoalescingTests(_BridgeTestCase):
             self.bridge.tool_use_runs["s1"].lines, [["Bash", 1]],
         )
 
-    async def test_tool_error_clears_run_and_posts_error(self):
+    async def test_tool_error_ends_run_without_deleting(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
         await self._tool_use("s1", "Bash")
-        placeholder_post_id = self.bridge.tool_use_runs["s1"].post_id
 
         await self.bridge._on_vd_event("message", {
             "session_id": "s1",
@@ -1273,34 +1285,31 @@ class ToolUseCoalescingTests(_BridgeTestCase):
             },
         })
 
-        self.assertIn((placeholder_post_id, False), self.bridge.mm.deletes)
+        self.assertEqual(self.bridge.mm.deletes, [])
         self.assertNotIn("s1", self.bridge.tool_use_runs)
         self.assertTrue(any("boom" in p.message for p in self.bridge.mm.posted))
 
-    async def test_session_status_stopped_clears_placeholder(self):
+    async def test_session_status_stopped_ends_run(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
         await self._tool_use("s1", "Bash")
-        placeholder_post_id = self.bridge.tool_use_runs["s1"].post_id
 
         await self.bridge._on_vd_event("session_status", {
             "session_id": "s1", "running": False,
         })
 
-        self.assertIn((placeholder_post_id, False), self.bridge.mm.deletes)
+        self.assertEqual(self.bridge.mm.deletes, [])
         self.assertNotIn("s1", self.bridge.tool_use_runs)
 
-    async def test_clear_always_uses_soft_delete(self):
-        """Deliberate choice: we soft-delete, not permanent-delete, so the
-        bot doesn't need `system_admin`. Every delete call must be
-        permanent=False.
+    async def test_placeholder_is_never_deleted(self):
+        """Safety net: regardless of turn end-reason, the placeholder post
+        is preserved in the channel as a permanent record.
         """
         self.bridge.mapping.link(Anchor("c1"), "s1")
-        await self._tool_use("s1", "Bash")
+        for _ in range(3):
+            await self._tool_use("s1", "Bash")
         await self._text("s1", "done")
 
-        self.assertTrue(self.bridge.mm.deletes)
-        for _, permanent in self.bridge.mm.deletes:
-            self.assertFalse(permanent)
+        self.assertEqual(self.bridge.mm.deletes, [])
 
     async def test_sessions_isolated(self):
         """Two live sessions must not share placeholder state."""

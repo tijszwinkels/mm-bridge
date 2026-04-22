@@ -11,26 +11,27 @@ Every tool invocation is currently posted as its own MM message (`_Using tool: B
 Per VD session, at most one "tool-use" placeholder post exists at any moment.
 
 - First tool call of a turn → create the post with a single line `_Using tool: Foo_`.
-- Same tool again → edit the same post, bump a counter on the last line: `_Using tool: Foo x2_`, `x3`, …
-- Different tool → edit the same post, append a **new line** for the new tool: `_Using tool: Foo x3_` / `_Using tool: Bar_`. A subsequent repeat of the new tool bumps the count on that last line.
-- When Claude's real response lands (text block) → **soft-delete** the placeholder (standard MM delete; the post disappears from channel views but edit-history rows persist in the DB), then post the response normally.
-- Tool errors (`tool_result` with `is_error=true`) → soft-delete the placeholder and post the error as a normal message. Errors are signal.
-- Interrupts / session stops (`session_status running=false`) → soft-delete placeholder as a safety net.
+- Same tool again → edit the same post, bump a counter on the last line: `_Using tool: Foo (x2)_`, `(x3)`, …
+- Different tool → edit the same post, append a **new line** for the new tool: `_Using tool: Foo (x3)_` / `_Using tool: Bar_`. A subsequent repeat of the new tool bumps the count on that last line.
+- When Claude's real response lands (text block) → **drop the run state** (the placeholder post stays in the channel untouched), then post the response normally. The placeholder becomes a compact per-turn record of which tools were invoked.
+- Tool errors (`tool_result` with `is_error=true`) → drop the run state and post the error as a normal message. Errors are signal.
+- Interrupts / session stops (`session_status running=false`) → drop the run state as a safety net.
+- **No deletes, ever.** A persistent tool-use summary avoids both the soft-delete tombstone in the MM UI and the privilege escalation needed for permanent-delete.
 
 Example MM message transitions within one turn `[Bash, Bash, Read, Bash, Bash, <reply>]`:
 
 ```
 post:  _Using tool: Bash_
-edit:  _Using tool: Bash x2_
-edit:  _Using tool: Bash x2_
+edit:  _Using tool: Bash (x2)_
+edit:  _Using tool: Bash (x2)_
        _Using tool: Read_
-edit:  _Using tool: Bash x2_
+edit:  _Using tool: Bash (x2)_
        _Using tool: Read_
        _Using tool: Bash_
-edit:  _Using tool: Bash x2_
+edit:  _Using tool: Bash (x2)_
        _Using tool: Read_
-       _Using tool: Bash x2_
-delete (permanent), then post real reply.
+       _Using tool: Bash (x2)_
+end-of-turn: drop state (post stays), then post real reply.
 ```
 
 ## Design decisions
@@ -38,17 +39,17 @@ delete (permanent), then post real reply.
 1. **Per-session in-memory state on `Bridge`.** A `tool_use_posts: dict[session_id, ToolUseRun]` where `ToolUseRun` holds `post_id` and `lines: list[(tool_name, count)]`. In-memory is enough — a bridge restart mid-turn orphans one placeholder post; the cost of file I/O on every tool call outweighs that recovery value.
 2. **Dispatch per block inside `_on_vd_message`.** Today `_extract_text_from_blocks` flattens blocks into one string. We switch to walking `msg["blocks"]` and handling each block type individually. A mixed-block event (`[text, tool_use]`) is handled naturally: the text path clears+posts, the trailing tool_use starts a fresh run.
 3. **End-of-turn trigger = real text block.** Simpler and more reliable than gating on `session_status`. We still clear on `session_status running=false` as a safety net for interrupts and crashes.
-4. **Soft delete, not permanent.** `permanent=true` requires the bot to have `PermissionPermanentDeletePost`, i.e. `system_admin`. We don't promote the bot — least-privilege wins, and edit-history retention is a feature, not a bug ("data never gets lost"). `mm_client.delete_post` still exposes a `permanent` kwarg for future use; the bridge calls it with the default (`permanent=False`).
+4. **No delete at turn end.** The placeholder survives in the channel as a compact record of the tools used that turn. This sidesteps two problems: soft-delete leaves an ugly "(message deleted)" tombstone in the MM UI, and permanent-delete requires promoting the bot to `system_admin`. `mm_client.delete_post` still exposes a `permanent` kwarg (added during design) for future use by other callers; the bridge itself never calls it.
 5. **No change to `tool_result` handling** beyond errors. Regular tool results aren't posted today; that stays.
 6. **No change to attribution, directives, attachments.** The response-text path runs the existing code after the delete+clear.
 
 ## Server-side prerequisite
 
-None for the default soft-delete path. `ServiceSettings.EnableAPIPostDeletion` was flipped to `true` across the fleet (preview, plenny, tinkertank) during implementation in case we later move to permanent-delete; it has no effect while the bot stays on `system_user`.
+None. `ServiceSettings.EnableAPIPostDeletion` was flipped to `true` across the fleet (preview, plenny, tinkertank) earlier in the design exploration; it's unused by this feature and harmless left on.
 
-### DB growth (soft-delete trade-off)
+### DB growth
 
-Soft-delete hides the post from channel views but keeps the row — and every edit-history row — in `posts` (`deleteat > 0`). At ~5 edits/turn × 200 turns/week ≈ 1 200 residual rows/week ≈ 60 MB/year. Indexes keep live-post queries fast (`idx_posts_channel_id_delete_at_create_at`), so the cost is disk + backup size, not latency. If this ever becomes material, promoting the bot + switching `_clear_tool_use_run` to `permanent=True` is a one-line change.
+Each turn leaves one current placeholder + N edit-history rows (one per tool switch) in `posts`. At ~5 edits/turn × 200 turns/week ≈ 1 200 rows/week ≈ 60 MB/year — same order as if we soft-deleted, but the posts are visible and useful in channel scrollback. Indexes keep live-post queries fast (`idx_posts_channel_id_delete_at_create_at`), so the cost is disk + backup size, not latency.
 
 ## Build plan
 
@@ -82,9 +83,9 @@ Replace the flatten-then-post flow with per-block handling:
 | Block type | Action |
 |---|---|
 | `tool_use` | Upsert tool-use run; create or edit the placeholder post. |
-| `tool_result` (`is_error=true`) | `_clear_tool_use_run`; post error as normal message. |
+| `tool_result` (`is_error=true`) | `_end_tool_use_run`; post error as normal message. |
 | `tool_result` (non-error) | Ignore (existing behavior). |
-| `text` (non-empty) | `_clear_tool_use_run`; run the existing directives / attachments / truncate / post path. |
+| `text` (non-empty) | `_end_tool_use_run`; run the existing directives / attachments / truncate / post path. |
 | `text` (blank/whitespace) | Skip (existing behavior). |
 
 Preserve the existing `<leaveChannel/>`, `<openFile/>`, truncation, and root_id behavior for the text path.
@@ -100,12 +101,13 @@ Call `_clear_run(session_id)` from:
 
 Unit (`tests/test_bridge.py`):
 
-- `Bash, Bash, Read, Bash, Bash` → one create + 4 edits; final body has 3 lines (`Bash x2`, `Read`, `Bash x2`).
-- Trailing text block → placeholder soft-deleted (call trace asserts `permanent=False`), reply posted.
-- Tool error mid-run → placeholder soft-deleted, error posted.
-- `session_status running=false` → placeholder cleared.
+- `Bash, Bash, Read, Bash, Bash` → one create + 4 edits; final body has 3 lines (`Bash (x2)`, `Read`, `Bash (x2)`).
+- Trailing text block → run state dropped, placeholder left untouched, reply posted.
+- Tool error mid-run → run state dropped, placeholder left untouched, error posted.
+- `session_status running=false` → run state dropped.
+- Next turn creates a fresh placeholder with a new post_id (not an edit of the old one).
 - Mixed-block event `[text, tool_use]` → text posted, then new run starts with one line.
-- Every delete call must be `permanent=False` (least-privilege guarantee).
+- **`mm.deletes` must stay empty across all scenarios** — the placeholder is never deleted.
 - Two concurrent sessions remain isolated (per-session state).
 
 ### Step 6 — Docs
