@@ -29,6 +29,8 @@ class FakeMattermostClient:
     team_id: str = "team-1"
     channels: dict = field(default_factory=dict)
     posted: list[_Post] = field(default_factory=list)
+    edits: list[tuple[str, str]] = field(default_factory=list)
+    deletes: list[tuple[str, bool]] = field(default_factory=list)  # (post_id, permanent)
     renames: list[tuple[str, str]] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     typing: list[tuple[str, str | None]] = field(default_factory=list)
@@ -44,6 +46,13 @@ class FakeMattermostClient:
     joined: list = field(default_factory=list)
     # First-message preamble support:
     channel_members: dict = field(default_factory=dict)
+    # Permanent-delete failure simulation:
+    permanent_delete_disabled: bool = False
+    _post_counter: int = 0
+
+    def _next_post_id(self) -> str:
+        self._post_counter += 1
+        return f"p{self._post_counter}"
 
     def login(self) -> None:
         pass
@@ -53,12 +62,25 @@ class FakeMattermostClient:
         return
 
     def post_message(self, channel_id: str, message: str) -> dict:
+        pid = self._next_post_id()
         self.posted.append(_Post(channel_id, message))
-        return {"id": "p"}
+        return {"id": pid}
 
     def post(self, channel_id: str, message: str, *, file_ids=None, root_id=None):
+        pid = self._next_post_id()
         self.posted.append(_Post(channel_id, message, file_ids, root_id))
-        return {"id": "p"}
+        return {"id": pid}
+
+    def update_post(self, post_id: str, message: str) -> dict:
+        self.edits.append((post_id, message))
+        return {"id": post_id}
+
+    def delete_post(self, post_id: str, *, permanent: bool = False) -> None:
+        if permanent and self.permanent_delete_disabled:
+            raise RuntimeError(
+                "Cannot delete post, ServiceSettings.EnableAPIPostDeletion is not enabled."
+            )
+        self.deletes.append((post_id, permanent))
 
     def create_channel(self, name: str, display_name: str, purpose: str = "") -> dict:
         cid = f"c-{name}"
@@ -1140,6 +1162,157 @@ class AssistantMessageTests(_BridgeTestCase):
 
         self.assertIn("c1", self.bridge.mm.removed)
         self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
+
+
+class ToolUseCoalescingTests(_BridgeTestCase):
+    """Verify tool-use blocks coalesce into a single per-turn placeholder
+    post that gets hard-deleted when the turn ends.
+    """
+
+    async def _tool_use(self, session_id: str, tool: str) -> None:
+        await self.bridge._on_vd_event("message", {
+            "session_id": session_id,
+            "message": {
+                "role": "assistant",
+                "blocks": [{"type": "tool_use", "tool_name": tool}],
+            },
+        })
+
+    async def _text(self, session_id: str, text: str) -> None:
+        await self.bridge._on_vd_event("message", {
+            "session_id": session_id,
+            "message": {
+                "role": "assistant",
+                "blocks": [{"type": "text", "text": text}],
+            },
+        })
+
+    async def test_single_tool_use_creates_placeholder(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self._tool_use("s1", "Bash")
+
+        tool_posts = [p for p in self.bridge.mm.posted if "Using tool" in p.message]
+        self.assertEqual(len(tool_posts), 1)
+        self.assertEqual(tool_posts[0].message, "_Using tool: Bash_")
+
+    async def test_repeat_tool_bumps_counter_via_edit(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        for _ in range(3):
+            await self._tool_use("s1", "Bash")
+
+        tool_posts = [p for p in self.bridge.mm.posted if "Using tool" in p.message]
+        self.assertEqual(len(tool_posts), 1, "only one placeholder post should be created")
+        self.assertEqual(self.bridge.mm.edits[-1][1], "_Using tool: Bash x3_")
+
+    async def test_different_tool_adds_new_line(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self._tool_use("s1", "Bash")
+        await self._tool_use("s1", "Bash")
+        await self._tool_use("s1", "Read")
+        await self._tool_use("s1", "Bash")
+        await self._tool_use("s1", "Bash")
+
+        final = self.bridge.mm.edits[-1][1]
+        self.assertEqual(
+            final,
+            "_Using tool: Bash x2_\n_Using tool: Read_\n_Using tool: Bash x2_",
+        )
+        # Still one underlying post.
+        tool_posts = [p for p in self.bridge.mm.posted if "Using tool" in p.message]
+        self.assertEqual(len(tool_posts), 1)
+
+    async def test_real_text_deletes_placeholder_permanently(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self._tool_use("s1", "Bash")
+        await self._tool_use("s1", "Bash")
+        placeholder_id = self.bridge.mm.posted[0].message
+        placeholder_post_id = self.bridge.tool_use_runs["s1"].post_id
+
+        await self._text("s1", "here is the answer")
+
+        self.assertIn((placeholder_post_id, False), self.bridge.mm.deletes)
+        self.assertNotIn("s1", self.bridge.tool_use_runs)
+        self.assertTrue(
+            any(p.message == "here is the answer" for p in self.bridge.mm.posted),
+        )
+
+    async def test_mixed_block_event_text_then_tool(self):
+        """A single event with [text, tool_use] posts the text, then starts
+        a fresh tool-use run for the trailing tool.
+        """
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self.bridge._on_vd_event("message", {
+            "session_id": "s1",
+            "message": {
+                "role": "assistant",
+                "blocks": [
+                    {"type": "text", "text": "planning next step"},
+                    {"type": "tool_use", "tool_name": "Bash"},
+                ],
+            },
+        })
+
+        self.assertTrue(any(p.message == "planning next step" for p in self.bridge.mm.posted))
+        self.assertIn("s1", self.bridge.tool_use_runs)
+        self.assertEqual(
+            self.bridge.tool_use_runs["s1"].lines, [["Bash", 1]],
+        )
+
+    async def test_tool_error_clears_run_and_posts_error(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self._tool_use("s1", "Bash")
+        placeholder_post_id = self.bridge.tool_use_runs["s1"].post_id
+
+        await self.bridge._on_vd_event("message", {
+            "session_id": "s1",
+            "message": {
+                "role": "assistant",
+                "blocks": [
+                    {"type": "tool_result", "is_error": True, "content": "boom"},
+                ],
+            },
+        })
+
+        self.assertIn((placeholder_post_id, False), self.bridge.mm.deletes)
+        self.assertNotIn("s1", self.bridge.tool_use_runs)
+        self.assertTrue(any("boom" in p.message for p in self.bridge.mm.posted))
+
+    async def test_session_status_stopped_clears_placeholder(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self._tool_use("s1", "Bash")
+        placeholder_post_id = self.bridge.tool_use_runs["s1"].post_id
+
+        await self.bridge._on_vd_event("session_status", {
+            "session_id": "s1", "running": False,
+        })
+
+        self.assertIn((placeholder_post_id, False), self.bridge.mm.deletes)
+        self.assertNotIn("s1", self.bridge.tool_use_runs)
+
+    async def test_clear_always_uses_soft_delete(self):
+        """Deliberate choice: we soft-delete, not permanent-delete, so the
+        bot doesn't need `system_admin`. Every delete call must be
+        permanent=False.
+        """
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        await self._tool_use("s1", "Bash")
+        await self._text("s1", "done")
+
+        self.assertTrue(self.bridge.mm.deletes)
+        for _, permanent in self.bridge.mm.deletes:
+            self.assertFalse(permanent)
+
+    async def test_sessions_isolated(self):
+        """Two live sessions must not share placeholder state."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mapping.link(Anchor("c2"), "s2")
+
+        await self._tool_use("s1", "Bash")
+        await self._tool_use("s2", "Read")
+        await self._tool_use("s1", "Bash")
+
+        self.assertEqual(self.bridge.tool_use_runs["s1"].lines, [["Bash", 2]])
+        self.assertEqual(self.bridge.tool_use_runs["s2"].lines, [["Read", 1]])
 
 
 class NameSyncTests(_BridgeTestCase):

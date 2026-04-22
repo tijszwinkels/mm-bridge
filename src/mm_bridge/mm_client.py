@@ -99,6 +99,19 @@ class MattermostClient:
             "message": message,
         })
 
+    def delete_post(self, post_id: str, *, permanent: bool = False) -> None:
+        """Delete a post. `permanent=True` drops the DB row (no soft-delete,
+        no edit-history row retained) — requires `ServiceSettings.
+        EnableAPIPostDeletion=true` server-side. If that flag is off, MM
+        returns 501; callers should catch and fall back.
+        """
+        if permanent:
+            self._driver.client.delete(
+                f"/api/v4/posts/{post_id}", params={"permanent": "true"},
+            )
+            return
+        self._driver.posts.delete_post(post_id)
+
     def get_posts(self, channel_id: str, limit: int) -> list[dict]:
         """Most-recent N posts, returned oldest-first."""
         resp = self._driver.posts.get_posts_for_channel(
