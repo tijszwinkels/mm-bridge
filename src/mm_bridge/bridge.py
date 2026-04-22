@@ -61,16 +61,41 @@ class PendingMattermostSession:
     channel_display_name: str | None = None
 
 
+@dataclass
+class ToolUseRun:
+    """A single per-turn tool-use placeholder post, edited in place as
+    the assistant fires tool calls. Lines accumulate one per tool switch;
+    consecutive calls of the same tool bump the last line's counter.
+    """
+    post_id: str
+    lines: list[list] = field(default_factory=list)  # [[tool_name, count], ...]
+
+
+def _format_tool_run(run: ToolUseRun) -> str:
+    parts: list[str] = []
+    for tool, count in run.lines:
+        suffix = f" x{count}" if count > 1 else ""
+        parts.append(f"_Using tool: {tool}{suffix}_")
+    return "\n".join(parts)
+
+
+def _bump_or_append(run: ToolUseRun, tool: str) -> None:
+    if run.lines and run.lines[-1][0] == tool:
+        run.lines[-1][1] += 1
+    else:
+        run.lines.append([tool, 1])
+
+
 def _extract_text_from_blocks(blocks: list[dict]) -> str:
-    """Extract readable text from VibeDeck normalized message blocks."""
+    """Flatten text + error blocks (not tool_use). Used for the real
+    assistant response; tool_use blocks are handled separately via the
+    ToolUseRun coalescing path in `_on_vd_message`.
+    """
     parts: list[str] = []
     for block in blocks:
         btype = block.get("type")
         if btype == "text":
             parts.append(block.get("text", ""))
-        elif btype == "tool_use":
-            tool = block.get("tool_name", "unknown")
-            parts.append(f"_Using tool: {tool}_")
         elif btype == "tool_result":
             content = block.get("content", "")
             if block.get("is_error"):
@@ -228,6 +253,13 @@ class Bridge:
         # should be silent until a user engages.
         self._self_joined_channels: set[str] = set()
         self._max_file_size: int | None = None
+        # Per-session coalesced tool-use placeholder posts. Created on the
+        # first tool_use block of a turn, edited on subsequent ones, soft-
+        # deleted when the turn ends (real text reply, tool error, session
+        # stop, or any cleanup path). Soft-delete is intentional — we want
+        # edit history retained rather than require `system_admin` on the
+        # bot for permanent-delete.
+        self.tool_use_runs: dict[str, ToolUseRun] = {}
 
     # ----- lifecycle -----
 
@@ -547,6 +579,7 @@ class Bridge:
         self.purpose_by_channel.pop(channel_id, None)
         self.pending_mm_sessions.pop(channel_id, None)
         if session_id:
+            self._clear_tool_use_run(session_id)
             self.posters.forget(session_id)
             if self.typing:
                 await self.typing.stop(session_id)
@@ -843,6 +876,7 @@ class Bridge:
         replaced. The old session is abandoned (no explicit VD-side delete).
         """
         self.mapping.unlink(Anchor(channel_id))
+        self._clear_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
         if self.typing:
             await self.typing.stop(old_session_id)
@@ -1343,6 +1377,7 @@ class Bridge:
             removed = self.mapping.unlink(Anchor(channel_id, thread_root))
             self.dead_threads.add((channel_id, thread_root))
             if removed:
+                self._clear_tool_use_run(removed)
                 self.posters.forget(removed)
                 if self.typing:
                     await self.typing.stop(removed)
@@ -1384,6 +1419,7 @@ class Bridge:
             except Exception:
                 pass
             return
+        self._clear_tool_use_run(session_id)
         if self.typing:
             await self.typing.stop(session_id)
         logger.info("MM → VD [%s]: stop (interrupt)", session_id[:8])
@@ -1416,6 +1452,7 @@ class Bridge:
             return
         self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
+        self._clear_tool_use_run(session_id)
         self.posters.forget(session_id)
         if self.typing:
             await self.typing.stop(session_id)
@@ -1612,9 +1649,43 @@ class Bridge:
         if not channel_id:
             return
 
-        text = _extract_text_from_blocks(msg.get("blocks", []))
-        if not text.strip():
-            return
+        # Walk blocks in order. tool_use blocks coalesce into a per-session
+        # placeholder; text/error blocks end the run and post normally.
+        for block in msg.get("blocks", []):
+            btype = block.get("type")
+            if btype == "tool_use":
+                tool = block.get("tool_name", "unknown")
+                self._upsert_tool_use(session_id, channel_id, thread_root, tool)
+            elif btype == "tool_result" and block.get("is_error"):
+                self._clear_tool_use_run(session_id)
+                err_text = f"**Tool error:** {str(block.get('content',''))[:500]}"
+                try:
+                    self.mm.post(
+                        channel_id, _truncate_for_mm(err_text), root_id=thread_root,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to post tool error for session %s", session_id[:8],
+                    )
+            elif btype == "text":
+                text = (block.get("text") or "").strip()
+                if not text:
+                    continue
+                await self._handle_assistant_text_block(
+                    session_id, channel_id, thread_root, text,
+                )
+
+    async def _handle_assistant_text_block(
+        self,
+        session_id: str,
+        channel_id: str,
+        thread_root: str | None,
+        text: str,
+    ) -> None:
+        """Real assistant response — clear the tool-use placeholder, then
+        run the existing directives / attachments / post pipeline.
+        """
+        self._clear_tool_use_run(session_id)
 
         cleaned, dirs = directives.extract(text)
 
@@ -1700,6 +1771,62 @@ class Bridge:
         except Exception:
             logger.exception("Failed to post to MM channel for session %s",
                              session_id[:8])
+
+    # ----- Coalesced tool-use placeholder -----
+
+    def _upsert_tool_use(
+        self,
+        session_id: str,
+        channel_id: str,
+        thread_root: str | None,
+        tool: str,
+    ) -> None:
+        """Create or edit the per-turn tool-use placeholder post for
+        `session_id`. Repeats of the last-used tool bump a counter; a
+        different tool appends a new line.
+        """
+        run = self.tool_use_runs.get(session_id)
+        if run is None:
+            body = f"_Using tool: {tool}_"
+            try:
+                post = self.mm.post(channel_id, body, root_id=thread_root)
+            except Exception:
+                logger.exception(
+                    "Failed to post tool-use placeholder for %s", session_id[:8],
+                )
+                return
+            post_id = post.get("id")
+            if not post_id:
+                return
+            self.tool_use_runs[session_id] = ToolUseRun(
+                post_id=post_id, lines=[[tool, 1]],
+            )
+            return
+
+        _bump_or_append(run, tool)
+        try:
+            self.mm.update_post(run.post_id, _format_tool_run(run))
+        except Exception:
+            logger.exception(
+                "Failed to edit tool-use placeholder for %s", session_id[:8],
+            )
+
+    def _clear_tool_use_run(self, session_id: str) -> None:
+        """Soft-delete the tool-use placeholder (if any) and drop state.
+        Soft-delete is deliberate: it hides the post from channel views
+        while preserving edit history in the DB. Permanent-delete would
+        require promoting the bot to `system_admin`, which we don't do.
+        """
+        run = self.tool_use_runs.pop(session_id, None)
+        if run is None:
+            return
+        try:
+            self.mm.delete_post(run.post_id)
+        except Exception:
+            logger.warning(
+                "Failed to delete tool-use placeholder %s for session %s",
+                run.post_id, session_id[:8], exc_info=True,
+            )
 
     async def _project_path_for(self, session_id: str) -> str | None:
         meta = await self.vd.get_session_meta(session_id)
@@ -1790,14 +1917,20 @@ class Bridge:
     async def _on_vd_session_status(self, data: dict) -> None:
         session_id = data.get("session_id", "")
         running = bool(data.get("running"))
-        if not session_id or not self.typing:
+        if not session_id:
             return
         self.last_status_ts[session_id] = time.monotonic()
 
         if not running:
-            await self.typing.stop(session_id)
+            # Safety net: clear any lingering tool-use placeholder when the
+            # turn ends without a final assistant text (interrupt, crash).
+            self._clear_tool_use_run(session_id)
+            if self.typing:
+                await self.typing.stop(session_id)
             return
 
+        if not self.typing:
+            return
         anchor = self.mapping.get_anchor(session_id)
         if not anchor:
             return
