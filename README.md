@@ -56,6 +56,12 @@ default_model     = "opus"
 default_cwd       = "~/projects"
 default_autorespond = false
 
+# Coalesce Claude's tool-use events into one per-turn placeholder post
+# (edited as more tools run, left as a compact summary when the turn
+# ends). Set false to hide them entirely — channels then carry only
+# real assistant replies and tool errors.
+show_tool_use = true
+
 # Auto-join: silently join every public channel the bot can see.
 # Sessions are NOT created until someone actually engages the bot.
 auto_join_public_channels  = false
@@ -92,6 +98,7 @@ catch_up_max_n     = 500
 | `VD_DEFAULT_BACKEND`     | `claude` or `codex`.                                               |
 | `VD_DEFAULT_MODEL`       | Model slug (empty string → unset).                                 |
 | `VD_DEFAULT_AUTORESPOND` | `1/true/yes/on` to enable autorespond by default.                  |
+| `MM_SHOW_TOOL_USE`       | Toggle `show_tool_use` without editing TOML.                       |
 | `MM_AUTO_JOIN`           | Toggle `auto_join_public_channels` without editing TOML.           |
 | `MM_BRIDGE_STATE`        | Path to the state JSON.                                            |
 | `MM_BRIDGE_SIDECAR_DIR`  | Sidecar directory.                                                 |
