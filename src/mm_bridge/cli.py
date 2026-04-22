@@ -25,7 +25,7 @@ from typing import Callable
 import json
 
 from . import sidecar, spawn as spawn_mod
-from .bridge import Bridge
+from .bridge import Bridge, resolve_attachment_path
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .vd_client import VibeDeckClient
@@ -327,6 +327,145 @@ def cmd_channels(args: argparse.Namespace) -> int:
     return 0
 
 
+_MAX_POST_ATTACHMENTS = 10
+
+
+def _resolve_post_anchor(
+    cfg: Config, explicit_channel: str | None,
+) -> Anchor:
+    """Channel + default root_id for a post.
+
+    Explicit ``--channel`` wins with no default root_id. Otherwise fall
+    back to the current session's sidecar (which may carry a root_id
+    for thread-forked sessions).
+    """
+    if explicit_channel:
+        return Anchor(explicit_channel, None)
+    return _resolve_anchor_from_session(cfg.sidecar_dir, _current_session_id())
+
+
+def _resolve_effective_root(
+    anchor: Anchor, thread: str | None, no_thread: bool,
+) -> str | None:
+    if no_thread:
+        return None
+    if thread:
+        return thread
+    return anchor.root_id
+
+
+def _validate_attachments(
+    paths: list[str], allowed_roots: list[str], max_bytes: int,
+) -> tuple[list[Path] | None, int, str]:
+    """Resolve + stat every --file. Returns (paths|None, exit_code, err_msg).
+
+    A non-None paths list means all checks passed. On failure, ``paths``
+    is None and the caller should exit with ``exit_code``.
+    """
+    if len(paths) > _MAX_POST_ATTACHMENTS:
+        return (
+            None, 2,
+            f"Error: at most {_MAX_POST_ATTACHMENTS} --file attachments "
+            f"allowed per post (got {len(paths)}).",
+        )
+    resolved: list[Path] = []
+    for raw in paths:
+        path = resolve_attachment_path(
+            raw, project_path=None, allowed_roots=allowed_roots,
+        )
+        if path is None:
+            return (
+                None, 2,
+                f"Error: --file {raw!r} is outside allowed_attachment_roots.",
+            )
+        if not path.is_file():
+            return (
+                None, 3,
+                f"Error: --file {raw!r} is not a readable file ({path}).",
+            )
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return None, 3, f"Error: could not stat --file {raw!r}: {exc}"
+        if size > max_bytes:
+            return (
+                None, 3,
+                f"Error: --file {raw!r} is {size} bytes, exceeds server "
+                f"max of {max_bytes} bytes.",
+            )
+        resolved.append(path)
+    return resolved, 0, ""
+
+
+def cmd_post(args: argparse.Namespace) -> int:
+    cfg = Config.load()
+    _require_bot_token(cfg)
+
+    try:
+        anchor = _resolve_post_anchor(cfg, args.channel)
+    except NotInMattermostChannel as exc:
+        print(
+            f"Error: not running inside a Mattermost channel and "
+            f"no --channel given ({exc}).",
+            file=sys.stderr,
+        )
+        return 2
+
+    root_id = _resolve_effective_root(anchor, args.thread, args.no_thread)
+
+    if args.message == "-":
+        body = sys.stdin.read().rstrip("\n")
+    else:
+        body = args.message
+
+    if not body.strip() and not args.file:
+        print("Error: message body is empty.", file=sys.stderr)
+        return 2
+
+    mm = _make_mm_client(cfg)
+    try:
+        mm.login()
+    except Exception as exc:
+        print(f"Error: could not log into Mattermost: {exc}", file=sys.stderr)
+        return 3
+
+    try:
+        max_bytes = mm.get_max_file_size()
+    except Exception:
+        logger.debug("get_max_file_size failed, using 50MB fallback", exc_info=True)
+        max_bytes = 50 * 1024 * 1024
+
+    resolved, err_code, err_msg = _validate_attachments(
+        args.file, cfg.allowed_attachment_roots, max_bytes,
+    )
+    if resolved is None:
+        print(err_msg, file=sys.stderr)
+        return err_code
+
+    file_ids: list[str] = []
+    for path in resolved:
+        try:
+            file_ids.append(mm.upload_file(anchor.channel_id, path))
+        except Exception as exc:
+            print(
+                f"Error: upload failed for {path}: {exc}", file=sys.stderr,
+            )
+            return 3
+
+    try:
+        post = mm.post(
+            anchor.channel_id, body,
+            file_ids=file_ids or None,
+            root_id=root_id,
+        )
+    except Exception as exc:
+        print(f"Error: post failed: {exc}", file=sys.stderr)
+        return 3
+
+    print(post["id"])
+    return 0
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
@@ -517,6 +656,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--format", choices=["text", "json"], default="text",
     )
     p_channels.set_defaults(func=cmd_channels)
+
+    p_post = sub.add_parser(
+        "post", help="Post a message to a Mattermost channel.",
+    )
+    p_post.add_argument(
+        "--channel",
+        help="Channel id. Defaults to the current session's channel.",
+    )
+    thread_group = p_post.add_mutually_exclusive_group()
+    thread_group.add_argument(
+        "--thread", metavar="ROOT_POST_ID",
+        help="Post as a reply inside this thread.",
+    )
+    thread_group.add_argument(
+        "--no-thread", action="store_true",
+        help="Post at channel level even if the session is thread-forked.",
+    )
+    p_post.add_argument(
+        "--file", action="append", default=[], metavar="PATH",
+        help="Attachment path (repeatable, max 10).",
+    )
+    p_post.add_argument(
+        "message", help="Message body, or '-' to read from stdin.",
+    )
+    p_post.set_defaults(func=cmd_post)
 
     p_spawn = sub.add_parser(
         "spawn",
