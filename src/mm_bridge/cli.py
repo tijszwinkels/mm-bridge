@@ -17,8 +17,10 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -466,6 +468,207 @@ def cmd_post(args: argparse.Namespace) -> int:
     return 0
 
 
+_DURATION_RE = re.compile(r"^(\d+)(m|h|d)$")
+_DURATION_UNIT_MS = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+
+
+def _parse_since(raw: str, now_ms: int) -> int:
+    """Return a ms-epoch for a ``--since`` argument.
+
+    Accepted forms:
+
+    * ``<int><m|h|d>`` — relative duration, subtracted from ``now_ms``.
+    * All-digits → parsed as an ms-epoch verbatim.
+    * ISO-8601 timestamp (``Z`` or offset suffix accepted).
+    """
+    match = _DURATION_RE.match(raw)
+    if match:
+        amount = int(match.group(1))
+        unit_ms = _DURATION_UNIT_MS[match.group(2)]
+        return now_ms - amount * unit_ms
+    if raw.isdigit():
+        return int(raw)
+    try:
+        iso = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+    except ValueError as exc:
+        raise ValueError(
+            "--since must be an ISO-8601 timestamp, an ms-epoch, or a "
+            "duration like '30m', '2h', '1d'."
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+class _UserCache:
+    """Per-invocation username cache; unknown users degrade gracefully."""
+
+    def __init__(self, mm) -> None:
+        self._mm = mm
+        self._cache: dict[str, str] = {}
+
+    def username(self, user_id: str) -> str:
+        if user_id in self._cache:
+            return self._cache[user_id]
+        try:
+            user = self._mm.get_user(user_id)
+            name = user.get("username") or f"user:{user_id[:8]}"
+        except Exception:
+            name = f"user:{user_id[:8]}"
+        self._cache[user_id] = name
+        return name
+
+
+def _human_size(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f} MB"
+    if n >= 1000:
+        return f"{n // 1000} KB"
+    return f"{n} B"
+
+
+def _render_post_text(
+    post: dict, username: str, file_infos: list[dict],
+) -> str:
+    ts_ms = int(post.get("create_at") or 0)
+    ts = datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M")
+    lines = [f"[{ts}] {username}"]
+    body = (post.get("message") or "").rstrip()
+    if body:
+        lines.append(body)
+    for info in file_infos:
+        name = info.get("name") or info.get("id") or "file"
+        size = info.get("size") or 0
+        lines.append(f"📎 {name} ({_human_size(size)})")
+    return "\n".join(lines)
+
+
+def _project_post_json(
+    post: dict, username: str, is_bot: bool, file_infos: list[dict],
+) -> dict:
+    return {
+        "id": post.get("id"),
+        "create_at": post.get("create_at"),
+        "user_id": post.get("user_id"),
+        "username": username,
+        "is_bot": is_bot,
+        "root_id": post.get("root_id") or "",
+        "message": post.get("message") or "",
+        "files": [
+            {
+                "id": f.get("id"),
+                "name": f.get("name"),
+                "size": f.get("size"),
+                "mime_type": f.get("mime_type"),
+            }
+            for f in file_infos
+        ],
+    }
+
+
+def _collect_file_infos(mm, post: dict) -> list[dict]:
+    infos: list[dict] = []
+    for fid in post.get("file_ids") or []:
+        try:
+            infos.append(mm.get_file_info(fid))
+        except Exception:
+            logger.debug("get_file_info failed for %s", fid, exc_info=True)
+            infos.append({"id": fid, "name": fid, "size": 0})
+    return infos
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    cfg = Config.load()
+    _require_bot_token(cfg)
+
+    try:
+        anchor = _resolve_post_anchor(cfg, args.channel)
+    except NotInMattermostChannel as exc:
+        print(
+            f"Error: not running inside a Mattermost channel and "
+            f"no --channel given ({exc}).",
+            file=sys.stderr,
+        )
+        return 2
+
+    root_id = _resolve_effective_root(anchor, args.thread, args.no_thread)
+
+    since_ms: int | None = None
+    if args.since:
+        try:
+            since_ms = _parse_since(args.since, int(time.time() * 1000))
+        except ValueError as exc:
+            print(f"Error: --since: {exc}", file=sys.stderr)
+            return 2
+
+    if args.n == 0:
+        limit = cfg.catch_up_max_n
+        uncapped = True
+    else:
+        limit = min(max(args.n, 1), cfg.catch_up_max_n)
+        uncapped = False
+
+    mm = _make_mm_client(cfg)
+    try:
+        mm.login()
+    except Exception as exc:
+        print(f"Error: could not log into Mattermost: {exc}", file=sys.stderr)
+        return 3
+
+    try:
+        if root_id:
+            posts = mm.get_thread_posts(root_id)
+        elif since_ms is not None:
+            posts = mm.get_posts_since(anchor.channel_id, since_ms)
+        else:
+            posts = mm.get_posts(anchor.channel_id, limit)
+    except Exception as exc:
+        print(f"Error: could not fetch posts: {exc}", file=sys.stderr)
+        return 3
+
+    if since_ms is not None:
+        posts = [p for p in posts if (p.get("create_at") or 0) >= since_ms]
+
+    posts = [p for p in posts if not (p.get("type") or "")]
+    if args.no_bot:
+        bot_id = getattr(mm, "bot_user_id", "")
+        posts = [p for p in posts if p.get("user_id") != bot_id]
+
+    posts.sort(key=lambda p: p.get("create_at") or 0)
+
+    if not uncapped and len(posts) > limit:
+        posts = posts[-limit:]
+
+    users = _UserCache(mm)
+    bot_id = getattr(mm, "bot_user_id", "")
+
+    if args.format == "text":
+        blocks: list[str] = []
+        for p in posts:
+            uname = users.username(p.get("user_id") or "")
+            infos = _collect_file_infos(mm, p)
+            blocks.append(_render_post_text(p, uname, infos))
+        if blocks:
+            print("\n\n".join(blocks))
+        return 0
+
+    projected = []
+    for p in posts:
+        uname = users.username(p.get("user_id") or "")
+        infos = _collect_file_infos(mm, p)
+        projected.append(
+            _project_post_json(p, uname, p.get("user_id") == bot_id, infos),
+        )
+
+    if args.format == "jsonl":
+        for obj in projected:
+            print(json.dumps(obj))
+    else:
+        print(json.dumps(projected, indent=2))
+    return 0
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
@@ -681,6 +884,38 @@ def _build_parser() -> argparse.ArgumentParser:
         "message", help="Message body, or '-' to read from stdin.",
     )
     p_post.set_defaults(func=cmd_post)
+
+    p_read = sub.add_parser(
+        "read", help="Print recent posts from a Mattermost channel.",
+    )
+    p_read.add_argument(
+        "--channel",
+        help="Channel id. Defaults to the current session's channel.",
+    )
+    read_thread_group = p_read.add_mutually_exclusive_group()
+    read_thread_group.add_argument(
+        "--thread", metavar="ROOT_POST_ID",
+        help="Read only posts inside this thread.",
+    )
+    read_thread_group.add_argument(
+        "--no-thread", action="store_true",
+        help="Read channel-level even if the session is thread-forked.",
+    )
+    p_read.add_argument(
+        "-n", type=int, default=50,
+        help="Max posts (0 = unlimited within --since). Default 50, cap 500.",
+    )
+    p_read.add_argument(
+        "--since",
+        help="ISO-8601 timestamp, ms-epoch, or duration like '1h', '2d'.",
+    )
+    p_read.add_argument(
+        "--format", choices=["text", "json", "jsonl"], default="text",
+    )
+    p_read.add_argument(
+        "--no-bot", action="store_true", help="Exclude bot posts.",
+    )
+    p_read.set_defaults(func=cmd_read)
 
     p_spawn = sub.add_parser(
         "spawn",
