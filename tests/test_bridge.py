@@ -1311,6 +1311,27 @@ class ToolUseCoalescingTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.mm.deletes, [])
 
+    async def test_show_tool_use_false_suppresses_placeholder(self):
+        """When `show_tool_use=False`, tool_use blocks are silently
+        dropped — no post, no edit, no run state. Real text still posts.
+        """
+        self.bridge.config.show_tool_use = False
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self._tool_use("s1", "Bash")
+        await self._tool_use("s1", "Read")
+
+        self.assertFalse(
+            any("Using tool" in p.message for p in self.bridge.mm.posted),
+        )
+        self.assertEqual(self.bridge.mm.edits, [])
+        self.assertNotIn("s1", self.bridge.tool_use_runs)
+
+        await self._text("s1", "here's the answer")
+        self.assertTrue(
+            any(p.message == "here's the answer" for p in self.bridge.mm.posted),
+        )
+
     async def test_sessions_isolated(self):
         """Two live sessions must not share placeholder state."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
