@@ -6,3 +6,15 @@ If `~/.mm-bridge/sessions/$CLAUDE_SESSION_ID` exists, you're running inside a Ma
 - **Getting human attention.** If the operator is in the channel, @mention them (`@username`). Otherwise — or if you're unsure — run `mm-bridge invite <username>` to pull them in. When multiple users are in the channel, each message is prefixed with `username:` — use the prefix to decide who to mention.
 - **Attaching local files.** Emit `<openFile path="..." [line="N"] />` anywhere in your reply; the bridge uploads the file, strips the directive from the visible text, and attaches it to the post. Files must live inside the bridge's `allowed_attachment_roots`.
 - **Spawning sub-sessions.** Run `mm-bridge spawn [--title "<name>"] [--cwd <path>] [--backend claude|codex] [--invite <user>] [--no-forward-prompt] "<prompt>"` to start a fresh VibeDeck session in a new sibling Mattermost channel. By default the parent channel gets a post linking to the new channel with the prompt quoted. The new channel's `header` is set to `Parent: ~<parent-channel>~` so context is discoverable from the sub-channel.
+- **Discovering channels.** `mm-bridge channels [--title <kw>] [-n N]` lists channels the bot can see, sorted by recent activity. Filter by title substring; pipe the first column (channel_id) into `post` / `read`.
+- **Reading scrollback.** `mm-bridge read [--channel <id>] [-n N] [--since 1h|2d|ISO]` prints recent posts from a channel (or the current session's channel if `--channel` is omitted). `--thread <root_post_id>` restricts to a thread; an agent running inside a thread-forked session reads its own thread by default.
+- **Posting ad-hoc.** `mm-bridge post [--channel <id>] [--thread <root>] [--file <path>]... "<message>"` sends a one-off message. Omit `--channel` to post into the current session's channel. Use `-` in place of the message to read the body from stdin.
+- **Summarizing a channel.** There's no dedicated subcommand; pipe `read` into an ephemeral Claude run. For example:
+
+  ```sh
+  mm-bridge read --channel <id> --since 1d --no-bot --format text | \
+    claude -p --no-session-persistence \
+      "Summarize this Mattermost channel transcript in 3-5 bullets, focusing on decisions, questions, and action items."
+  ```
+
+  `-p` (alias for `--print`) runs a one-shot, non-interactive completion. `--no-session-persistence` skips writing the conversation to `~/.claude/projects/.../<id>.jsonl` — only valid with `-p`. `--no-bot` on the `read` side strips Claude's own prior replies so it doesn't re-read itself as context. Tune the prompt per use case; add `--model claude-haiku-4-5-20251001` for cheap summaries.
