@@ -616,15 +616,19 @@ class ForwardingTests(_BridgeTestCase):
 
     async def test_explicit_catch_up_drains_silent_drop_queue(self):
         """`@claude catch up` already surfaces the missed conversation
-        from MM history; the silent-drop queue must be cleared so the
-        next mentioned message doesn't prepend the same context twice."""
+        from MM history; silent-drop entries that appear in the
+        catch-up block get cleared so the next mention doesn't replay
+        the same context twice."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
         from mm_bridge.purpose import PurposeConfig
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model=None, mention_only=True,
         )
+        # The MM history used by `_run_catch_up` mirrors the incoming
+        # post ids so `_drain_silent_drops_matching` can align them.
         self.bridge.mm.posts_by_channel["c1"] = [
-            {"user_id": "u1", "message": "ambient chatter", "type": ""},
+            {"id": "d1", "user_id": "u1", "message": "ambient chatter",
+             "type": ""},
         ]
 
         await self.bridge._on_mm_posted({
@@ -650,6 +654,55 @@ class ForwardingTests(_BridgeTestCase):
         last_body = self.bridge.vd.sent[-1][1]
         self.assertNotIn("Catch-up context", last_body)
         self.assertNotIn("ambient chatter", last_body)
+
+    async def test_partial_catch_up_preserves_unsurfaced_drops(self):
+        """``@claude catch up 1`` surfaces only the most recent message;
+        earlier queued drops that weren't in the block must remain so
+        the next mention still replays them."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+        # `get_posts` is served in `oldest-first` order and the
+        # collector scans as-is, taking up to n entries.
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"id": "older", "user_id": "u1", "message": "older chatter",
+             "type": ""},
+            {"id": "newer", "user_id": "u1", "message": "newer chatter",
+             "type": ""},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "id": "older", "channel_id": "c1", "message": "older chatter",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "newer", "channel_id": "c1", "message": "newer chatter",
+            "user_id": "u1", "type": "",
+        })
+        self.assertEqual(len(self.bridge._silent_drops[("c1", None)]), 2)
+
+        await self.bridge._on_mm_posted({
+            "id": "cu", "channel_id": "c1", "message": "@claude catch up 1",
+            "user_id": "u1", "type": "",
+        })
+
+        # Only the single surfaced post ("older", first by get_posts
+        # order) is removed; "newer" stays queued.
+        remaining = self.bridge._silent_drops.get(("c1", None))
+        self.assertIsNotNone(remaining)
+        remaining_ids = [p.get("id") for p in remaining]
+        self.assertEqual(remaining_ids, ["newer"])
+
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude what now",
+            "user_id": "u1", "type": "",
+        })
+
+        last_body = self.bridge.vd.sent[-1][1]
+        self.assertIn("newer chatter", last_body)
+        self.assertNotIn("older chatter", last_body)
 
     async def test_mention_only_drops_survive_send_failure(self):
         """If the VD send fails while replaying silent drops, the queue
