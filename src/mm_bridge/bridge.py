@@ -1109,8 +1109,11 @@ class Bridge:
                 )
             except Exception:
                 pass
-            # Queue intentionally left intact — a subsequent mention
-            # will replay the same context plus the new trigger.
+            # Preserve the previously-queued drops AND enqueue the
+            # current post too: the user's actual request would
+            # otherwise vanish with the failed send. The next mention
+            # replays everything that wasn't delivered.
+            self._enqueue_silent_drop(channel_id, thread_root, post)
         else:
             self._clear_silent_drops(silent_key)
 
@@ -1477,6 +1480,11 @@ class Bridge:
         except Exception:
             logger.exception("Failed to send catch-up block")
             return
+
+        # Explicit catch-up already surfaces the missed conversation from
+        # MM history; drop the silent-drop queue so the next mention
+        # doesn't prepend the same messages a second time.
+        self._clear_silent_drops((channel_id, thread_root))
 
         note = (
             f":arrows_counterclockwise: Sent the last {len(lines)} messages as context."
