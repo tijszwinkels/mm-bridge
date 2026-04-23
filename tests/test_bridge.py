@@ -49,6 +49,9 @@ class FakeMattermostClient:
     # Permanent-delete failure simulation:
     permanent_delete_disabled: bool = False
     _post_counter: int = 0
+    # Mirror of MattermostClient's own-post tracking — populated
+    # whenever the fake creates or edits a post.
+    own_post_ids: set = field(default_factory=set)
 
     def _next_post_id(self) -> str:
         self._post_counter += 1
@@ -61,18 +64,24 @@ class FakeMattermostClient:
         # Not driven in unit tests.
         return
 
+    def is_own_post(self, post_id: str) -> bool:
+        return bool(post_id) and post_id in self.own_post_ids
+
     def post_message(self, channel_id: str, message: str) -> dict:
         pid = self._next_post_id()
         self.posted.append(_Post(channel_id, message))
+        self.own_post_ids.add(pid)
         return {"id": pid}
 
     def post(self, channel_id: str, message: str, *, file_ids=None, root_id=None):
         pid = self._next_post_id()
         self.posted.append(_Post(channel_id, message, file_ids, root_id))
+        self.own_post_ids.add(pid)
         return {"id": pid}
 
     def update_post(self, post_id: str, message: str) -> dict:
         self.edits.append((post_id, message))
+        self.own_post_ids.add(post_id)
         return {"id": post_id}
 
     def delete_post(self, post_id: str, *, permanent: bool = False) -> None:
@@ -494,7 +503,11 @@ class ForwardingTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent[0], ("s1", "first"))
         self.assertTrue(self.bridge.vd.sent[1][1].startswith("u-u2: second"))
 
-    async def test_mention_only_filters_non_mentions(self):
+    async def test_mention_only_drops_are_replayed_on_next_mention(self):
+        """Non-mentions are held in an in-memory queue and prepended to
+        the next forwarded message as a catch-up block — the session
+        should see the conversation it missed while mention-only was
+        silencing it."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
         from mm_bridge.purpose import PurposeConfig
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
@@ -502,15 +515,137 @@ class ForwardingTests(_BridgeTestCase):
         )
 
         await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "just chatting", "user_id": "u1", "type": "",
+            "id": "p1", "channel_id": "c1", "message": "just chatting",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "p2", "channel_id": "c1", "message": "more chatter",
+            "user_id": "u2", "type": "",
         })
         self.assertEqual(self.bridge.vd.sent, [])
 
         await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "@claude help please",
+            "id": "p3", "channel_id": "c1", "message": "@claude help please",
             "user_id": "u1", "type": "",
         })
-        self.assertEqual(self.bridge.vd.sent, [("s1", "help please")])
+
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        session_id, body = self.bridge.vd.sent[0]
+        self.assertEqual(session_id, "s1")
+        self.assertIn("Catch-up context", body)
+        self.assertIn("u-u1: just chatting", body)
+        self.assertIn("u-u2: more chatter", body)
+        self.assertTrue(body.rstrip().endswith("help please"))
+
+    async def test_mention_only_drops_cleared_after_replay(self):
+        """The silent-drop queue is drained on replay — a second mention
+        after a quiet gap should not re-include earlier drops."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "id": "p1", "channel_id": "c1", "message": "earlier",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "p2", "channel_id": "c1", "message": "@claude first",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "p3", "channel_id": "c1", "message": "@claude second",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.vd.sent), 2)
+        self.assertIn("earlier", self.bridge.vd.sent[0][1])
+        self.assertNotIn("earlier", self.bridge.vd.sent[1][1])
+        self.assertNotIn("Catch-up context", self.bridge.vd.sent[1][1])
+
+    async def test_mention_only_drops_capped_by_initial_catch_up_n(self):
+        """If more than ``initial_catch_up_n`` messages pile up, only
+        the most recent N survive."""
+        self.config.initial_catch_up_n = 3
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        for i in range(5):
+            await self.bridge._on_mm_posted({
+                "id": f"d{i}", "channel_id": "c1", "message": f"drop{i}",
+                "user_id": "u1", "type": "",
+            })
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude ping",
+            "user_id": "u1", "type": "",
+        })
+
+        body = self.bridge.vd.sent[0][1]
+        self.assertNotIn("drop0", body)
+        self.assertNotIn("drop1", body)
+        self.assertIn("drop2", body)
+        self.assertIn("drop3", body)
+        self.assertIn("drop4", body)
+
+    async def test_mention_only_drops_disabled_when_catch_up_is_zero(self):
+        """``initial_catch_up_n = 0`` disables auto-replay too — matches
+        the knob that disables initial session catch-up."""
+        self.config.initial_catch_up_n = 0
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "id": "p1", "channel_id": "c1", "message": "silent",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "p2", "channel_id": "c1", "message": "@claude hi",
+            "user_id": "u1", "type": "",
+        })
+
+        body = self.bridge.vd.sent[0][1]
+        self.assertNotIn("silent", body)
+        self.assertNotIn("Catch-up context", body)
+
+    async def test_mention_only_drops_keyed_per_thread(self):
+        """Silent drops in a thread do not leak into the channel root
+        (or vice versa) — each anchor has its own queue."""
+        self.bridge.mapping.link(Anchor("c1"), "s-root")
+        self.bridge.mapping.link(Anchor("c1", "t1"), "s-thread")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "id": "pr1", "channel_id": "c1", "message": "root chatter",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "pt1", "channel_id": "c1", "message": "thread chatter",
+            "user_id": "u1", "type": "", "root_id": "t1",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "pr2", "channel_id": "c1", "message": "@claude root",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "pt2", "channel_id": "c1", "message": "@claude thread",
+            "user_id": "u1", "type": "", "root_id": "t1",
+        })
+
+        by_session = {sid: body for sid, body in self.bridge.vd.sent}
+        self.assertIn("root chatter", by_session["s-root"])
+        self.assertNotIn("thread chatter", by_session["s-root"])
+        self.assertIn("thread chatter", by_session["s-thread"])
+        self.assertNotIn("root chatter", by_session["s-thread"])
 
 
 class InboundAttachmentTests(_BridgeTestCase):
@@ -640,14 +775,21 @@ class InboundAttachmentTests(_BridgeTestCase):
 class CatchUpTests(_BridgeTestCase):
     async def test_catch_up_command_sends_block_to_session(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
+        # One genuine echo this process authored (tracked), and one
+        # "bot echo" coming from another actor sharing the bot identity
+        # (untracked — should appear in the catch-up block).
+        self.bridge.mm.own_post_ids.add("own-1")
         self.bridge.mm.posts_by_channel["c1"] = [
-            {"user_id": "u1", "message": "m1", "type": ""},
-            {"user_id": self.bridge.mm.bot_user_id, "message": "bot echo", "type": ""},
-            {"user_id": "u2", "message": "m2", "type": ""},
+            {"id": "pu1", "user_id": "u1", "message": "m1", "type": ""},
+            {"id": "own-1", "user_id": self.bridge.mm.bot_user_id,
+             "message": "our own echo", "type": ""},
+            {"id": "other-bot-1", "user_id": self.bridge.mm.bot_user_id,
+             "message": "sibling session post", "type": ""},
+            {"id": "pu2", "user_id": "u2", "message": "m2", "type": ""},
         ]
 
         await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "@claude catch up 50",
+            "id": "trigger", "channel_id": "c1", "message": "@claude catch up 50",
             "user_id": "u1", "type": "",
         })
 
@@ -655,7 +797,8 @@ class CatchUpTests(_BridgeTestCase):
         block = self.bridge.vd.sent[0][1]
         self.assertIn("m1", block)
         self.assertIn("m2", block)
-        self.assertNotIn("bot echo", block)
+        self.assertNotIn("our own echo", block)
+        self.assertIn("sibling session post", block)
 
 
 class InitialCatchUpTests(_BridgeTestCase):
