@@ -614,6 +614,58 @@ class ForwardingTests(_BridgeTestCase):
         self.assertNotIn("silent", body)
         self.assertNotIn("Catch-up context", body)
 
+    async def test_mention_only_drops_survive_send_failure(self):
+        """If the VD send fails while replaying silent drops, the queue
+        must not be lost — a subsequent mention should still carry the
+        same context forward."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "id": "drop-1", "channel_id": "c1", "message": "dropped once",
+            "user_id": "u1", "type": "",
+        })
+
+        # First mention: VD raises, queue must be preserved.
+        async def failing_send(session_id, message):
+            raise RuntimeError("simulated VD outage")
+
+        self.bridge.vd.send_message = failing_send  # type: ignore[assignment]
+        await self.bridge._on_mm_posted({
+            "id": "trigger-1", "channel_id": "c1", "message": "@claude first try",
+            "user_id": "u1", "type": "",
+        })
+
+        # Warning posted to channel, but queue still holds the drop.
+        self.assertTrue(any(
+            ":warning:" in p.message for p in self.bridge.mm.posted
+        ))
+        self.assertIn(("c1", None), self.bridge._silent_drops)
+        self.assertEqual(len(self.bridge._silent_drops[("c1", None)]), 1)
+
+        # Second mention: VD back online — the missed drop is replayed,
+        # plus the new trigger. Queue is cleared only on success.
+        captured: list[tuple[str, str]] = []
+
+        async def ok_send(session_id, message):
+            captured.append((session_id, message))
+            return {"status": "sent"}
+
+        self.bridge.vd.send_message = ok_send  # type: ignore[assignment]
+        await self.bridge._on_mm_posted({
+            "id": "trigger-2", "channel_id": "c1", "message": "@claude second try",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(captured), 1)
+        _, body = captured[0]
+        self.assertIn("dropped once", body)
+        self.assertTrue(body.rstrip().endswith("second try"))
+        self.assertNotIn(("c1", None), self.bridge._silent_drops)
+
     async def test_mention_only_drops_keyed_per_thread(self):
         """Silent drops in a thread do not leak into the channel root
         (or vice versa) — each anchor has its own queue."""
@@ -775,21 +827,17 @@ class InboundAttachmentTests(_BridgeTestCase):
 class CatchUpTests(_BridgeTestCase):
     async def test_catch_up_command_sends_block_to_session(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
-        # One genuine echo this process authored (tracked), and one
-        # "bot echo" coming from another actor sharing the bot identity
-        # (untracked — should appear in the catch-up block).
-        self.bridge.mm.own_post_ids.add("own-1")
+        # All bot-identity posts are filtered from history replay —
+        # restart-safe (is_own_post() is empty on a fresh process, so we
+        # can't rely on it for catch-up).
         self.bridge.mm.posts_by_channel["c1"] = [
-            {"id": "pu1", "user_id": "u1", "message": "m1", "type": ""},
-            {"id": "own-1", "user_id": self.bridge.mm.bot_user_id,
-             "message": "our own echo", "type": ""},
-            {"id": "other-bot-1", "user_id": self.bridge.mm.bot_user_id,
-             "message": "sibling session post", "type": ""},
-            {"id": "pu2", "user_id": "u2", "message": "m2", "type": ""},
+            {"user_id": "u1", "message": "m1", "type": ""},
+            {"user_id": self.bridge.mm.bot_user_id, "message": "bot echo", "type": ""},
+            {"user_id": "u2", "message": "m2", "type": ""},
         ]
 
         await self.bridge._on_mm_posted({
-            "id": "trigger", "channel_id": "c1", "message": "@claude catch up 50",
+            "channel_id": "c1", "message": "@claude catch up 50",
             "user_id": "u1", "type": "",
         })
 
@@ -797,8 +845,7 @@ class CatchUpTests(_BridgeTestCase):
         block = self.bridge.vd.sent[0][1]
         self.assertIn("m1", block)
         self.assertIn("m2", block)
-        self.assertNotIn("our own echo", block)
-        self.assertIn("sibling session post", block)
+        self.assertNotIn("bot echo", block)
 
 
 class InitialCatchUpTests(_BridgeTestCase):
