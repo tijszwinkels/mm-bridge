@@ -243,13 +243,14 @@ class MattermostClient:
 
     def download_file(self, file_id: str) -> bytes:
         """Fetch the raw bytes of an uploaded file from Mattermost."""
-        resp = self._driver.files.get_file(file_id)
-        if isinstance(resp, (bytes, bytearray)):
-            return bytes(resp)
-        content = getattr(resp, "content", None)
-        if content is None:
-            raise RuntimeError(f"Unexpected get_file response: {type(resp).__name__}")
-        return content
+        # Bypass self._driver.files.get_file(), which routes through
+        # Client.get() and auto-parses any application/json response into
+        # a dict — corrupting JSON file downloads. make_request() returns
+        # the raw httpx Response regardless of content-type.
+        resp = self._driver.client.make_request(
+            "get", f"/api/v4/files/{file_id}"
+        )
+        return resp.content
 
     def get_max_file_size(self) -> int:
         """Read MaxFileSize from the MM server config; 50MB fallback."""
