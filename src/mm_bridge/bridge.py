@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -259,6 +260,11 @@ class Bridge:
         # the next turn starts a fresh placeholder. The post remains as a
         # compact summary of that turn's tool usage.
         self.tool_use_runs: dict[str, ToolUseRun] = {}
+        # Posts silently dropped in mention-only mode, keyed by
+        # (channel_id, thread_root). Drained on the next forwarded
+        # message in the same anchor and prepended as a catch-up block
+        # so the session sees the preceding conversation it missed.
+        self._silent_drops: dict[tuple[str, str | None], deque[dict]] = {}
 
     # ----- lifecycle -----
 
@@ -1042,7 +1048,10 @@ class Bridge:
         bot_mention = f"@{self.mm.bot_username}"
 
         if cfg and cfg.mention_only and bot_mention not in message:
-            return  # Filtered out: nothing to forward, no warning.
+            # Silently dropped for now; remember it so the next forwarded
+            # message in this anchor can prepend it as catch-up context.
+            self._enqueue_silent_drop(channel_id, thread_root, post)
+            return
 
         # Strip the @-mention so Claude doesn't see a stray handle.
         cleaned = message.replace(bot_mention, "").replace("@claude", "").strip()
@@ -1073,6 +1082,12 @@ class Bridge:
         if attachment_notes:
             notes_block = "\n".join(attachment_notes)
             body = f"{notes_block}\n\n{body}" if body else notes_block
+
+        silent_block = self._drain_silent_drops_as_block(
+            channel_id, thread_root, exclude_post_id=post.get("id"),
+        )
+        if silent_block:
+            body = f"{silent_block}\n\n{body}" if body else silent_block
 
         if first_message:
             preamble = await self._compute_first_message_preamble(channel_id)
@@ -1270,6 +1285,58 @@ class Bridge:
 
     # ─────────────────────── Catch-up & leave ──────────────────────────────
 
+    def _enqueue_silent_drop(
+        self,
+        channel_id: str,
+        thread_root: str | None,
+        post: dict,
+    ) -> None:
+        """Record a mention-only drop so the next forwarded message in
+        this anchor can replay it as catch-up. Capped at
+        ``config.initial_catch_up_n``; ``<= 0`` disables entirely."""
+        cap = self.config.initial_catch_up_n
+        if cap <= 0:
+            return
+        key = (channel_id, thread_root)
+        q = self._silent_drops.get(key)
+        if q is None or q.maxlen != cap:
+            # Rebuild on cap change so runtime config tweaks apply.
+            old = list(q) if q is not None else []
+            q = deque(old[-cap:], maxlen=cap)
+            self._silent_drops[key] = q
+        q.append(post)
+
+    def _drain_silent_drops_as_block(
+        self,
+        channel_id: str,
+        thread_root: str | None,
+        *,
+        exclude_post_id: str | None = None,
+    ) -> str:
+        """Pop the pending silent drops for ``(channel_id, thread_root)``
+        and render them as a catch-up block. Returns an empty string
+        when the queue is empty or every entry got filtered out."""
+        key = (channel_id, thread_root)
+        dropped = self._silent_drops.pop(key, None)
+        if not dropped:
+            return ""
+        lines: list[str] = []
+        for p in dropped:
+            if exclude_post_id and p.get("id") == exclude_post_id:
+                continue
+            if self.mm.is_own_post(p.get("id", "")):
+                continue
+            if _is_mm_system_post(p):
+                continue
+            msg = (p.get("message") or "").strip()
+            if not msg:
+                continue
+            username = self._resolve_username(p.get("user_id", ""))
+            lines.append(f"{username}: {msg}")
+        if not lines:
+            return ""
+        return self._format_catch_up_block(lines)
+
     def _collect_catch_up_lines(
         self,
         channel_id: str,
@@ -1277,9 +1344,12 @@ class Bridge:
         *,
         exclude_post_id: str | None = None,
     ) -> list[str]:
-        """Fetch up to `n` user messages from a channel, oldest-first, as
-        `username: message` lines. Skips bot posts, system posts, and any
-        `@claude catch up` commands themselves.
+        """Fetch up to `n` channel messages, oldest-first, as
+        ``username: message`` lines. Skips our own echoes, system posts,
+        and ``@claude catch up`` commands themselves. Posts from other
+        actors sharing the bot identity (sibling sessions, scripts,
+        humans posting as @claude) are included — the author's username
+        prefix makes the distinction clear to the model.
         """
         try:
             posts = self.mm.get_posts(channel_id, max(n + 2, 1))
@@ -1291,7 +1361,7 @@ class Bridge:
         for p in posts:
             if exclude_post_id and p.get("id") == exclude_post_id:
                 continue
-            if p.get("user_id") == self.mm.bot_user_id:
+            if self.mm.is_own_post(p.get("id", "")):
                 continue
             if _is_mm_system_post(p):
                 continue
