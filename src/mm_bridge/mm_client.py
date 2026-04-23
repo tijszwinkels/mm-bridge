@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import deque
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 _HANDLED_EVENTS = {
     "posted", "user_added", "user_removed", "channel_updated", "channel_created",
 }
+
+# Upper bound on tracked own-post IDs. Only the most-recent IDs are kept;
+# older entries age out of both the deque and the lookup set.
+_OWN_POST_HISTORY_MAX = 1024
 
 
 class MattermostClient:
@@ -46,6 +51,15 @@ class MattermostClient:
         self._team_id: str = ""
         self._bot_user_id: str = ""
         self._bot_username: str = ""
+        # Post IDs this process authored via post()/post_message()/
+        # update_post(), used to suppress the WS echo Mattermost sends
+        # back for our own posts. Without this, the dispatcher would
+        # either see its own posts as user input, or (the old bug) blanket-
+        # filter the shared bot identity and drop legitimate posts from
+        # sibling mm-bridge sessions, other tools using MM_BOT_TOKEN, or
+        # humans posting as @claude.
+        self._own_post_ids: deque[str] = deque(maxlen=_OWN_POST_HISTORY_MAX)
+        self._own_post_id_set: set[str] = set()
 
     # ----- setup -----
 
@@ -70,13 +84,28 @@ class MattermostClient:
     def team_id(self) -> str:
         return self._team_id
 
+    def is_own_post(self, post_id: str) -> bool:
+        """Return True when ``post_id`` was authored by this process."""
+        return bool(post_id) and post_id in self._own_post_id_set
+
+    def _record_own_post(self, post_id: str | None) -> None:
+        if not post_id or post_id in self._own_post_id_set:
+            return
+        if len(self._own_post_ids) == self._own_post_ids.maxlen:
+            evicted = self._own_post_ids[0]
+            self._own_post_id_set.discard(evicted)
+        self._own_post_ids.append(post_id)
+        self._own_post_id_set.add(post_id)
+
     # ----- posts -----
 
     def post_message(self, channel_id: str, message: str) -> dict:
-        return self._driver.posts.create_post(options={
+        resp = self._driver.posts.create_post(options={
             "channel_id": channel_id,
             "message": message,
         })
+        self._record_own_post(resp.get("id") if isinstance(resp, dict) else None)
+        return resp
 
     def post(
         self,
@@ -91,13 +120,19 @@ class MattermostClient:
             options["file_ids"] = file_ids
         if root_id:
             options["root_id"] = root_id
-        return self._driver.posts.create_post(options=options)
+        resp = self._driver.posts.create_post(options=options)
+        self._record_own_post(resp.get("id") if isinstance(resp, dict) else None)
+        return resp
 
     def update_post(self, post_id: str, message: str) -> dict:
-        return self._driver.posts.update_post(post_id, options={
+        resp = self._driver.posts.update_post(post_id, options={
             "id": post_id,
             "message": message,
         })
+        # Re-record in case the post id aged out of the deque between
+        # create and edit — MM will echo the edited post back over WS.
+        self._record_own_post(post_id)
+        return resp
 
     def delete_post(self, post_id: str, *, permanent: bool = False) -> None:
         """Delete a post. `permanent=True` drops the DB row (no soft-delete,
@@ -273,7 +308,11 @@ class MattermostClient:
           - "channel_updated" → fn(channel: dict)
           - "channel_created" → fn(channel_id: str)
 
-        The bot's own `posted` events are filtered before dispatch.
+        `posted` events whose post id matches one this process just
+        authored are filtered before dispatch (the echo suppression).
+        Posts by *other* actors that happen to share the bot identity
+        (sibling mm-bridge sessions, scripts using MM_BOT_TOKEN, humans
+        posting as the bot) still reach the handler.
         """
         ws_scheme = "wss" if self._scheme == "https" else "ws"
         ws_url = f"{ws_scheme}://{self._url}:{self._port}/api/v4/websocket"
@@ -339,7 +378,7 @@ class MattermostClient:
                     post = json.loads(post_json)
                 except json.JSONDecodeError:
                     return
-                if post.get("user_id") == self._bot_user_id:
+                if self.is_own_post(post.get("id") or ""):
                     return
                 await handler(post)
 
