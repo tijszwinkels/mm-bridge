@@ -1083,7 +1083,7 @@ class Bridge:
             notes_block = "\n".join(attachment_notes)
             body = f"{notes_block}\n\n{body}" if body else notes_block
 
-        silent_block = self._drain_silent_drops_as_block(
+        silent_block, silent_key = self._peek_silent_drops_as_block(
             channel_id, thread_root, exclude_post_id=post.get("id"),
         )
         if silent_block:
@@ -1107,6 +1107,10 @@ class Bridge:
                 )
             except Exception:
                 pass
+            # Queue intentionally left intact — a subsequent mention
+            # will replay the same context plus the new trigger.
+        else:
+            self._clear_silent_drops(silent_key)
 
     def _resolve_username(self, user_id: str) -> str:
         try:
@@ -1306,20 +1310,24 @@ class Bridge:
             self._silent_drops[key] = q
         q.append(post)
 
-    def _drain_silent_drops_as_block(
+    def _peek_silent_drops_as_block(
         self,
         channel_id: str,
         thread_root: str | None,
         *,
         exclude_post_id: str | None = None,
-    ) -> str:
-        """Pop the pending silent drops for ``(channel_id, thread_root)``
-        and render them as a catch-up block. Returns an empty string
-        when the queue is empty or every entry got filtered out."""
+    ) -> tuple[str, tuple[str, str | None] | None]:
+        """Render pending silent drops for ``(channel_id, thread_root)``
+        as a catch-up block without mutating the queue. Returns
+        ``(block_text, clear_key)``; callers should only pass
+        ``clear_key`` to :meth:`_clear_silent_drops` after the forwarded
+        message has been successfully delivered to VD, so a transient
+        VD send failure doesn't discard queued conversation.
+        """
         key = (channel_id, thread_root)
-        dropped = self._silent_drops.pop(key, None)
+        dropped = self._silent_drops.get(key)
         if not dropped:
-            return ""
+            return "", None
         lines: list[str] = []
         for p in dropped:
             if exclude_post_id and p.get("id") == exclude_post_id:
@@ -1334,8 +1342,14 @@ class Bridge:
             username = self._resolve_username(p.get("user_id", ""))
             lines.append(f"{username}: {msg}")
         if not lines:
-            return ""
-        return self._format_catch_up_block(lines)
+            return "", None
+        return self._format_catch_up_block(lines), key
+
+    def _clear_silent_drops(
+        self, key: tuple[str, str | None] | None,
+    ) -> None:
+        if key is not None:
+            self._silent_drops.pop(key, None)
 
     def _collect_catch_up_lines(
         self,
@@ -1344,12 +1358,17 @@ class Bridge:
         *,
         exclude_post_id: str | None = None,
     ) -> list[str]:
-        """Fetch up to `n` channel messages, oldest-first, as
-        ``username: message`` lines. Skips our own echoes, system posts,
-        and ``@claude catch up`` commands themselves. Posts from other
-        actors sharing the bot identity (sibling sessions, scripts,
-        humans posting as @claude) are included — the author's username
-        prefix makes the distinction clear to the model.
+        """Fetch up to `n` user messages from a channel, oldest-first, as
+        `username: message` lines. Skips bot posts, system posts, and any
+        `@claude catch up` commands themselves.
+
+        The `user_id == bot_user_id` filter is intentionally blanket: on
+        a restart `is_own_post()` is empty-set, so using it here would
+        let prior replies of this same bridge leak into catch-up context
+        and confuse the model with its own earlier output. Cross-bot
+        posts (sibling sessions, etc.) are already handled live by the
+        dispatcher in `mm_client._dispatch_event`; history replay only
+        needs to surface user-authored messages.
         """
         try:
             posts = self.mm.get_posts(channel_id, max(n + 2, 1))
@@ -1361,7 +1380,7 @@ class Bridge:
         for p in posts:
             if exclude_post_id and p.get("id") == exclude_post_id:
                 continue
-            if self.mm.is_own_post(p.get("id", "")):
+            if p.get("user_id") == self.mm.bot_user_id:
                 continue
             if _is_mm_system_post(p):
                 continue
