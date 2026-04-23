@@ -1376,6 +1376,32 @@ class Bridge:
         if key is not None:
             self._silent_drops.pop(key, None)
 
+    def _drain_silent_drops_matching(
+        self,
+        channel_id: str,
+        thread_root: str | None,
+        ids: set[str],
+    ) -> None:
+        """Remove only queue entries whose post id is in ``ids``.
+
+        Used after an explicit ``@claude catch up`` so that a partial
+        catch-up doesn't throw away queued messages it never surfaced.
+        """
+        if not ids:
+            return
+        key = (channel_id, thread_root)
+        q = self._silent_drops.get(key)
+        if q is None:
+            return
+        kept = [p for p in q if p.get("id", "") not in ids]
+        if not kept:
+            self._silent_drops.pop(key, None)
+            return
+        if len(kept) == len(q):
+            return
+        # Preserve the deque's original maxlen so the cap survives.
+        self._silent_drops[key] = deque(kept, maxlen=q.maxlen)
+
     def _forget_channel_silent_drops(self, channel_id: str) -> None:
         """Drop every queued silent-drop entry for this channel (root
         and any threads). Called on teardown paths so drops from a
@@ -1394,10 +1420,12 @@ class Bridge:
         n: int,
         *,
         exclude_post_id: str | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], set[str]]:
         """Fetch up to `n` user messages from a channel, oldest-first, as
-        `username: message` lines. Skips bot posts, system posts, and any
-        `@claude catch up` commands themselves.
+        `username: message` lines. Returns ``(lines, included_post_ids)``
+        — the id set lets callers scope queue cleanup to only the posts
+        that were actually surfaced. Skips bot posts, system posts, and
+        any `@claude catch up` commands themselves.
 
         The `user_id == bot_user_id` filter is intentionally blanket: on
         a restart `is_own_post()` is empty-set, so using it here would
@@ -1411,9 +1439,10 @@ class Bridge:
             posts = self.mm.get_posts(channel_id, max(n + 2, 1))
         except Exception:
             logger.exception("get_posts failed for catch-up")
-            return []
+            return [], set()
 
         lines: list[str] = []
+        included_ids: set[str] = set()
         for p in posts:
             if exclude_post_id and p.get("id") == exclude_post_id:
                 continue
@@ -1425,9 +1454,12 @@ class Bridge:
                 continue
             username = self._resolve_username(p.get("user_id", ""))
             lines.append(f"{username}: {p.get('message', '')}")
+            pid = p.get("id")
+            if pid:
+                included_ids.add(pid)
             if len(lines) >= n:
                 break
-        return lines
+        return lines, included_ids
 
     @staticmethod
     def _format_catch_up_block(lines: list[str]) -> str:
@@ -1450,7 +1482,7 @@ class Bridge:
         n = self.config.initial_catch_up_n
         if n <= 0:
             return initial_message
-        lines = self._collect_catch_up_lines(
+        lines, _ = self._collect_catch_up_lines(
             channel_id, n, exclude_post_id=exclude_post_id,
         )
         if not lines:
@@ -1472,7 +1504,7 @@ class Bridge:
             n = self.config.catch_up_max_n
             clamped = True
 
-        lines = self._collect_catch_up_lines(channel_id, n)
+        lines, included_ids = self._collect_catch_up_lines(channel_id, n)
         block = self._format_catch_up_block(lines)
 
         try:
@@ -1481,10 +1513,14 @@ class Bridge:
             logger.exception("Failed to send catch-up block")
             return
 
-        # Explicit catch-up already surfaces the missed conversation from
-        # MM history; drop the silent-drop queue so the next mention
-        # doesn't prepend the same messages a second time.
-        self._clear_silent_drops((channel_id, thread_root))
+        # Explicit catch-up already surfaced these messages from MM
+        # history; drop only the queue entries that were actually
+        # replayed. A smaller catch-up (e.g. `catch up 1`) or one
+        # outside the queue's window must leave the rest intact so the
+        # next mention still sees the missed conversation.
+        self._drain_silent_drops_matching(
+            channel_id, thread_root, included_ids,
+        )
 
         note = (
             f":arrows_counterclockwise: Sent the last {len(lines)} messages as context."

@@ -378,6 +378,14 @@ class MattermostClient:
                     post = json.loads(post_json)
                 except json.JSONDecodeError:
                     return
+                # Race-safety: id tracking only works because our REST
+                # post calls (`post`, `post_message`, `update_post`) are
+                # synchronous and block this event loop — the id is
+                # recorded before control returns to the WS read loop,
+                # so the subsequent echo frame always sees it. If those
+                # calls are ever wrapped in `asyncio.to_thread` or made
+                # natively async, add a content-hash fallback (recent
+                # channel_id + message hash window) to close the race.
                 if self.is_own_post(post.get("id") or ""):
                     return
                 await handler(post)
