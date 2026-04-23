@@ -583,6 +583,7 @@ class Bridge:
         session_id = self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
         self.pending_mm_sessions.pop(channel_id, None)
+        self._forget_channel_silent_drops(channel_id)
         if session_id:
             self._end_tool_use_run(session_id)
             self.posters.forget(session_id)
@@ -883,6 +884,7 @@ class Bridge:
         self.mapping.unlink(Anchor(channel_id))
         self._end_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
+        self._forget_channel_silent_drops(channel_id)
         if self.typing:
             await self.typing.stop(old_session_id)
         effective_cwd = self._resolve_purpose_cwd(cfg)
@@ -1083,8 +1085,8 @@ class Bridge:
             notes_block = "\n".join(attachment_notes)
             body = f"{notes_block}\n\n{body}" if body else notes_block
 
-        silent_block, silent_key = self._peek_silent_drops_as_block(
-            channel_id, thread_root, exclude_post_id=post.get("id"),
+        silent_block, silent_key = await self._peek_silent_drops_as_block(
+            channel_id, thread_root, session_id, exclude_post_id=post.get("id"),
         )
         if silent_block:
             body = f"{silent_block}\n\n{body}" if body else silent_block
@@ -1310,16 +1312,19 @@ class Bridge:
             self._silent_drops[key] = q
         q.append(post)
 
-    def _peek_silent_drops_as_block(
+    async def _peek_silent_drops_as_block(
         self,
         channel_id: str,
         thread_root: str | None,
+        session_id: str,
         *,
         exclude_post_id: str | None = None,
     ) -> tuple[str, tuple[str, str | None] | None]:
         """Render pending silent drops for ``(channel_id, thread_root)``
-        as a catch-up block without mutating the queue. Returns
-        ``(block_text, clear_key)``; callers should only pass
+        as a catch-up block without mutating the queue. Downloads any
+        attachments on queued posts into the session cwd so the replay
+        carries the file the user uploaded before mentioning the bot.
+        Returns ``(block_text, clear_key)``; callers should only pass
         ``clear_key`` to :meth:`_clear_silent_drops` after the forwarded
         message has been successfully delivered to VD, so a transient
         VD send failure doesn't discard queued conversation.
@@ -1328,6 +1333,16 @@ class Bridge:
         dropped = self._silent_drops.get(key)
         if not dropped:
             return "", None
+        cwd: str | None = None
+        if any(p.get("file_ids") for p in dropped):
+            try:
+                cwd = await self._project_path_for(session_id)
+            except Exception:
+                logger.exception(
+                    "project-path lookup failed while replaying drops for %s",
+                    session_id[:8],
+                )
+                cwd = None
         lines: list[str] = []
         for p in dropped:
             if exclude_post_id and p.get("id") == exclude_post_id:
@@ -1337,10 +1352,17 @@ class Bridge:
             if _is_mm_system_post(p):
                 continue
             msg = (p.get("message") or "").strip()
-            if not msg:
+            note_lines: list[str] = []
+            if p.get("file_ids"):
+                if cwd:
+                    note_lines = await self._save_mm_attachments(p, cwd)
+                else:
+                    note_lines = ["[MM attachment skipped: no project path for session]"]
+            if not msg and not note_lines:
                 continue
             username = self._resolve_username(p.get("user_id", ""))
-            lines.append(f"{username}: {msg}")
+            rendered = "\n".join([*note_lines, msg] if msg else note_lines)
+            lines.append(f"{username}: {rendered}")
         if not lines:
             return "", None
         return self._format_catch_up_block(lines), key
@@ -1350,6 +1372,18 @@ class Bridge:
     ) -> None:
         if key is not None:
             self._silent_drops.pop(key, None)
+
+    def _forget_channel_silent_drops(self, channel_id: str) -> None:
+        """Drop every queued silent-drop entry for this channel (root
+        and any threads). Called on teardown paths so drops from a
+        previous session don't leak into the next one mapped here."""
+        for key in [k for k in self._silent_drops if k[0] == channel_id]:
+            self._silent_drops.pop(key, None)
+
+    def _forget_thread_silent_drops(
+        self, channel_id: str, thread_root: str,
+    ) -> None:
+        self._silent_drops.pop((channel_id, thread_root), None)
 
     def _collect_catch_up_lines(
         self,
@@ -1464,6 +1498,7 @@ class Bridge:
         if thread_root:
             removed = self.mapping.unlink(Anchor(channel_id, thread_root))
             self.dead_threads.add((channel_id, thread_root))
+            self._forget_thread_silent_drops(channel_id, thread_root)
             if removed:
                 self._end_tool_use_run(removed)
                 self.posters.forget(removed)
@@ -1540,6 +1575,7 @@ class Bridge:
             return
         self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
+        self._forget_channel_silent_drops(channel_id)
         self._end_tool_use_run(session_id)
         self.posters.forget(session_id)
         if self.typing:
@@ -1796,6 +1832,7 @@ class Bridge:
                 except Exception:
                     pass
                 self.mapping.unlink(Anchor(channel_id, thread_root))
+                self._forget_thread_silent_drops(channel_id, thread_root)
                 self.posters.forget(session_id)
                 if self.typing:
                     await self.typing.stop(session_id)
