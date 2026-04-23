@@ -614,10 +614,48 @@ class ForwardingTests(_BridgeTestCase):
         self.assertNotIn("silent", body)
         self.assertNotIn("Catch-up context", body)
 
+    async def test_explicit_catch_up_drains_silent_drop_queue(self):
+        """`@claude catch up` already surfaces the missed conversation
+        from MM history; the silent-drop queue must be cleared so the
+        next mentioned message doesn't prepend the same context twice."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"user_id": "u1", "message": "ambient chatter", "type": ""},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "id": "d1", "channel_id": "c1", "message": "ambient chatter",
+            "user_id": "u1", "type": "",
+        })
+        self.assertIn(("c1", None), self.bridge._silent_drops)
+
+        await self.bridge._on_mm_posted({
+            "id": "cu", "channel_id": "c1", "message": "@claude catch up",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertNotIn(("c1", None), self.bridge._silent_drops)
+
+        # Next mention must not prepend another catch-up block —
+        # history has already been delivered by the catch-up command.
+        await self.bridge._on_mm_posted({
+            "id": "next", "channel_id": "c1", "message": "@claude what next",
+            "user_id": "u1", "type": "",
+        })
+
+        last_body = self.bridge.vd.sent[-1][1]
+        self.assertNotIn("Catch-up context", last_body)
+        self.assertNotIn("ambient chatter", last_body)
+
     async def test_mention_only_drops_survive_send_failure(self):
         """If the VD send fails while replaying silent drops, the queue
-        must not be lost — a subsequent mention should still carry the
-        same context forward."""
+        must not be lost AND the failed trigger itself is re-queued —
+        otherwise a transient outage would eat the user's actual
+        request."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
         from mm_bridge.purpose import PurposeConfig
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
@@ -629,7 +667,8 @@ class ForwardingTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        # First mention: VD raises, queue must be preserved.
+        # First mention: VD raises. Queue must preserve the old drop
+        # and also enqueue the failed trigger.
         async def failing_send(session_id, message):
             raise RuntimeError("simulated VD outage")
 
@@ -639,15 +678,15 @@ class ForwardingTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        # Warning posted to channel, but queue still holds the drop.
         self.assertTrue(any(
             ":warning:" in p.message for p in self.bridge.mm.posted
         ))
         self.assertIn(("c1", None), self.bridge._silent_drops)
-        self.assertEqual(len(self.bridge._silent_drops[("c1", None)]), 1)
+        self.assertEqual(len(self.bridge._silent_drops[("c1", None)]), 2)
 
-        # Second mention: VD back online — the missed drop is replayed,
-        # plus the new trigger. Queue is cleared only on success.
+        # Second mention: VD back online. Catch-up block carries BOTH
+        # the original drop and the failed trigger; queue clears only
+        # after a successful send.
         captured: list[tuple[str, str]] = []
 
         async def ok_send(session_id, message):
@@ -663,6 +702,7 @@ class ForwardingTests(_BridgeTestCase):
         self.assertEqual(len(captured), 1)
         _, body = captured[0]
         self.assertIn("dropped once", body)
+        self.assertIn("first try", body)
         self.assertTrue(body.rstrip().endswith("second try"))
         self.assertNotIn(("c1", None), self.bridge._silent_drops)
 
