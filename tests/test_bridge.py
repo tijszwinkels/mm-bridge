@@ -666,6 +666,116 @@ class ForwardingTests(_BridgeTestCase):
         self.assertTrue(body.rstrip().endswith("second try"))
         self.assertNotIn(("c1", None), self.bridge._silent_drops)
 
+    async def test_mention_only_drops_cleared_on_user_removed(self):
+        """Silent drops accumulated under the old session must not leak
+        into the next session that takes over the same channel — clear
+        on ``user_removed`` (the bot being kicked out / leaving)."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "id": "d1", "channel_id": "c1", "message": "stale",
+            "user_id": "u1", "type": "",
+        })
+        self.assertIn(("c1", None), self.bridge._silent_drops)
+
+        await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
+
+        self.assertNotIn(("c1", None), self.bridge._silent_drops)
+
+    async def test_mention_only_drops_cleared_on_leave(self):
+        """``@claude leave`` clears any queued drops in that channel."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "id": "d1", "channel_id": "c1", "message": "stale",
+            "user_id": "u1", "type": "",
+        })
+        self.assertIn(("c1", None), self.bridge._silent_drops)
+
+        await self.bridge._on_mm_posted({
+            "id": "d2", "channel_id": "c1", "message": "@claude leave done",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertNotIn(("c1", None), self.bridge._silent_drops)
+
+    async def test_mention_only_drops_thread_cleared_on_thread_leave(self):
+        """Leaving a thread clears that thread's queue without touching
+        the channel-root queue."""
+        self.bridge.mapping.link(Anchor("c1"), "s-root")
+        self.bridge.mapping.link(Anchor("c1", "t1"), "s-thread")
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+
+        await self.bridge._on_mm_posted({
+            "id": "dr", "channel_id": "c1", "message": "root chatter",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "dt", "channel_id": "c1", "message": "thread chatter",
+            "user_id": "u1", "type": "", "root_id": "t1",
+        })
+
+        await self.bridge._on_mm_posted({
+            "id": "lv", "channel_id": "c1", "message": "@claude leave",
+            "user_id": "u1", "type": "", "root_id": "t1",
+        })
+
+        self.assertNotIn(("c1", "t1"), self.bridge._silent_drops)
+        self.assertIn(("c1", None), self.bridge._silent_drops)
+
+    async def test_mention_only_replay_downloads_queued_attachments(self):
+        """File uploads silently dropped before a mention must be
+        downloaded on replay so the session sees the file it's being
+        asked about, not just the message text."""
+        from pathlib import Path
+
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.vd.sessions_meta.append(
+            {"id": "s1", "projectPath": self.tmp.name, "backend": "claude"},
+        )
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+        self.bridge.mm.files_by_id["fid-silent"] = b"# uploaded before mention\n"
+
+        # Drop: file upload with no @claude mention.
+        await self.bridge._on_mm_posted({
+            "id": "drop-1", "channel_id": "c1", "message": "",
+            "user_id": "u1", "type": "",
+            "file_ids": ["fid-silent"],
+            "metadata": {"files": [{"id": "fid-silent", "name": "silent.md",
+                                     "size": 25}]},
+        })
+        self.assertIn(("c1", None), self.bridge._silent_drops)
+
+        # Mention triggers replay — attachment should be saved and
+        # the catch-up block should reference the saved path.
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude please look",
+            "user_id": "u1", "type": "",
+        })
+
+        saved = Path(self.tmp.name) / ".mattermost-inbox" / "silent.md"
+        self.assertTrue(saved.exists())
+        self.assertEqual(saved.read_bytes(), b"# uploaded before mention\n")
+
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        body = self.bridge.vd.sent[0][1]
+        self.assertIn("Catch-up context", body)
+        self.assertIn(f"[User attached file: {saved}]", body)
+
     async def test_mention_only_drops_keyed_per_thread(self):
         """Silent drops in a thread do not leak into the channel root
         (or vice versa) — each anchor has its own queue."""
