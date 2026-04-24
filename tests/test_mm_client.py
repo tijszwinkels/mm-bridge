@@ -35,6 +35,8 @@ class FakePostsApi:
     returns the id callers hand back via ``next_id``."""
     created: list[dict] = field(default_factory=list)
     updated: list[tuple[str, dict]] = field(default_factory=list)
+    channel_responses: list[dict] = field(default_factory=list)
+    channel_calls: list[tuple[str, dict]] = field(default_factory=list)
     next_id: str = "new-id"
 
     def create_post(self, options):
@@ -44,6 +46,13 @@ class FakePostsApi:
     def update_post(self, post_id, options):
         self.updated.append((post_id, options))
         return {"id": post_id, **options}
+
+    def get_posts_for_channel(self, channel_id, params=None):
+        self.channel_calls.append((channel_id, params or {}))
+        idx = len(self.channel_calls) - 1
+        if idx >= len(self.channel_responses):
+            raise AssertionError("get_posts_since did not stop after repeated page")
+        return self.channel_responses[idx]
 
 
 @dataclass
@@ -91,6 +100,25 @@ def test_download_file_returns_raw_bytes_for_binary_attachment():
     client = _make_client_with_driver(driver)
 
     assert client.download_file("pdf99") == pdf_bytes
+
+
+def test_get_posts_since_breaks_when_pagination_repeats_page():
+    """Regression: repeated full pages must not loop forever."""
+    page = {
+        "order": ["p1", "p2"],
+        "posts": {
+            "p1": {"id": "p1", "create_at": 100},
+            "p2": {"id": "p2", "create_at": 200},
+        },
+    }
+    driver = FakeDriver()
+    driver.posts.channel_responses = [page, page]
+    client = _make_client_with_driver(driver)
+
+    posts = client.get_posts_since("c1", 123, per_page=2)
+
+    assert [p["id"] for p in posts] == ["p1", "p2"]
+    assert [params["page"] for _, params in driver.posts.channel_calls] == [0, 1]
 
 
 # ───────────────────── Own-post tracking ──────────────────────────────────

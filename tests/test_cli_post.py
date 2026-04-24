@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import unittest
 from dataclasses import dataclass, field
@@ -219,6 +220,26 @@ class PostCommandTests(unittest.TestCase):
         self.assertEqual(len(mm.uploaded), 1)
         self.assertEqual(mm.uploaded[0][0], "c1")
         self.assertEqual(mm.posted[0]["file_ids"], ["f-1"])
+
+    def test_relative_file_resolves_from_current_working_directory(self) -> None:
+        f = Path(self.tmp.name) / "relative.txt"
+        f.write_text("x")
+        mm = FakeMM()
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp.name)
+            rc, _, _ = self._invoke(
+                mm,
+                ["mm-bridge", "post", "--channel", "c1",
+                 "--file", "relative.txt", "hi"],
+                session_id=None,
+            )
+        finally:
+            os.chdir(old_cwd)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.uploaded), 1)
+        self.assertEqual(Path(mm.uploaded[0][1]), f)
 
     def test_more_than_10_files_exits_2_without_upload(self) -> None:
         f = Path(self.tmp.name) / "a.txt"

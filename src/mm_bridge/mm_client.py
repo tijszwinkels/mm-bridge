@@ -184,11 +184,15 @@ class MattermostClient:
             resp_posts = resp.get("posts", {})
             if not resp_order:
                 break
+            added = 0
             for pid in resp_order:
                 if pid in collected:
                     continue
                 collected[pid] = resp_posts[pid]
                 order.append(pid)
+                added += 1
+            if added == 0:
+                break
             if len(resp_order) < per_page:
                 break
             page += 1

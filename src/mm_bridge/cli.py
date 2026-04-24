@@ -372,8 +372,10 @@ def _validate_attachments(
         )
     resolved: list[Path] = []
     for raw in paths:
+        raw_path = Path(raw)
+        candidate = raw_path if raw_path.is_absolute() else Path.cwd() / raw_path
         path = resolve_attachment_path(
-            raw, project_path=None, allowed_roots=allowed_roots,
+            str(candidate), project_path=None, allowed_roots=allowed_roots,
         )
         if path is None:
             return (
