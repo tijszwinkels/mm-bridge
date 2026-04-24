@@ -13,8 +13,16 @@ If `~/.mm-bridge/sessions/$CLAUDE_SESSION_ID` exists, you're running inside a Ma
 
   ```sh
   mm-bridge read --channel <id> --since 1d --no-bot --format text | \
-    claude -p --no-session-persistence \
+    claude -p --model haiku --no-session-persistence \
       "Summarize this Mattermost channel transcript in 3-5 bullets, focusing on decisions, questions, and action items."
   ```
 
-  `-p` (alias for `--print`) runs a one-shot, non-interactive completion. `--no-session-persistence` skips writing the conversation to `~/.claude/projects/.../<id>.jsonl` — only valid with `-p`. `--no-bot` on the `read` side strips Claude's own prior replies so it doesn't re-read itself as context. Tune the prompt per use case; add `--model claude-haiku-4-5-20251001` for cheap summaries.
+  Codex equivalent:
+
+  ```sh
+  mm-bridge read --channel <id> --since 1d --no-bot --format text | \
+    codex exec --model gpt-5.4-mini --ephemeral --sandbox read-only \
+      "Summarize this Mattermost channel transcript in 3-5 bullets, focusing on decisions, questions, and action items."
+  ```
+
+  `claude -p` (alias for `--print`) runs a one-shot, non-interactive completion. `--model haiku` keeps summaries cheap. `--no-session-persistence` skips writing the conversation to `~/.claude/projects/.../<id>.jsonl` — only valid with `-p`. For Codex, `exec` runs non-interactively; when stdin is piped and a prompt is provided, the transcript is appended as a `<stdin>` block, `--ephemeral` avoids persisting session files, and `--model gpt-5.4-mini` keeps the run lightweight. `--no-bot` on the `read` side strips Claude's own prior replies so it doesn't re-read itself as context. Tune the prompt per use case.
