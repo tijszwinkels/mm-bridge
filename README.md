@@ -2,7 +2,7 @@
 
 Mattermost ↔ [VibeDeck](https://github.com/tijszwinkels/VibeDeck) bridge — one channel (or thread) per Claude / Codex session.
 
-A daemon connects a Mattermost bot account to a local VibeDeck instance and maps conversations to sessions:
+A daemon connects a Mattermost bot account (conventionally `@claude`) to a local VibeDeck instance and maps conversations to sessions:
 
 - **A channel** the bot is invited to → one VibeDeck session. Messages in the channel become user turns; assistant replies stream back as posts.
 - **A thread** inside a channel → its own *forked* session, so side-quests don't pollute the main conversation.
