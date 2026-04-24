@@ -138,6 +138,24 @@ class ChannelsCommandTests(unittest.TestCase):
         self.assertIn("[session]", rows["c1"])
         self.assertNotIn("[session]", rows["c2"])
 
+    def test_channels_does_not_reconcile_or_delete_sidecars(self) -> None:
+        from mm_bridge import sidecar
+
+        sidecar_dir = Path(self.cfg.sidecar_dir)
+        sidecar.write(sidecar_dir, "live-session", "live-channel")
+        self.assertIsNotNone(sidecar.read(sidecar_dir, "live-session"))
+
+        mm = FakeMM(_channels=[
+            _mk("c1", display_name="listed", last_post_at=100),
+        ])
+        rc, _, _ = self._invoke(mm, ["mm-bridge", "channels"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            sidecar.read(sidecar_dir, "live-session"),
+            ("live-channel", None),
+        )
+
     def test_purpose_badge_truncated_and_sanitised(self) -> None:
         long_purpose = "x" * 80 + "\tembedded\tnewline\n"
         mm = FakeMM(_channels=[

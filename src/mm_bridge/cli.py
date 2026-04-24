@@ -293,7 +293,11 @@ def cmd_channels(args: argparse.Namespace) -> int:
     )
 
     try:
-        mapping = ChannelMapping.load(cfg.state_file, sidecar_dir=cfg.sidecar_dir)
+        mapping = ChannelMapping.load(
+            cfg.state_file,
+            sidecar_dir=cfg.sidecar_dir,
+            reconcile_sidecars=False,
+        )
         channel_to_session = {
             a.channel_id: sid
             for a, sid in mapping.anchor_to_session.items()

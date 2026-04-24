@@ -280,6 +280,8 @@ class ChannelMapping:
         cls,
         path: str,
         sidecar_dir: Path | str | None = None,
+        *,
+        reconcile_sidecars: bool = True,
     ) -> "ChannelMapping":
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -288,10 +290,14 @@ class ChannelMapping:
         if p.exists():
             data = json.loads(p.read_text())
             m._ingest(data)
-        sidecar.reconcile(
-            sd,
-            {sid: (a.channel_id, a.root_id) for sid, a in m.session_to_anchor.items()},
-        )
+        if reconcile_sidecars:
+            sidecar.reconcile(
+                sd,
+                {
+                    sid: (a.channel_id, a.root_id)
+                    for sid, a in m.session_to_anchor.items()
+                },
+            )
         return m
 
     def _ingest(self, data: dict) -> None:
