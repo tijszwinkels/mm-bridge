@@ -2072,5 +2072,102 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         )
 
 
+class MentionUserWhenDoneTests(_BridgeTestCase):
+    """`mention_user_when_done` — post `@<username>` in the session's anchor
+    when the VD run ends, targeted at the user whose MM post triggered it."""
+
+    async def _trigger_run(self, channel_id: str, user_id: str, session_id: str) -> None:
+        self.bridge.mapping.link(Anchor(channel_id), session_id)
+        await self.bridge._on_mm_posted({
+            "channel_id": channel_id, "message": "do a thing",
+            "user_id": user_id, "type": "",
+        })
+
+    async def test_posts_mention_to_channel_on_run_end(self) -> None:
+        await self._trigger_run("c1", "u1", "s1")
+
+        await self.bridge._on_vd_session_status({
+            "session_id": "s1", "running": False,
+        })
+
+        mentions = [p for p in self.bridge.mm.posted if p.message.startswith("@")]
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(mentions[0].channel_id, "c1")
+        self.assertEqual(mentions[0].message, "@u-u1")
+        self.assertIsNone(mentions[0].root_id)
+
+    async def test_posts_mention_into_thread_when_anchor_is_thread(self) -> None:
+        self.bridge.mapping.link(Anchor("c1", "root-post"), "s-thread")
+        # Feed a forwarded user post directly via the low-level path, since
+        # `_on_mm_posted` has its own thread dispatch logic.
+        await self.bridge._forward_user_post(
+            "c1", "s-thread",
+            {"user_id": "u2", "message": "hi", "type": ""},
+            "hi", "root-post", first_message=False,
+        )
+
+        await self.bridge._on_vd_session_status({
+            "session_id": "s-thread", "running": False,
+        })
+
+        mentions = [p for p in self.bridge.mm.posted if p.message.startswith("@")]
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(mentions[0].root_id, "root-post")
+        self.assertEqual(mentions[0].message, "@u-u2")
+
+    async def test_no_mention_when_no_triggerer_tracked(self) -> None:
+        # Session exists but no user post was forwarded (e.g. autorespond loop).
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_vd_session_status({
+            "session_id": "s1", "running": False,
+        })
+
+        self.assertFalse(any(p.message.startswith("@") for p in self.bridge.mm.posted))
+
+    async def test_triggerer_consumed_on_use(self) -> None:
+        await self._trigger_run("c1", "u1", "s1")
+
+        # First completion event pings.
+        await self.bridge._on_vd_session_status({
+            "session_id": "s1", "running": False,
+        })
+        # A second running=false (e.g. spurious duplicate) must NOT re-ping.
+        await self.bridge._on_vd_session_status({
+            "session_id": "s1", "running": False,
+        })
+
+        mentions = [p for p in self.bridge.mm.posted if p.message.startswith("@")]
+        self.assertEqual(len(mentions), 1)
+
+    async def test_disabled_by_config(self) -> None:
+        self.bridge.config.mention_user_when_done = False
+        await self._trigger_run("c1", "u1", "s1")
+
+        await self.bridge._on_vd_session_status({
+            "session_id": "s1", "running": False,
+        })
+
+        self.assertFalse(any(p.message.startswith("@") for p in self.bridge.mm.posted))
+
+    async def test_second_run_pings_most_recent_triggerer(self) -> None:
+        # Alice triggers → run ends → ping @alice. Then Bob triggers → run
+        # ends → ping @bob, not @alice.
+        await self._trigger_run("c1", "u-alice", "s1")
+        await self.bridge._on_vd_session_status({
+            "session_id": "s1", "running": False,
+        })
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "my turn",
+            "user_id": "u-bob", "type": "",
+        })
+        await self.bridge._on_vd_session_status({
+            "session_id": "s1", "running": False,
+        })
+
+        mentions = [p.message for p in self.bridge.mm.posted if p.message.startswith("@")]
+        self.assertEqual(mentions, ["@u-u-al", "@u-u-bo"])
+
+
 if __name__ == "__main__":
     unittest.main()

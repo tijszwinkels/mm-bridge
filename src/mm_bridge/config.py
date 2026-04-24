@@ -54,6 +54,12 @@ class Config:
     # Disable to keep channels to only real assistant replies.
     show_tool_use: bool = True
 
+    # When a run finishes, post a standalone ``@<username>`` in the same
+    # channel/thread to notify the user whose message triggered it.
+    # No-op if the run had no tracked triggerer (e.g. autorespond loops
+    # or queued messages flushed at session start).
+    mention_user_when_done: bool = True
+
     # Auto-join all public channels (silent presence — sessions start on
     # first engagement, not on join).
     auto_join_public_channels: bool = False
@@ -141,6 +147,7 @@ class Config:
             "default_cwd",
             "default_autorespond",
             "show_tool_use",
+            "mention_user_when_done",
             "auto_join_public_channels",
             "auto_join_reconcile_seconds",
             "state_file",
@@ -201,6 +208,10 @@ class Config:
             )
         if "MM_SHOW_TOOL_USE" in env:
             self.show_tool_use = env["MM_SHOW_TOOL_USE"].lower() in (
+                "1", "true", "yes", "on",
+            )
+        if "MM_MENTION_USER_WHEN_DONE" in env:
+            self.mention_user_when_done = env["MM_MENTION_USER_WHEN_DONE"].lower() in (
                 "1", "true", "yes", "on",
             )
         if "MM_AUTO_JOIN" in env:

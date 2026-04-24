@@ -265,6 +265,11 @@ class Bridge:
         # message in the same anchor and prepended as a catch-up block
         # so the session sees the preceding conversation it missed.
         self._silent_drops: dict[tuple[str, str | None], deque[dict]] = {}
+        # user_id of the most recent MM post forwarded into each session.
+        # Read by `_mention_triggerer_on_done` to @-mention that user when
+        # the run ends. Cleared on use, so a single completion event only
+        # pings once, and on session teardown (see `*_forget_session`).
+        self._session_triggerer: dict[str, str] = {}
 
     # ----- lifecycle -----
 
@@ -587,6 +592,7 @@ class Bridge:
         if session_id:
             self._end_tool_use_run(session_id)
             self.posters.forget(session_id)
+            self._session_triggerer.pop(session_id, None)
             if self.typing:
                 await self.typing.stop(session_id)
         logger.info("Bot removed from channel %s (session %s unlinked)",
@@ -885,6 +891,7 @@ class Bridge:
         self._end_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
         self._forget_channel_silent_drops(channel_id)
+        self._session_triggerer.pop(old_session_id, None)
         if self.typing:
             await self.typing.stop(old_session_id)
         effective_cwd = self._resolve_purpose_cwd(cfg)
@@ -1076,6 +1083,8 @@ class Bridge:
 
         user_id = post.get("user_id", "")
         attribute = self.posters.note_post(session_id, user_id)
+        if user_id:
+            self._session_triggerer[session_id] = user_id
         if attribute and cleaned:
             username = self._resolve_username(user_id)
             cleaned = self.posters.format(cleaned, username, True)
@@ -1546,6 +1555,7 @@ class Bridge:
             if removed:
                 self._end_tool_use_run(removed)
                 self.posters.forget(removed)
+                self._session_triggerer.pop(removed, None)
                 if self.typing:
                     await self.typing.stop(removed)
             farewell = (
@@ -1622,6 +1632,7 @@ class Bridge:
         self._forget_channel_silent_drops(channel_id)
         self._end_tool_use_run(session_id)
         self.posters.forget(session_id)
+        self._session_triggerer.pop(session_id, None)
         if self.typing:
             await self.typing.stop(session_id)
 
@@ -1878,6 +1889,7 @@ class Bridge:
                 self.mapping.unlink(Anchor(channel_id, thread_root))
                 self._forget_thread_silent_drops(channel_id, thread_root)
                 self.posters.forget(session_id)
+                self._session_triggerer.pop(session_id, None)
                 if self.typing:
                     await self.typing.stop(session_id)
             else:
@@ -2091,6 +2103,7 @@ class Bridge:
             self._end_tool_use_run(session_id)
             if self.typing:
                 await self.typing.stop(session_id)
+            self._mention_triggerer_on_done(session_id)
             return
 
         if not self.typing:
@@ -2099,3 +2112,30 @@ class Bridge:
         if not anchor:
             return
         await self.typing.start(session_id, anchor.channel_id, anchor.root_id)
+
+    def _mention_triggerer_on_done(self, session_id: str) -> None:
+        """Post ``@<username>`` in the session's channel/thread so the user
+        whose MM message triggered this run gets a push notification. No-op
+        when the feature is disabled, no triggerer was tracked, or the
+        anchor can't be resolved. The triggerer is consumed on use so a
+        single run completion only pings once."""
+        if not self.config.mention_user_when_done:
+            return
+        user_id = self._session_triggerer.pop(session_id, None)
+        if not user_id:
+            return
+        anchor = self.mapping.get_anchor(session_id)
+        if not anchor:
+            return
+        username = self._resolve_username(user_id)
+        try:
+            self.mm.post(
+                anchor.channel_id,
+                f"@{username}",
+                root_id=anchor.root_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to @-mention %s on session %s completion",
+                username, session_id[:8], exc_info=True,
+            )
