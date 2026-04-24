@@ -159,6 +159,60 @@ class MattermostClient:
     def get_post(self, post_id: str) -> dict:
         return self._driver.posts.get_post(post_id)
 
+    def get_posts_since(
+        self, channel_id: str, since_ms: int, per_page: int = 200,
+    ) -> list[dict]:
+        """Posts in `channel_id` created after `since_ms`, oldest first.
+
+        Mattermost's `since` endpoint returns all posts since the given
+        epoch in a single page when the window is small; we still loop
+        with `?page` as a defensive measure and cap at a hard safety
+        ceiling so a misuse doesn't pull the whole channel.
+        """
+        safety_cap = 2000
+        collected: dict[str, dict] = {}
+        order: list[str] = []
+        page = 0
+        while len(collected) < safety_cap:
+            resp = self._driver.posts.get_posts_for_channel(
+                channel_id,
+                params={
+                    "since": since_ms, "per_page": per_page, "page": page,
+                },
+            )
+            resp_order = resp.get("order", [])
+            resp_posts = resp.get("posts", {})
+            if not resp_order:
+                break
+            added = 0
+            for pid in resp_order:
+                if pid in collected:
+                    continue
+                collected[pid] = resp_posts[pid]
+                order.append(pid)
+                added += 1
+            if added == 0:
+                break
+            if len(resp_order) < per_page:
+                break
+            page += 1
+        posts = [collected[pid] for pid in order if pid in collected]
+        posts.sort(key=lambda p: p.get("create_at", 0))
+        return posts
+
+    def get_thread_posts(self, root_id: str) -> list[dict]:
+        """All posts in the thread rooted at `root_id`, oldest first."""
+        resp = self._driver.posts.get_post_thread(root_id)
+        posts = resp.get("posts", {})
+        order = resp.get("order", []) or list(posts.keys())
+        ordered = [posts[pid] for pid in order if pid in posts]
+        ordered.sort(key=lambda p: p.get("create_at", 0))
+        return ordered
+
+    def get_file_info(self, file_id: str) -> dict:
+        """Return the metadata record for a single uploaded file."""
+        return self._driver.files.get_file_info(file_id)
+
     # ----- channels -----
 
     def create_channel(
@@ -196,10 +250,14 @@ class MattermostClient:
 
     def get_bot_channel_ids(self) -> set[str]:
         """Return the set of channel IDs the bot currently belongs to in its team."""
-        channels = self._driver.channels.get_channels_for_team_for_user(
+        channels = self.list_bot_channels()
+        return {c["id"] for c in channels}
+
+    def list_bot_channels(self) -> list[dict]:
+        """Return the full channel records for the bot's team memberships."""
+        return self._driver.channels.get_channels_for_team_for_user(
             self._bot_user_id, self._team_id,
         )
-        return {c["id"] for c in channels}
 
     def list_public_team_channels(self) -> list[dict]:
         """List all public channels in the bot's team."""

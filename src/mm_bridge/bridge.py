@@ -176,7 +176,7 @@ def _unique_inbox_path(dest_dir: Path, filename: str) -> Path:
     raise RuntimeError(f"too many filename conflicts in {dest_dir}")
 
 
-def _resolve_attachment_path(
+def resolve_attachment_path(
     raw_path: str,
     project_path: str | None,
     allowed_roots: list[str],
@@ -775,12 +775,12 @@ class Bridge:
         otherwise we append a warning to `cfg.warnings` so the channel learns
         the override was rejected, and fall back to `config.default_cwd`.
         With no allowed roots configured we trust the caller (same as
-        `_resolve_attachment_path`).
+        `resolve_attachment_path`).
         """
         if not cfg.cwd:
             return self.config.default_cwd
         roots = self.config.allowed_attachment_roots
-        resolved = _resolve_attachment_path(cfg.cwd, project_path=None, allowed_roots=roots)
+        resolved = resolve_attachment_path(cfg.cwd, project_path=None, allowed_roots=roots)
         if resolved is None:
             cfg.warnings.append(
                 f"Channel Purpose `cwd={cfg.cwd}` is not inside any allowed_attachment_root "
@@ -1908,7 +1908,7 @@ class Bridge:
                 raw_path = d.attrs.get("path", "")
                 if not raw_path:
                     continue
-                resolved = _resolve_attachment_path(
+                resolved = resolve_attachment_path(
                     raw_path, project_path, self.config.allowed_attachment_roots,
                 )
                 if not resolved:
