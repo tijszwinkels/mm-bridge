@@ -472,6 +472,36 @@ class ForwardingTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.sent, [])
 
+    async def test_posted_with_from_bridge_cli_prop_is_skipped(self):
+        """Posts authored by the bridge CLI (e.g. ``mm-bridge spawn``'s
+        parent-channel announcement) carry a ``props.from_bridge_cli``
+        marker so the daemon can recognise them on the WS echo and
+        avoid forwarding them to the linked session as a user turn.
+        Without this, the parent session reads its own spawn
+        announcement back as if a human had typed it."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ":thread: Spawned ...",
+            "user_id": "u1", "type": "",
+            "props": {"from_bridge_cli": "spawn-announcement"},
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_posted_without_from_bridge_cli_prop_forwards_normally(self):
+        """Regression guard: posts whose ``props`` dict is missing or
+        lacks the marker still forward to the linked session."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "human msg",
+            "user_id": "u1", "type": "",
+            "props": {"unrelated": "value"},
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "human msg")])
+
     async def test_posted_queues_while_session_pending(self):
         self.bridge.pending_mm_sessions["c1"] = type(self.bridge.pending_mm_sessions.get("c1") or self.bridge)  # placeholder
         # Use the real dataclass:

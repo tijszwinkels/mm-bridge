@@ -136,6 +136,34 @@ def test_post_records_returned_id_as_own():
     assert client.is_own_post("someone-else") is False
 
 
+def test_post_passes_props_through_to_create_post():
+    """``props=...`` lands in ``options['props']`` on the underlying
+    create_post call so the daemon dispatcher can recognise CLI-authored
+    posts and skip user-turn injection."""
+    driver = FakeDriver()
+    client = _make_client_with_driver(driver)
+
+    client.post("c1", "hi", props={"from_bridge_cli": "spawn-announcement"})
+
+    assert len(driver.posts.created) == 1
+    assert driver.posts.created[0].get("props") == {
+        "from_bridge_cli": "spawn-announcement",
+    }
+
+
+def test_post_omits_props_key_when_not_provided():
+    """No ``props`` kwarg → no ``props`` key in the create_post options.
+    Keeps the wire payload identical to the pre-feature behaviour for the
+    common (non-marker) case."""
+    driver = FakeDriver()
+    client = _make_client_with_driver(driver)
+
+    client.post("c1", "hi")
+
+    assert len(driver.posts.created) == 1
+    assert "props" not in driver.posts.created[0]
+
+
 def test_post_message_records_returned_id_as_own():
     driver = FakeDriver()
     driver.posts.next_id = "own-456"

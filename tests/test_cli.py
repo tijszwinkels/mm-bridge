@@ -53,9 +53,13 @@ class FakeMM:
         *,
         file_ids: list | None = None,
         root_id: str | None = None,
+        props: dict | None = None,
     ) -> dict:
         self.posts.append(
-            {"channel_id": channel_id, "message": message, "root_id": root_id},
+            {
+                "channel_id": channel_id, "message": message,
+                "root_id": root_id, "props": props,
+            },
         )
         return {"id": f"post-{len(self.posts)}"}
 
@@ -388,6 +392,32 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertIn("> fix the bug", parent_body)
         # Spawning from a channel-level session: announcement is not threaded.
         self.assertIsNone(posts_by_chan["parent-chan"]["root_id"])
+
+    def test_spawn_announcement_carries_bridge_cli_marker_prop(self) -> None:
+        """The parent-channel announcement is authored by the CLI — the
+        daemon's per-process own-post tracker does not know about it,
+        so without a marker prop it would forward the announcement to
+        the parent session as a user turn. Stamping
+        ``props.from_bridge_cli`` lets the daemon dispatcher skip it.
+        The kickoff post into the new child channel must NOT carry the
+        marker — the spawn flow relies on the daemon forwarding it as
+        the new session's first user message."""
+        rc = self._invoke([
+            "mm-bridge", "spawn", "fix the bug", "--title", "Bug Fix",
+        ])
+        self.assertEqual(rc, 0)
+        posts_by_chan = {p["channel_id"]: p for p in self.fake_mm.posts}
+
+        announcement = posts_by_chan["parent-chan"]
+        self.assertEqual(
+            announcement.get("props"),
+            {"from_bridge_cli": "spawn-announcement"},
+        )
+
+        kickoff = posts_by_chan["new-chan"]
+        # The kickoff goes through post_message(), which never sets
+        # props — the daemon must still forward it to the new session.
+        self.assertIsNone(kickoff.get("props"))
 
     def test_spawn_without_title_does_not_rename(self) -> None:
         rc = self._invoke(["mm-bridge", "spawn", "ad hoc"])
