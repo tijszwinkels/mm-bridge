@@ -70,14 +70,72 @@ def test_case_insensitive_leave_channel() -> None:
     assert directives == [Directive("leave_channel", {})]
 
 
-def test_directive_inside_code_fence_still_matches() -> None:
-    # Mirrors VibeDeck JS regex behavior — no code-fence awareness.
+def test_open_file_inside_plain_fence_not_extracted() -> None:
     text = '```\n<openFile path="a"/>\n```'
     cleaned, directives = extract(text)
-    assert directives == [Directive("open_file", {"path": "a"})]
-    assert "<openFile" not in cleaned
-    assert cleaned.startswith("```")
-    assert cleaned.endswith("```")
+    assert directives == []
+    assert cleaned == text
+
+
+def test_open_file_inside_language_tagged_fence_not_extracted() -> None:
+    text = '```xml\n<openFile path="a"/>\n```'
+    cleaned, directives = extract(text)
+    assert directives == []
+    assert cleaned == text
+
+
+def test_leave_channel_inside_plain_fence_not_extracted() -> None:
+    text = '```\n<leaveChannel reason="done"/>\n```'
+    cleaned, directives = extract(text)
+    assert directives == []
+    assert cleaned == text
+
+
+def test_leave_channel_inside_language_tagged_fence_not_extracted() -> None:
+    text = '```md\n<leaveChannel />\n```'
+    cleaned, directives = extract(text)
+    assert directives == []
+    assert cleaned == text
+
+
+def test_open_file_inside_inline_code_span_not_extracted() -> None:
+    text = 'Use `<openFile path="a"/>` to attach files.'
+    cleaned, directives = extract(text)
+    assert directives == []
+    assert cleaned == text
+
+
+def test_leave_channel_inside_inline_code_span_not_extracted() -> None:
+    text = 'Emit `<leaveChannel reason="bye"/>` to leave.'
+    cleaned, directives = extract(text)
+    assert directives == []
+    assert cleaned == text
+
+
+def test_directive_outside_fence_still_extracted_when_fence_present() -> None:
+    text = (
+        'Example below:\n'
+        '```\n'
+        '<openFile path="example.py"/>\n'
+        '```\n'
+        'Now actually do it: <openFile path="real.py"/>'
+    )
+    cleaned, directives = extract(text)
+    assert directives == [Directive("open_file", {"path": "real.py"})]
+    # Fenced block preserved verbatim, real directive stripped.
+    assert '```\n<openFile path="example.py"/>\n```' in cleaned
+    assert "real.py" not in cleaned
+
+
+def test_directive_outside_code_span_still_extracted_when_span_present() -> None:
+    text = (
+        'The directive `<openFile path="x"/>` works like this: '
+        '<openFile path="real.py"/>'
+    )
+    cleaned, directives = extract(text)
+    assert directives == [Directive("open_file", {"path": "real.py"})]
+    assert '`<openFile path="x"/>`' in cleaned
+    assert "real.py" not in cleaned
 
 
 def test_extra_attrs_preserved() -> None:
