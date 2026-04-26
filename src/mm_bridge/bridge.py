@@ -386,6 +386,15 @@ class Bridge:
     async def _on_mm_posted(self, post: dict) -> None:
         if _is_mm_system_post(post):
             return
+        # Bridge CLI subcommands stamp `props.from_bridge_cli` on posts
+        # they author themselves (e.g. `mm-bridge spawn`'s parent-channel
+        # announcement). Those posts are visible to humans but must not
+        # be forwarded to the linked session as a user turn — the daemon
+        # didn't author them, so its per-process own-post tracker can't
+        # suppress the WS echo on its own.
+        props = post.get("props") or {}
+        if isinstance(props, dict) and props.get("from_bridge_cli"):
+            return
         message = (post.get("message") or "").strip()
         if not message and not post.get("file_ids"):
             return

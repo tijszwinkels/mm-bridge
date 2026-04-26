@@ -807,6 +807,12 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                     display_name, new_channel_name, args.prompt,
                 ),
                 root_id=parent_anchor.root_id,
+                # The daemon's per-process own-post tracker only sees
+                # IDs created by *its own* MattermostClient, so a CLI-
+                # authored post would otherwise be forwarded to the
+                # parent session as a user turn. The marker lets the
+                # dispatcher recognise and skip the WS echo.
+                props={"from_bridge_cli": "spawn-announcement"},
             )
         except Exception:
             logger.warning(

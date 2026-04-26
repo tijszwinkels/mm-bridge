@@ -114,12 +114,15 @@ class MattermostClient:
         *,
         file_ids: list[str] | None = None,
         root_id: str | None = None,
+        props: dict | None = None,
     ) -> dict:
         options: dict = {"channel_id": channel_id, "message": message}
         if file_ids:
             options["file_ids"] = file_ids
         if root_id:
             options["root_id"] = root_id
+        if props is not None:
+            options["props"] = props
         resp = self._driver.posts.create_post(options=options)
         self._record_own_post(resp.get("id") if isinstance(resp, dict) else None)
         return resp
