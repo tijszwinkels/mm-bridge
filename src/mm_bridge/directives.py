@@ -4,10 +4,11 @@ Supported directives:
     <openFile path="..." [line="..."] [follow="..."] />
     <leaveChannel [reason="..."] />
 
-Regex mirrors VibeDeck's JS parser in
-``VibeDeck/src/vibedeck/templates/static/js/commands.js`` so both sides agree
-on what counts as a directive (including odd cases like directives inside
-code fences, which the JS parser also matches).
+Directive regex mirrors VibeDeck's JS parser in
+``VibeDeck/src/vibedeck/templates/static/js/commands.js``. Unlike the JS
+side, this parser is markdown-fence-aware: directives appearing inside
+triple-backtick fenced blocks or inline backtick code spans are treated
+as documentation and left intact in the visible text.
 """
 
 from __future__ import annotations
@@ -32,6 +33,31 @@ _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 # Collapse 3+ consecutive newlines (possibly with blank whitespace) to two.
 _BLANK_RUN_RE = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)+")
 
+# Triple-backtick fenced block (with optional language tag on the open line).
+# Non-greedy body so adjacent fences don't merge.
+_FENCE_RE = re.compile(r"```[^\n]*\n.*?\n```", re.DOTALL)
+
+# Inline single-backtick code span — must not span lines or contain backticks.
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+
+# Sentinel char used to mask code regions so the directive regex can't match
+# inside them. NUL never appears in normal markdown and is not `<`/`>`.
+_MASK_CHAR = "\x00"
+
+
+def _mask_code_regions(text: str) -> str:
+    """Return ``text`` with fenced blocks and inline code spans replaced by
+    same-length runs of NUL, so directive regexes won't fire inside them
+    while character offsets are preserved for slicing the original text.
+    """
+
+    def _blank(match: re.Match[str]) -> str:
+        return _MASK_CHAR * (match.end() - match.start())
+
+    masked = _FENCE_RE.sub(_blank, text)
+    masked = _INLINE_CODE_RE.sub(_blank, masked)
+    return masked
+
 
 def _parse_attrs(inner: str | None) -> dict[str, str]:
     if not inner:
@@ -49,13 +75,14 @@ def extract(text: str) -> tuple[str, list[Directive]]:
     """
 
     matches: list[tuple[int, int, Directive]] = []
+    masked = _mask_code_regions(text)
 
-    for m in _OPEN_FILE_RE.finditer(text):
+    for m in _OPEN_FILE_RE.finditer(masked):
         matches.append(
             (m.start(), m.end(), Directive("open_file", _parse_attrs(m.group(1))))
         )
 
-    for m in _LEAVE_CHANNEL_RE.finditer(text):
+    for m in _LEAVE_CHANNEL_RE.finditer(masked):
         matches.append(
             (m.start(), m.end(), Directive("leave_channel", _parse_attrs(m.group(1))))
         )
