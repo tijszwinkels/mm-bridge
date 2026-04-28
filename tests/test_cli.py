@@ -415,9 +415,12 @@ class SpawnCommandTests(unittest.TestCase):
         )
 
         kickoff = posts_by_chan["new-chan"]
-        # The kickoff goes through post_message(), which never sets
-        # props — the daemon must still forward it to the new session.
-        self.assertIsNone(kickoff.get("props"))
+        # Load-bearing scope distinction: the kickoff goes through
+        # post_message() (no props arg), so the recorded fake post must
+        # not carry a `props` key at all. The daemon relies on this
+        # to forward the kickoff to the new session as the first user
+        # message — adding the marker here would silently break spawn.
+        self.assertNotIn("props", kickoff)
 
     def test_spawn_without_title_does_not_rename(self) -> None:
         rc = self._invoke(["mm-bridge", "spawn", "ad hoc"])

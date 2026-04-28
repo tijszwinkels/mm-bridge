@@ -229,6 +229,41 @@ def test_ws_posted_suppresses_our_own_echo():
     assert captured == []
 
 
+def test_ws_posted_marker_does_not_disable_own_echo_suppression():
+    """The ``from_bridge_cli`` marker is an *additional* skip path
+    layered on top of ``is_own_post`` echo suppression, not a
+    replacement. A post that's both marker-stamped *and* one this
+    process just authored must still be dropped at the
+    ``_dispatch_event`` layer — i.e. the existing echo path is
+    untouched. (The marker's job is the *cross-process* case the
+    deque can't see, not weakening the in-process echo guard.)"""
+    import json as _json
+
+    driver = FakeDriver()
+    driver.posts.next_id = "echo-1"
+    client = _make_client_with_driver(driver)
+    client.post(
+        "c1", "outbound",
+        props={"from_bridge_cli": "spawn-announcement"},
+    )  # records "echo-1" as own
+
+    captured: list[dict] = []
+
+    async def handler(post):
+        captured.append(post)
+
+    echo_event = {
+        "event": "posted",
+        "data": {"post": _json.dumps({
+            "id": "echo-1", "user_id": "bot", "message": "outbound",
+            "props": {"from_bridge_cli": "spawn-announcement"},
+        })},
+    }
+    asyncio.run(client._dispatch_event(echo_event, {"posted": handler}))
+
+    assert captured == []
+
+
 def test_ws_posted_forwards_cross_identity_bot_post():
     """Regression: posts by another actor sharing the bot identity
     (sibling mm-bridge sessions, other scripts using MM_BOT_TOKEN,
