@@ -1678,6 +1678,45 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
         await self._direct_user_text("s-inv", "kick-off prompt")
         self.assertEqual(len(self.bridge.mm.posted), before)
 
+    async def test_invite_first_message_truncated_in_session_added_still_dedups(self):
+        """Regression: VD's `firstMessage` field in `session_added` is
+        truncated to 200 chars by every backend's `get_first_user_message`.
+        When the bridge ships a >200-char body via `create_session` (e.g.
+        with `initial_catch_up_n` > 0 prepending a catch-up block), the
+        role=user echo VD broadcasts later carries the full body — so
+        recording the truncated `firstMessage` for dedup misses the echo
+        and the catch-up block leaks into MM as `_via coding agent: …`.
+        Fix: record `pending.initial_message` (the full body actually
+        shipped) instead of `firstMessage`."""
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        full_body = (
+            "[catch-up: last 50 messages]\n"
+            + ("\n".join(f"- u{i}: line {i} of context" for i in range(50)))
+            + "\n\nkick-off prompt"
+        )
+        # Sanity: this is the regime the bug applies to.
+        self.assertGreater(len(full_body), 200)
+        truncated = full_body[:200]
+
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message=full_body, requested_at=_time.monotonic(),
+        )
+        await self.bridge._on_vd_event("session_added", {
+            "id": "s-inv", "projectPath": "/tmp/proj", "backend": "claude",
+            "firstMessage": truncated,
+        })
+
+        before = len(self.bridge.mm.posted)
+        await self._direct_user_text("s-inv", full_body)
+        self.assertEqual(
+            len(self.bridge.mm.posted), before,
+            "Truncated firstMessage in session_added must not defeat "
+            "dedup of the full-body role=user echo.",
+        )
+
     async def test_fork_continuation_preamble_is_swallowed(self):
         """Claude Code forks emit a synthetic continuation summary as
         firstMessage. It is NOT user-typed input — must be suppressed."""

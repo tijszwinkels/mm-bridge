@@ -1733,11 +1733,17 @@ class Bridge:
         self.pending_mm_sessions.pop(channel_id, None)
         if pending.allow_first_message_config:
             self.awaiting_first_message.add(channel_id)
-        # The firstMessage VD will broadcast back is the prompt we shipped
-        # via create_session — suppress the echo so it isn't mirrored as a
-        # "direct" user turn.
-        if first_msg:
-            self._record_vd_send(session_id, first_msg)
+        # The role=user echo VD will broadcast for this session's first
+        # turn carries the *full* body we shipped via `create_session`.
+        # `data["firstMessage"]` is the SSE-side preview field, which
+        # every backend's `get_first_user_message` truncates to 200 chars
+        # (see VD `backends/*/discovery.py`, `backends/claude_code/tailer.py`)
+        # — so dedup against `first_msg` misses on any session whose
+        # `effective_initial` exceeds 200 chars (almost always true once
+        # `initial_catch_up_n` prepends a catch-up block). Record the
+        # full `pending.initial_message` instead.
+        if pending.initial_message:
+            self._record_vd_send(session_id, pending.initial_message)
         logger.info("Claimed pending invite: channel %s → session %s",
                     channel_id, session_id[:8])
         if pending.channel_display_name:
