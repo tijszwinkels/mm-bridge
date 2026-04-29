@@ -517,6 +517,7 @@ def _maybe_mirror_cross_channel_post(
     try:
         mm.post(
             self_anchor.channel_id, mirror_body,
+            root_id=self_anchor.root_id,
             props={"from_bridge_cli": "cross-post-mirror"},
         )
     except Exception:
