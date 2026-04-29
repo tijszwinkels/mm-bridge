@@ -70,7 +70,18 @@ class VibeDeckClient:
             payload["source_session_id"] = source_session_id
 
         resp = await self._http.post("/sessions/new", json=payload)
-        resp.raise_for_status()
+        if resp.is_error:
+            # Surface VD's `{"detail": "..."}` body so callers can see *which*
+            # validation branch fired. raise_for_status() alone discards it.
+            try:
+                detail = resp.json().get("detail", "")
+            except Exception:
+                detail = (resp.text or "")[:500]
+            raise httpx.HTTPStatusError(
+                f"VibeDeck POST /sessions/new → {resp.status_code}: {detail}",
+                request=resp.request,
+                response=resp,
+            )
         return resp.json()
 
     async def send_message(self, session_id: str, message: str) -> dict:
@@ -131,13 +142,20 @@ class VibeDeckClient:
         )
         resp.raise_for_status()
 
-    async def list_models(self, backend: str) -> list[str]:
+    async def list_models(self, backend: str, *, force_refresh: bool = False) -> list[str]:
         """Return model names for a backend. Cached in-process.
 
         Uses the same wire-alias mapping as `create_session` so the
         purpose token ``claude`` reaches VD as ``claude-code``.
+
+        ``force_refresh=True`` bypasses the cache and re-fetches from VD.
+        Beyond updating the bridge's cache, the GET also re-populates VD's
+        own ``_cached_models`` (see ``routes/sessions.py::list_backend_models``),
+        which ``model_index`` validation in ``POST /sessions/new`` depends on.
+        Call this immediately before ``create_session`` if a stale VD cache
+        could otherwise reject ``model_index``.
         """
-        if backend in self._model_cache:
+        if not force_refresh and backend in self._model_cache:
             return self._model_cache[backend]
         wire = _to_wire_backend(backend)
         try:
