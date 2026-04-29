@@ -697,9 +697,23 @@ class Bridge:
             except Exception:
                 logger.debug("posting purpose warning failed", exc_info=True)
 
+        # Force-refresh the chosen backend's model list so the GET also
+        # warms VD's _cached_models for that backend — POST /sessions/new
+        # validates model_index against that VD-side cache and returns 400
+        # if it's empty (e.g. nothing has fetched the list since VD restart).
         model_index = None
         if cfg.model:
-            for i, m in enumerate(models_by_backend.get(cfg.backend, [])):
+            try:
+                fresh_models = await self.vd.list_models(
+                    cfg.backend, force_refresh=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Force-refresh of models for %s failed; falling back to cached list",
+                    cfg.backend, exc_info=True,
+                )
+                fresh_models = models_by_backend.get(cfg.backend, [])
+            for i, m in enumerate(fresh_models):
                 if m.lower() == cfg.model.lower():
                     model_index = i
                     break

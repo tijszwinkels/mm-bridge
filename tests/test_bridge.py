@@ -218,7 +218,7 @@ class FakeVibeDeckClient:
         self.interrupted.append(session_id)
         return {"status": "interrupted", "session_id": session_id}
 
-    async def list_models(self, backend) -> list[str]:
+    async def list_models(self, backend, *, force_refresh: bool = False) -> list[str]:
         return self.models_by_backend.get(backend, [])
 
     async def stream_events(self, on_event) -> None:
