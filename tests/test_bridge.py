@@ -1717,6 +1717,46 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
             "dedup of the full-body role=user echo.",
         )
 
+    async def test_fork_message_echo_is_swallowed(self):
+        """Symmetric to the invite truncation case. On Claude Code,
+        `vd.fork_session(parent, fork_message)` ships `fork_message` via
+        stdin; Claude writes it into the new session's transcript and
+        VD broadcasts it as a role=user `message` event. The bridge must
+        record `pending.initial_message` (= `fork_message`) so the echo
+        is suppressed — otherwise the wrapped thread-context preamble
+        plus the user's MM thread reply gets re-posted back into the
+        same thread as `_via coding agent: …`.
+        """
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        fork_message = (
+            "[Mattermost thread context] You are continuing the parent "
+            "conversation in a Mattermost thread. The user replied to "
+            "this message:\n\n> root post body\n\n"
+            "Their reply follows:\n\n"
+            "thread starter"
+        )
+        self.bridge.pending_forks.append(PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message=fork_message, requested_at=_time.monotonic(),
+            is_fork=True, fork_parent_session="s1",
+            fork_thread_channel="c1", fork_thread_root="r1",
+        ))
+        await self.bridge._on_vd_event("session_added", {
+            "id": "s-fork", "projectPath": "/tmp/proj", "backend": "claude",
+            "firstMessage": "This session is being continued from a previous conversation...",
+        })
+
+        before = len(self.bridge.mm.posted)
+        await self._direct_user_text("s-fork", fork_message)
+        self.assertEqual(
+            len(self.bridge.mm.posted), before,
+            "fork_message echo from the new session must be deduplicated, "
+            "not mirrored as a `_via coding agent: …` post.",
+        )
+
     async def test_fork_continuation_preamble_is_swallowed(self):
         """Claude Code forks emit a synthetic continuation summary as
         firstMessage. It is NOT user-typed input — must be suppressed."""

@@ -1782,12 +1782,26 @@ class Bridge:
         if not ch_id or not root_id:
             return False
         self.mapping.link(Anchor(ch_id, root_id), session_id)
-        # On Claude Code, the fork's firstMessage is a synthetic
-        # continuation summary — never user-typed input, so suppress it
-        # from the direct-user-message mirror.
+        # On Claude Code, the fork's transcript receives TWO user-role
+        # entries we must keep out of the mirror:
+        #   1. Claude's synthetic continuation summary, surfaced as
+        #      `data["firstMessage"]` (truncated to 200 chars by VD's
+        #      `get_first_user_message`). Recording the truncated form
+        #      suffices in practice — observed continuation summaries
+        #      are well under the limit.
+        #   2. The wrapped `fork_message` we shipped via
+        #      `vd.fork_session(parent, fork_message)`, which Claude's
+        #      `build_fork_command` pipes over stdin and is written
+        #      into the new session's transcript verbatim. Record
+        #      `pending.initial_message` (the full body shipped) so
+        #      that echo is suppressed regardless of length —
+        #      otherwise the thread-context preamble + user reply
+        #      gets re-posted back into the same thread.
         synth_first = (data.get("firstMessage") or "").strip()
         if synth_first:
             self._record_vd_send(session_id, synth_first)
+        if pending.initial_message:
+            self._record_vd_send(session_id, pending.initial_message)
         logger.info("Claimed pending fork: thread %s:%s → session %s",
                     ch_id, root_id[:8], session_id[:8])
         try:
