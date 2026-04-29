@@ -54,6 +54,17 @@ class Config:
     # Disable to keep channels to only real assistant replies.
     show_tool_use: bool = True
 
+    # Mirror user turns that arrive via the coding agent's own UI/CLI
+    # (rather than via Mattermost) back into the channel, so MM watchers
+    # see the conversation in full. Tool results (role=user, tool_result
+    # blocks) are never mirrored. Bridge-originated sends are de-duped
+    # against a recent-send window so MM-routed turns don't echo back.
+    mirror_direct_user_messages: bool = True
+    # Window inside which an outbound send is treated as the source of a
+    # subsequent role=user echo. Claude Code startup can be slow, so the
+    # default is generous.
+    direct_user_message_dedup_window_seconds: float = 30.0
+
     # When a run finishes, post a standalone ``@<username>`` in the same
     # channel/thread to notify the user whose message triggered it.
     # No-op if the run had no tracked triggerer (e.g. autorespond loops
@@ -147,6 +158,8 @@ class Config:
             "default_cwd",
             "default_autorespond",
             "show_tool_use",
+            "mirror_direct_user_messages",
+            "direct_user_message_dedup_window_seconds",
             "mention_user_when_done",
             "auto_join_public_channels",
             "auto_join_reconcile_seconds",
@@ -209,6 +222,11 @@ class Config:
         if "MM_SHOW_TOOL_USE" in env:
             self.show_tool_use = env["MM_SHOW_TOOL_USE"].lower() in (
                 "1", "true", "yes", "on",
+            )
+        if "MM_MIRROR_DIRECT_USER_MESSAGES" in env:
+            self.mirror_direct_user_messages = (
+                env["MM_MIRROR_DIRECT_USER_MESSAGES"].lower()
+                in ("1", "true", "yes", "on")
             )
         if "MM_MENTION_USER_WHEN_DONE" in env:
             self.mention_user_when_done = env["MM_MENTION_USER_WHEN_DONE"].lower() in (

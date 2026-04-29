@@ -1587,6 +1587,260 @@ class AssistantMessageTests(_BridgeTestCase):
         self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
 
 
+class DirectUserMessageMirrorTests(_BridgeTestCase):
+    """User turns that arrive via the coding agent's UI/CLI (role=user from
+    SSE) are mirrored back into the bound MM channel so MM watchers see the
+    full conversation. Bridge-originated sends, tool results, and synthetic
+    fork preambles are all suppressed.
+    """
+
+    USER_PREFIX = "_via coding agent:_"
+
+    async def _direct_user_text(self, session_id: str, text: str) -> None:
+        await self.bridge._on_vd_event("message", {
+            "session_id": session_id,
+            "message": {
+                "role": "user",
+                "blocks": [{"type": "text", "text": text}],
+            },
+        })
+
+    async def test_direct_user_text_block_is_mirrored(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self._direct_user_text("s1", "what's the build status?")
+
+        mirrored = [p for p in self.bridge.mm.posted if self.USER_PREFIX in p.message]
+        self.assertEqual(len(mirrored), 1)
+        self.assertIn("what's the build status?", mirrored[0].message)
+        self.assertEqual(mirrored[0].channel_id, "c1")
+        self.assertIsNone(mirrored[0].root_id)
+
+    async def test_tool_result_role_user_is_not_mirrored(self):
+        """Claude/Codex represent tool results as role=user with a
+        tool_result block. These must not leak into MM."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_vd_event("message", {
+            "session_id": "s1",
+            "message": {
+                "role": "user",
+                "blocks": [{
+                    "type": "tool_result",
+                    "content": "drwxr-xr-x  4 user  staff  128 ...",
+                    "is_error": False,
+                }],
+            },
+        })
+
+        self.assertEqual(self.bridge.mm.posted, [])
+
+    async def test_recent_mm_forwarded_post_does_not_echo_back(self):
+        """When MM forwards a user post to VD via send_message, VD's
+        transcript echoes it back as role=user. The bridge must dedup
+        against its recent-send window so the channel doesn't double up.
+        """
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "root_id": None, "message": "hello agent",
+            "user_id": "u1", "type": "", "id": "p-mm-1",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "hello agent")])
+
+        # VD echoes the same body back as role=user. Must not produce
+        # an extra MM post.
+        before = len(self.bridge.mm.posted)
+        await self._direct_user_text("s1", "hello agent")
+        after = len(self.bridge.mm.posted)
+        self.assertEqual(
+            after, before,
+            "MM-originated message must not be re-mirrored as a direct turn",
+        )
+
+    async def test_first_message_after_invite_claim_is_swallowed(self):
+        """The first user-role event after an invite-claim is the
+        firstMessage we shipped via create_session — not direct input."""
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message="kick-off prompt", requested_at=_time.monotonic(),
+        )
+        await self.bridge._on_vd_event("session_added", {
+            "id": "s-inv", "projectPath": "/tmp/proj", "backend": "claude",
+            "firstMessage": "kick-off prompt",
+        })
+
+        before = len(self.bridge.mm.posted)
+        await self._direct_user_text("s-inv", "kick-off prompt")
+        self.assertEqual(len(self.bridge.mm.posted), before)
+
+    async def test_invite_first_message_truncated_in_session_added_still_dedups(self):
+        """Regression: VD's `firstMessage` field in `session_added` is
+        truncated to 200 chars by every backend's `get_first_user_message`.
+        When the bridge ships a >200-char body via `create_session` (e.g.
+        with `initial_catch_up_n` > 0 prepending a catch-up block), the
+        role=user echo VD broadcasts later carries the full body — so
+        recording the truncated `firstMessage` for dedup misses the echo
+        and the catch-up block leaks into MM as `_via coding agent: …`.
+        Fix: record `pending.initial_message` (the full body actually
+        shipped) instead of `firstMessage`."""
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        full_body = (
+            "[catch-up: last 50 messages]\n"
+            + ("\n".join(f"- u{i}: line {i} of context" for i in range(50)))
+            + "\n\nkick-off prompt"
+        )
+        # Sanity: this is the regime the bug applies to.
+        self.assertGreater(len(full_body), 200)
+        truncated = full_body[:200]
+
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message=full_body, requested_at=_time.monotonic(),
+        )
+        await self.bridge._on_vd_event("session_added", {
+            "id": "s-inv", "projectPath": "/tmp/proj", "backend": "claude",
+            "firstMessage": truncated,
+        })
+
+        before = len(self.bridge.mm.posted)
+        await self._direct_user_text("s-inv", full_body)
+        self.assertEqual(
+            len(self.bridge.mm.posted), before,
+            "Truncated firstMessage in session_added must not defeat "
+            "dedup of the full-body role=user echo.",
+        )
+
+    async def test_fork_message_echo_is_swallowed(self):
+        """Symmetric to the invite truncation case. On Claude Code,
+        `vd.fork_session(parent, fork_message)` ships `fork_message` via
+        stdin; Claude writes it into the new session's transcript and
+        VD broadcasts it as a role=user `message` event. The bridge must
+        record `pending.initial_message` (= `fork_message`) so the echo
+        is suppressed — otherwise the wrapped thread-context preamble
+        plus the user's MM thread reply gets re-posted back into the
+        same thread as `_via coding agent: …`.
+        """
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        fork_message = (
+            "[Mattermost thread context] You are continuing the parent "
+            "conversation in a Mattermost thread. The user replied to "
+            "this message:\n\n> root post body\n\n"
+            "Their reply follows:\n\n"
+            "thread starter"
+        )
+        self.bridge.pending_forks.append(PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message=fork_message, requested_at=_time.monotonic(),
+            is_fork=True, fork_parent_session="s1",
+            fork_thread_channel="c1", fork_thread_root="r1",
+        ))
+        await self.bridge._on_vd_event("session_added", {
+            "id": "s-fork", "projectPath": "/tmp/proj", "backend": "claude",
+            "firstMessage": "This session is being continued from a previous conversation...",
+        })
+
+        before = len(self.bridge.mm.posted)
+        await self._direct_user_text("s-fork", fork_message)
+        self.assertEqual(
+            len(self.bridge.mm.posted), before,
+            "fork_message echo from the new session must be deduplicated, "
+            "not mirrored as a `_via coding agent: …` post.",
+        )
+
+    async def test_fork_continuation_preamble_is_swallowed(self):
+        """Claude Code forks emit a synthetic continuation summary as
+        firstMessage. It is NOT user-typed input — must be suppressed."""
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.pending_forks.append(PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message="thread starter", requested_at=_time.monotonic(),
+            is_fork=True, fork_parent_session="s1",
+            fork_thread_channel="c1", fork_thread_root="r1",
+        ))
+        synth = "This session is being continued from a previous conversation..."
+        await self.bridge._on_vd_event("session_added", {
+            "id": "s-fork", "projectPath": "/tmp/proj", "backend": "claude",
+            "firstMessage": synth,
+        })
+
+        before = len(self.bridge.mm.posted)
+        await self._direct_user_text("s-fork", synth)
+        self.assertEqual(len(self.bridge.mm.posted), before)
+
+    async def test_autonomous_session_first_message_is_mirrored(self):
+        """A session VD created on its own (no MM origin) gets a fresh
+        channel and the firstMessage IS direct input — must surface in MM.
+        """
+        await self.bridge._on_vd_event("session_added", {
+            "id": "s-cli", "projectPath": "/tmp/proj", "backend": "claude",
+            "firstMessage": "started a session locally",
+            "summaryTitle": "Local",
+        })
+
+        anchor = self.bridge.mapping.get_anchor("s-cli")
+        self.assertIsNotNone(anchor)
+
+        await self._direct_user_text("s-cli", "started a session locally")
+
+        mirrored = [p for p in self.bridge.mm.posted if self.USER_PREFIX in p.message]
+        self.assertEqual(len(mirrored), 1)
+        self.assertIn("started a session locally", mirrored[0].message)
+
+    async def test_thread_anchor_routes_to_thread_root(self):
+        self.bridge.mapping.link(Anchor("c1", "r1"), "s-thr")
+
+        await self._direct_user_text("s-thr", "thread-only thought")
+
+        mirrored = [p for p in self.bridge.mm.posted if self.USER_PREFIX in p.message]
+        self.assertEqual(len(mirrored), 1)
+        self.assertEqual(mirrored[0].channel_id, "c1")
+        self.assertEqual(mirrored[0].root_id, "r1")
+
+    async def test_disabled_via_config(self):
+        self.bridge.config.mirror_direct_user_messages = False
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self._direct_user_text("s1", "should not show")
+
+        self.assertEqual(self.bridge.mm.posted, [])
+
+    async def test_unbound_session_silently_dropped(self):
+        await self._direct_user_text("s-orphan", "no anchor here")
+
+        self.assertEqual(self.bridge.mm.posted, [])
+
+    async def test_dedup_window_expires(self):
+        """An echo arriving long after the send window must be mirrored.
+        We model this by directly draining the recent-send entry, then
+        firing the same body as a direct turn."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "root_id": None, "message": "stale body",
+            "user_id": "u1", "type": "", "id": "p-mm-1",
+        })
+        self.bridge.config.direct_user_message_dedup_window_seconds = 0.0
+        # After zeroing the window, the recent-send entry is past — a
+        # direct echo of the same body must now mirror.
+        await self._direct_user_text("s1", "stale body")
+
+        mirrored = [p for p in self.bridge.mm.posted if self.USER_PREFIX in p.message]
+        self.assertEqual(len(mirrored), 1)
+
+
 class ToolUseCoalescingTests(_BridgeTestCase):
     """Verify tool-use blocks coalesce into a single per-turn placeholder
     post that gets hard-deleted when the turn ends.
