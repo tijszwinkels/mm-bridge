@@ -62,6 +62,13 @@ default_autorespond = false
 # real assistant replies and tool errors.
 show_tool_use = true
 
+# Mirror user turns typed directly into the agent's UI/CLI back into the
+# bound MM channel as ``_via coding agent:_ <body>`` posts so MM watchers
+# see the full conversation. Bridge-originated sends and tool results are
+# never mirrored. Set false to keep direct-typed turns invisible to MM.
+mirror_direct_user_messages = true
+direct_user_message_dedup_window_seconds = 30.0
+
 # Auto-join: silently join every public channel the bot can see.
 # Sessions are NOT created until someone actually engages the bot.
 auto_join_public_channels  = false
@@ -99,6 +106,7 @@ catch_up_max_n     = 500
 | `VD_DEFAULT_MODEL`       | Model slug (empty string → unset).                                 |
 | `VD_DEFAULT_AUTORESPOND` | `1/true/yes/on` to enable autorespond by default.                  |
 | `MM_SHOW_TOOL_USE`       | Toggle `show_tool_use` without editing TOML.                       |
+| `MM_MIRROR_DIRECT_USER_MESSAGES` | Toggle `mirror_direct_user_messages` without editing TOML. |
 | `MM_AUTO_JOIN`           | Toggle `auto_join_public_channels` without editing TOML.           |
 | `MM_BRIDGE_STATE`        | Path to the state JSON.                                            |
 | `MM_BRIDGE_SIDECAR_DIR`  | Sidecar directory.                                                 |

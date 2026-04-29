@@ -270,6 +270,11 @@ class Bridge:
         # the run ends. Cleared on use, so a single completion event only
         # pings once, and on session teardown (see `*_forget_session`).
         self._session_triggerer: dict[str, str] = {}
+        # Recently-sent VD message bodies, keyed by session_id. Used to
+        # de-duplicate the role=user echo VD broadcasts when the bridge
+        # itself shipped the message (MM forwards, catch-up blocks,
+        # firstMessage on invite/fork claims). Capped per session.
+        self._recent_vd_sends: dict[str, deque[tuple[float, str]]] = {}
 
     # ----- lifecycle -----
 
@@ -602,6 +607,7 @@ class Bridge:
             self._end_tool_use_run(session_id)
             self.posters.forget(session_id)
             self._session_triggerer.pop(session_id, None)
+            self._recent_vd_sends.pop(session_id, None)
             if self.typing:
                 await self.typing.stop(session_id)
         logger.info("Bot removed from channel %s (session %s unlinked)",
@@ -901,6 +907,7 @@ class Bridge:
         self.posters.forget(old_session_id)
         self._forget_channel_silent_drops(channel_id)
         self._session_triggerer.pop(old_session_id, None)
+        self._recent_vd_sends.pop(old_session_id, None)
         if self.typing:
             await self.typing.stop(old_session_id)
         effective_cwd = self._resolve_purpose_cwd(cfg)
@@ -1115,6 +1122,7 @@ class Bridge:
                 body = f"{preamble}\n\n{body}" if body else preamble
 
         logger.info("MM → VD [%s]: %s", session_id[:8], body[:80])
+        self._record_vd_send(session_id, body)
         try:
             await self.vd.send_message(session_id, body)
         except Exception:
@@ -1525,6 +1533,7 @@ class Bridge:
         lines, included_ids = self._collect_catch_up_lines(channel_id, n)
         block = self._format_catch_up_block(lines)
 
+        self._record_vd_send(session_id, block)
         try:
             await self.vd.send_message(session_id, block)
         except Exception:
@@ -1565,6 +1574,7 @@ class Bridge:
                 self._end_tool_use_run(removed)
                 self.posters.forget(removed)
                 self._session_triggerer.pop(removed, None)
+                self._recent_vd_sends.pop(removed, None)
                 if self.typing:
                     await self.typing.stop(removed)
             farewell = (
@@ -1642,6 +1652,7 @@ class Bridge:
         self._end_tool_use_run(session_id)
         self.posters.forget(session_id)
         self._session_triggerer.pop(session_id, None)
+        self._recent_vd_sends.pop(session_id, None)
         if self.typing:
             await self.typing.stop(session_id)
 
@@ -1722,6 +1733,11 @@ class Bridge:
         self.pending_mm_sessions.pop(channel_id, None)
         if pending.allow_first_message_config:
             self.awaiting_first_message.add(channel_id)
+        # The firstMessage VD will broadcast back is the prompt we shipped
+        # via create_session — suppress the echo so it isn't mirrored as a
+        # "direct" user turn.
+        if first_msg:
+            self._record_vd_send(session_id, first_msg)
         logger.info("Claimed pending invite: channel %s → session %s",
                     channel_id, session_id[:8])
         if pending.channel_display_name:
@@ -1760,6 +1776,12 @@ class Bridge:
         if not ch_id or not root_id:
             return False
         self.mapping.link(Anchor(ch_id, root_id), session_id)
+        # On Claude Code, the fork's firstMessage is a synthetic
+        # continuation summary — never user-typed input, so suppress it
+        # from the direct-user-message mirror.
+        synth_first = (data.get("firstMessage") or "").strip()
+        if synth_first:
+            self._record_vd_send(session_id, synth_first)
         logger.info("Claimed pending fork: thread %s:%s → session %s",
                     ch_id, root_id[:8], session_id[:8])
         try:
@@ -1781,6 +1803,7 @@ class Bridge:
         pending: PendingMattermostSession,
     ) -> None:
         for msg in pending.queued_messages:
+            self._record_vd_send(session_id, msg)
             try:
                 await self.vd.send_message(session_id, msg)
             except Exception:
@@ -1828,7 +1851,11 @@ class Bridge:
     async def _on_vd_message(self, data: dict) -> None:
         session_id = data.get("session_id", "")
         msg = data.get("message", {}) or {}
-        if msg.get("role") != "assistant":
+        role = msg.get("role")
+        if role == "user":
+            await self._maybe_mirror_user_message(session_id, msg)
+            return
+        if role != "assistant":
             return
 
         anchor = self.mapping.get_anchor(session_id)
@@ -1866,6 +1893,70 @@ class Bridge:
                     session_id, channel_id, thread_root, text,
                 )
 
+    # ----- direct user-message mirroring -----
+
+    _RECENT_VD_SEND_MAX = 32
+
+    def _record_vd_send(self, session_id: str, body: str) -> None:
+        """Remember that we just shipped ``body`` to ``session_id`` so the
+        SSE echo can be suppressed by ``_consume_dedup_match``."""
+        if not session_id or not body:
+            return
+        q = self._recent_vd_sends.setdefault(
+            session_id, deque(maxlen=self._RECENT_VD_SEND_MAX),
+        )
+        q.append((time.monotonic(), body))
+
+    def _consume_dedup_match(self, session_id: str, body: str) -> bool:
+        """Return True (and pop the matching entry) if ``body`` matches a
+        recent VD send for ``session_id`` within the configured window."""
+        q = self._recent_vd_sends.get(session_id)
+        if not q:
+            return False
+        window = self.config.direct_user_message_dedup_window_seconds
+        now = time.monotonic()
+        while q and now - q[0][0] > window:
+            q.popleft()
+        for i, (_ts, recorded) in enumerate(q):
+            if recorded == body:
+                del q[i]
+                return True
+        return False
+
+    async def _maybe_mirror_user_message(self, session_id: str, msg: dict) -> None:
+        """Post role=user events into the bound MM channel when they
+        represent direct input to the agent (typed in the local CLI/UI),
+        not bridge-originated sends or tool results."""
+        if not self.config.mirror_direct_user_messages:
+            return
+        anchor = self.mapping.get_anchor(session_id)
+        if not anchor:
+            return  # not bound — nothing to mirror to
+
+        text_parts: list[str] = []
+        for block in msg.get("blocks", []) or []:
+            if block.get("type") == "text":
+                t = (block.get("text") or "").strip()
+                if t:
+                    text_parts.append(t)
+        text = "\n".join(text_parts).strip()
+        if not text:
+            return  # tool_result or empty turn — skip
+
+        if self._consume_dedup_match(session_id, text):
+            return  # echo of a body we just sent
+
+        body = f"_via coding agent:_ {text}"
+        try:
+            self.mm.post(
+                anchor.channel_id, _truncate_for_mm(body), root_id=anchor.root_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to mirror direct user message for session %s",
+                session_id[:8],
+            )
+
     async def _handle_assistant_text_block(
         self,
         session_id: str,
@@ -1899,6 +1990,7 @@ class Bridge:
                 self._forget_thread_silent_drops(channel_id, thread_root)
                 self.posters.forget(session_id)
                 self._session_triggerer.pop(session_id, None)
+                self._recent_vd_sends.pop(session_id, None)
                 if self.typing:
                     await self.typing.stop(session_id)
             else:
