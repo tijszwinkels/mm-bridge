@@ -18,13 +18,15 @@ from mm_bridge.config import Config
 class FakeMM:
     posted: list = field(default_factory=list)
     uploaded: list = field(default_factory=list)
+    channels: dict = field(default_factory=dict)
     logged_in: bool = False
     login_raises: Exception | None = None
     upload_raises: Exception | None = None
     post_raises: Exception | None = None
+    get_channel_raises: Exception | None = None
     max_file_size: int = 50 * 1024 * 1024
-    next_post_id: str = "post-1"
     next_file_id_counter: int = 0
+    next_post_id_counter: int = 0
 
     def login(self) -> None:
         if self.login_raises:
@@ -42,6 +44,11 @@ class FakeMM:
     def get_max_file_size(self) -> int:
         return self.max_file_size
 
+    def get_channel(self, channel_id: str) -> dict:
+        if self.get_channel_raises:
+            raise self.get_channel_raises
+        return self.channels.get(channel_id, {"id": channel_id, "name": ""})
+
     def post(
         self,
         channel_id: str,
@@ -49,16 +56,20 @@ class FakeMM:
         *,
         file_ids: list | None = None,
         root_id: str | None = None,
+        props: dict | None = None,
     ) -> dict:
         if self.post_raises:
             raise self.post_raises
+        self.next_post_id_counter += 1
+        pid = f"post-{self.next_post_id_counter}"
         self.posted.append({
             "channel_id": channel_id,
             "message": message,
             "file_ids": list(file_ids) if file_ids else [],
             "root_id": root_id,
+            "props": dict(props) if props else None,
         })
-        return {"id": self.next_post_id}
+        return {"id": pid}
 
 
 class PostCommandTests(unittest.TestCase):
@@ -329,6 +340,173 @@ class PostCommandTests(unittest.TestCase):
              patch("sys.stderr", io.StringIO()):
             with self.assertRaises(SystemExit):
                 cli.main()
+
+
+class CrossChannelMirrorTests(unittest.TestCase):
+    """`mm-bridge post --channel <other>` mirrors body in sender's channel."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sdir = Path(self.tmp.name) / "sessions"
+        self.cfg = Config(
+            mm_bot_token="t",
+            sidecar_dir=str(self.sdir),
+            state_file=f"{self.tmp.name}/state.json",
+            allowed_attachment_roots=[self.tmp.name],
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _invoke(
+        self,
+        fake_mm: FakeMM,
+        argv: list[str],
+        *,
+        session_id: str | None = "my-sess",
+        stdin: str = "",
+    ) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        env = {}
+        if session_id:
+            env["CLAUDE_SESSION_ID"] = session_id
+        with patch("sys.argv", argv), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch("mm_bridge.cli._make_mm_client", return_value=fake_mm), \
+             patch("sys.stdout", out), patch("sys.stderr", err), \
+             patch("sys.stdin", io.StringIO(stdin)), \
+             patch.dict("os.environ", env, clear=False) as osenv:
+            if session_id is None:
+                osenv.pop("CLAUDE_SESSION_ID", None)
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            return cm.exception.code, out.getvalue(), err.getvalue()
+
+    def test_cross_channel_post_creates_mirror_in_self_channel(self) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        mm = FakeMM(channels={"other-chan": {"id": "other-chan",
+                                              "name": "other-slug"}})
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "other-chan", "hello"],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 2)
+
+        original, mirror = mm.posted[0], mm.posted[1]
+        self.assertEqual(original["channel_id"], "other-chan")
+        self.assertEqual(original["message"], "hello")
+
+        self.assertEqual(mirror["channel_id"], "self-chan")
+        self.assertEqual(
+            mirror["message"],
+            "hello\n\n_→ also sent to ~other-slug~_",
+        )
+        self.assertEqual(
+            mirror["props"], {"from_bridge_cli": "cross-post-mirror"},
+        )
+        self.assertEqual(mirror["file_ids"], [])
+        self.assertIsNone(mirror["root_id"])
+
+    def test_original_cross_channel_post_carries_no_marker_props(self) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "other-chan", "hi"],
+        )
+        self.assertEqual(rc, 0)
+        original = mm.posted[0]
+        if original["props"] is not None:
+            self.assertNotIn("from_bridge_cli", original["props"])
+
+    def test_mirror_falls_back_to_channel_id_when_get_channel_raises(
+        self,
+    ) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        mm = FakeMM(get_channel_raises=RuntimeError("boom"))
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "other-chan", "hello"],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 2)
+        mirror = mm.posted[1]
+        self.assertEqual(
+            mirror["message"],
+            "hello\n\n_→ also sent to ~other-chan~_",
+        )
+
+    def test_mirror_includes_attachment_count_but_no_file_ids(self) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        f1 = Path(self.tmp.name) / "a.txt"
+        f1.write_text("x")
+        f2 = Path(self.tmp.name) / "b.txt"
+        f2.write_text("y")
+        mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
+        rc, _, _ = self._invoke(
+            mm,
+            [
+                "mm-bridge", "post", "--channel", "other-chan",
+                "--file", str(f1), "--file", str(f2), "hello",
+            ],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 2)
+        original, mirror = mm.posted[0], mm.posted[1]
+        self.assertEqual(original["file_ids"], ["f-1", "f-2"])
+        self.assertEqual(
+            mirror["message"],
+            "hello\n\n_→ also sent to ~other-slug~ with 2 attachment(s)_",
+        )
+        self.assertEqual(mirror["file_ids"], [])
+        # No re-upload: still only 2 uploads total.
+        self.assertEqual(len(mm.uploaded), 2)
+
+    def test_no_mirror_when_channel_equals_self_id(self) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        mm = FakeMM(channels={"self-chan": {"name": "self-slug"}})
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "self-chan", "hi"],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 1)
+
+    def test_no_mirror_when_no_channel_flag(self) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        mm = FakeMM()
+        rc, _, _ = self._invoke(mm, ["mm-bridge", "post", "hi"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 1)
+        self.assertEqual(mm.posted[0]["channel_id"], "self-chan")
+
+    def test_mirror_lands_in_senders_thread_when_session_is_thread_forked(
+        self,
+    ) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan", "self-root")
+        mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "other-chan", "hello"],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 2)
+        original, mirror = mm.posted[0], mm.posted[1]
+        # The cross-channel original is unaffected by the sender's own
+        # thread — it goes to other-chan at channel level (no --thread).
+        self.assertEqual(original["channel_id"], "other-chan")
+        self.assertIsNone(original["root_id"])
+        # The mirror lands inside the sender's own thread so it shows up
+        # in the same scrollback the human is watching.
+        self.assertEqual(mirror["channel_id"], "self-chan")
+        self.assertEqual(mirror["root_id"], "self-root")
+
+    def test_no_mirror_when_no_sidecar(self) -> None:
+        mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
+        rc, _, _ = self._invoke(
+            mm,
+            ["mm-bridge", "post", "--channel", "other-chan", "hi"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 1)
+        self.assertEqual(mm.posted[0]["channel_id"], "other-chan")
 
 
 if __name__ == "__main__":

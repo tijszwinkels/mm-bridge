@@ -470,8 +470,61 @@ def cmd_post(args: argparse.Namespace) -> int:
         print(f"Error: post failed: {exc}", file=sys.stderr)
         return 3
 
+    if args.channel:
+        _maybe_mirror_cross_channel_post(
+            mm, cfg, anchor.channel_id, body, file_ids,
+        )
+
     print(post["id"])
     return 0
+
+
+def _maybe_mirror_cross_channel_post(
+    mm, cfg: Config, target_channel_id: str,
+    body: str, file_ids: list[str],
+) -> None:
+    """Post a transcript-visibility mirror into the sender's own channel.
+
+    Only fires when the caller is inside a bridge-backed session AND the
+    explicit ``--channel`` differs from the session's own channel id. The
+    mirror is informational only — files are NOT re-uploaded — and carries
+    ``props.from_bridge_cli`` so the daemon dispatcher skips re-injecting
+    it into the sender's session as a user turn.
+    """
+    try:
+        sid = _current_session_id()
+        self_anchor = _resolve_anchor_from_session(cfg.sidecar_dir, sid)
+    except NotInMattermostChannel:
+        return
+    if self_anchor.channel_id == target_channel_id:
+        return
+
+    try:
+        slug = mm.get_channel(target_channel_id).get("name") or target_channel_id
+    except Exception:
+        logger.debug(
+            "get_channel(%s) failed; using bare id in mirror footer",
+            target_channel_id, exc_info=True,
+        )
+        slug = target_channel_id
+
+    parts = [f"→ also sent to ~{slug}~"]
+    if file_ids:
+        parts.append(f"with {len(file_ids)} attachment(s)")
+    footer = "_" + " ".join(parts) + "_"
+    mirror_body = f"{body}\n\n{footer}" if body else footer
+
+    try:
+        mm.post(
+            self_anchor.channel_id, mirror_body,
+            root_id=self_anchor.root_id,
+            props={"from_bridge_cli": "cross-post-mirror"},
+        )
+    except Exception:
+        logger.warning(
+            "cross-channel mirror post failed (target=%s, self=%s)",
+            target_channel_id, self_anchor.channel_id, exc_info=True,
+        )
 
 
 _DURATION_RE = re.compile(r"^(\d+)(m|h|d)$")
