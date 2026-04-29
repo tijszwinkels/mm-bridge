@@ -477,6 +477,26 @@ class CrossChannelMirrorTests(unittest.TestCase):
         self.assertEqual(len(mm.posted), 1)
         self.assertEqual(mm.posted[0]["channel_id"], "self-chan")
 
+    def test_mirror_lands_in_senders_thread_when_session_is_thread_forked(
+        self,
+    ) -> None:
+        sidecar.write(self.sdir, "my-sess", "self-chan", "self-root")
+        mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "other-chan", "hello"],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(mm.posted), 2)
+        original, mirror = mm.posted[0], mm.posted[1]
+        # The cross-channel original is unaffected by the sender's own
+        # thread — it goes to other-chan at channel level (no --thread).
+        self.assertEqual(original["channel_id"], "other-chan")
+        self.assertIsNone(original["root_id"])
+        # The mirror lands inside the sender's own thread so it shows up
+        # in the same scrollback the human is watching.
+        self.assertEqual(mirror["channel_id"], "self-chan")
+        self.assertEqual(mirror["root_id"], "self-root")
+
     def test_no_mirror_when_no_sidecar(self) -> None:
         mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
         rc, _, _ = self._invoke(
