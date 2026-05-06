@@ -292,3 +292,62 @@ def test_ws_posted_forwards_cross_identity_bot_post():
 
     assert len(captured) == 1
     assert captured[0]["id"] == "foreign-1"
+
+
+# ───────────────────── WS connection liveness ─────────────────────────────
+
+
+def test_ws_connect_passes_heartbeat_to_aiohttp():
+    """The WS opens with an aiohttp ``heartbeat`` so half-open TCP
+    sockets are detected and the outer reconnect loop can recover.
+
+    Without it, a silently-dropped TCP connection leaves the client
+    blocked in ``async for msg in ws`` forever — the symptom we hit
+    where MM events stopped flowing while HTTP API calls kept working.
+    """
+    driver = FakeDriver()
+    client = _make_client_with_driver(driver)
+
+    captured_kwargs: dict = {}
+
+    class FakeWS:
+        async def send_json(self, _):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class FakeWSCtx:
+        async def __aenter__(self):
+            return FakeWS()
+
+        async def __aexit__(self, *_):
+            return False
+
+    class FakeSession:
+        def ws_connect(self, url, **kwargs):
+            captured_kwargs.update(kwargs)
+            captured_kwargs["__url"] = url
+            return FakeWSCtx()
+
+    class FakeSessionCtx:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, *_):
+            return False
+
+    with patch("aiohttp.ClientSession", return_value=FakeSessionCtx()):
+        asyncio.run(client._ws_connect("wss://mm.example/ws", {}))
+
+    assert "heartbeat" in captured_kwargs, (
+        "ws_connect must be called with heartbeat= so half-open sockets are detected"
+    )
+    # Pin the value: aiohttp pongs wait heartbeat/2, so 30s gives ~45s
+    # worst-case detection — a deliberate trade between aggressive
+    # reconnects and silently stalled MM events. Drift here should be
+    # an explicit decision, not a silent edit.
+    assert captured_kwargs["heartbeat"] == 30
