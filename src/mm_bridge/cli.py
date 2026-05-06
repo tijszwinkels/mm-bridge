@@ -465,6 +465,12 @@ def cmd_post(args: argparse.Namespace) -> int:
             anchor.channel_id, body,
             file_ids=file_ids or None,
             root_id=root_id,
+            # The daemon's per-process own-post tracker only sees IDs
+            # created by *its own* MattermostClient. Without this marker,
+            # `mm-bridge post` posts would be forwarded into the linked
+            # session as a user turn (delayed, because VD queues them
+            # behind the agent's in-flight turn).
+            props={"from_bridge_cli": "post"},
         )
     except Exception as exc:
         print(f"Error: post failed: {exc}", file=sys.stderr)
@@ -833,9 +839,17 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     if not args.no_forward_prompt:
         try:
-            mm.post_message(
+            mm.post(
                 new_channel_id,
                 spawn_mod.format_spawn_kickoff(parent_name, args.prompt),
+                # VD already received `args.prompt` via `create_session`
+                # and delivers it as the new session's first user turn.
+                # The kickoff post is a visual record for the channel,
+                # not a duplicate user input — without this marker the
+                # daemon would forward it into the new session as a
+                # second copy of the prompt, queued behind the agent's
+                # in-flight first turn.
+                props={"from_bridge_cli": "spawn-kickoff"},
             )
         except Exception:
             logger.warning(

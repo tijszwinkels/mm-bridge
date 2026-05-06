@@ -132,6 +132,13 @@ class PostCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(mm.posted[0]["channel_id"], "sidecar-chan")
         self.assertIsNone(mm.posted[0]["root_id"])
+        # Same-channel posts must also carry the marker so the daemon's
+        # dispatcher skips the WS echo. This is the exact path that was
+        # looping `mm-bridge post "MILESTONE: ..."` calls back into the
+        # author's own session as a delayed user turn.
+        self.assertEqual(
+            mm.posted[0]["props"], {"from_bridge_cli": "post"},
+        )
 
     def test_no_channel_and_no_sidecar_exits_2(self) -> None:
         mm = FakeMM()
@@ -407,16 +414,23 @@ class CrossChannelMirrorTests(unittest.TestCase):
         self.assertEqual(mirror["file_ids"], [])
         self.assertIsNone(mirror["root_id"])
 
-    def test_original_cross_channel_post_carries_no_marker_props(self) -> None:
+    def test_original_post_carries_bridge_cli_marker_prop(self) -> None:
+        """Every ``mm-bridge post`` is authored by the CLI process; without
+        the marker the daemon's per-process own-post tracker can't suppress
+        the WS echo and forwards the post into the linked session as a
+        user turn (delayed, because VD queues it behind the agent's
+        in-flight turn). Both same-channel and cross-channel target posts
+        need to carry the marker; the cross-channel mirror has its own
+        marker value covered by the previous test."""
         sidecar.write(self.sdir, "my-sess", "self-chan")
         mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
         rc, _, _ = self._invoke(
             mm, ["mm-bridge", "post", "--channel", "other-chan", "hi"],
         )
         self.assertEqual(rc, 0)
-        original = mm.posted[0]
-        if original["props"] is not None:
-            self.assertNotIn("from_bridge_cli", original["props"])
+        self.assertEqual(
+            mm.posted[0]["props"], {"from_bridge_cli": "post"},
+        )
 
     def test_mirror_falls_back_to_channel_id_when_get_channel_raises(
         self,

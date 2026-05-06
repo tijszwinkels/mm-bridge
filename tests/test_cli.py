@@ -393,15 +393,14 @@ class SpawnCommandTests(unittest.TestCase):
         # Spawning from a channel-level session: announcement is not threaded.
         self.assertIsNone(posts_by_chan["parent-chan"]["root_id"])
 
-    def test_spawn_announcement_carries_bridge_cli_marker_prop(self) -> None:
-        """The parent-channel announcement is authored by the CLI — the
-        daemon's per-process own-post tracker does not know about it,
-        so without a marker prop it would forward the announcement to
-        the parent session as a user turn. Stamping
-        ``props.from_bridge_cli`` lets the daemon dispatcher skip it.
-        The kickoff post into the new child channel must NOT carry the
-        marker — the spawn flow relies on the daemon forwarding it as
-        the new session's first user message."""
+    def test_spawn_posts_carry_bridge_cli_marker_prop(self) -> None:
+        """Both spawn-authored posts (parent announcement and child kickoff)
+        are created by the CLI — the daemon's per-process own-post tracker
+        only sees IDs from its own MattermostClient, so without the marker
+        the WS echo would be forwarded to the linked session as a user turn.
+        VD already received ``args.prompt`` via ``create_session`` and
+        delivered it as the new session's first turn; the kickoff post is
+        a visual record for the channel, not a duplicate user input."""
         rc = self._invoke([
             "mm-bridge", "spawn", "fix the bug", "--title", "Bug Fix",
         ])
@@ -415,12 +414,10 @@ class SpawnCommandTests(unittest.TestCase):
         )
 
         kickoff = posts_by_chan["new-chan"]
-        # Load-bearing scope distinction: the kickoff goes through
-        # post_message() (no props arg), so the recorded fake post must
-        # not carry a `props` key at all. The daemon relies on this
-        # to forward the kickoff to the new session as the first user
-        # message — adding the marker here would silently break spawn.
-        self.assertNotIn("props", kickoff)
+        self.assertEqual(
+            kickoff.get("props"),
+            {"from_bridge_cli": "spawn-kickoff"},
+        )
 
     def test_spawn_without_title_does_not_rename(self) -> None:
         rc = self._invoke(["mm-bridge", "spawn", "ad hoc"])
