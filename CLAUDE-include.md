@@ -1,6 +1,8 @@
 ## Mattermost integration
 
-If `~/.mm-bridge/sessions/$CLAUDE_SESSION_ID` exists, you're running inside a Mattermost channel. Your assistant replies flow to the channel automatically — no explicit "post" needed. The bot account you post as is `@claude` in Mattermost (`/invite @claude` pulls you into a channel).
+If `~/.mm-bridge/sessions/$CLAUDE_SESSION_ID` exists (Claude Code) or `~/.mm-bridge/sessions/$MM_BRIDGE_SESSION_ID` exists (codex via VibeDeck), you're running inside a Mattermost channel. Your assistant replies flow to the channel automatically — no explicit "post" needed. The bot account you post as is `@claude` in Mattermost (`/invite @claude` pulls you into a channel).
+
+The bridge CLI resolves the current session id via three sources, in order: `CLAUDE_SESSION_ID` env → `MM_BRIDGE_SESSION_ID` env → cwd-matched codex rollout file (only adopted when a sidecar exists). Codex tool shells thus self-identify whether or not VibeDeck pinned the env var.
 
 - **CLI env (`MM_BOT_TOKEN` etc.).** Every `mm-bridge` subcommand that hits the MM API (`invite`, `spawn`, `channels`, `post`, `read`) needs `MM_BOT_TOKEN` (and `MM_URL`, `MM_TEAM`) in the environment. If you get `Error: MM_BOT_TOKEN environment variable is required`, source the repo's `.env`: `set -a; source ~/projects/mm-bridge/.env; set +a`.
 - **Getting human attention.** If the operator is in the channel, @mention them (`@username`). Otherwise — or if you're unsure — run `mm-bridge invite <username>` to pull them in. When multiple users are in the channel, each message is prefixed with `username:` — use the prefix to decide who to mention.

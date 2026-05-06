@@ -8,7 +8,13 @@ A daemon connects a Mattermost bot account (conventionally `@claude`) to a local
 - **A thread** inside a channel → its own *forked* session, so side-quests don't pollute the main conversation.
 - **`mm-bridge spawn "<prompt>"`** from inside a session → a fresh sibling channel with its own session, with the parent announced via a post that links the child's `~channel~` header back upstream.
 
-Each session gets a small **sidecar file** (`~/.mm-bridge/sessions/<session_id>`) so a Claude Code session running on the same machine can self-identify as "live in Mattermost" and use the CLI helpers (`invite`, `spawn`, `channel`).
+Each session gets a small **sidecar file** (`~/.mm-bridge/sessions/<session_id>`) so a Claude Code or codex session running on the same machine can self-identify as "live in Mattermost" and use the CLI helpers (`invite`, `spawn`, `channel`).
+
+The CLI discovers the current session id from one of three sources, in order:
+
+1. **`CLAUDE_SESSION_ID`** — populated by Claude Code's SessionStart hook (`~/.claude/hooks/export-session-id.sh`).
+2. **`MM_BRIDGE_SESSION_ID`** — backend-agnostic env var. VibeDeck pins this into the codex tool-shell environment via `-c shell_environment_policy.set` on `codex exec resume` and `codex fork`.
+3. **Cwd-matched codex rollout** — fallback that scans `~/.codex/sessions/.../rollout-*.jsonl` newest-first and picks the most recent rollout whose `payload.cwd` matches `os.getcwd()`. Only adopted when a sidecar exists for the candidate id; covers the very first turn of a fresh codex session and tool shells that outlive their codex parent.
 
 ## Install
 
@@ -124,7 +130,7 @@ mm-bridge serve
 
 ### `mm-bridge invite <username>`
 
-Inside a Claude Code session that already has a sidecar, invites a Mattermost user to the session's channel:
+Inside a Claude Code or codex session that already has a sidecar, invites a Mattermost user to the session's channel:
 
 ```bash
 mm-bridge invite tijs
