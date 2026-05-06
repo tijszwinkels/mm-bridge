@@ -394,7 +394,10 @@ class MattermostClient:
         handlers: dict[str, Callable[..., Awaitable[None]]],
     ) -> None:
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(url) as ws:
+            # heartbeat=30: aiohttp pings every 30s and raises on missed
+            # pongs, so a half-open TCP socket can't strand us in
+            # ``async for msg in ws`` — the outer reconnect loop kicks in.
+            async with session.ws_connect(url, heartbeat=30) as ws:
                 await ws.send_json({
                     "seq": 1,
                     "action": "authentication_challenge",
