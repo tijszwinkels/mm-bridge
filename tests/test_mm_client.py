@@ -346,5 +346,8 @@ def test_ws_connect_passes_heartbeat_to_aiohttp():
     assert "heartbeat" in captured_kwargs, (
         "ws_connect must be called with heartbeat= so half-open sockets are detected"
     )
-    assert isinstance(captured_kwargs["heartbeat"], (int, float))
-    assert captured_kwargs["heartbeat"] > 0
+    # Pin the value: aiohttp pongs wait heartbeat/2, so 30s gives ~45s
+    # worst-case detection — a deliberate trade between aggressive
+    # reconnects and silently stalled MM events. Drift here should be
+    # an explicit decision, not a silent edit.
+    assert captured_kwargs["heartbeat"] == 30
