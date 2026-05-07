@@ -16,7 +16,10 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from mm_bridge.codex_session import find_session_id_by_cwd
+from mm_bridge.codex_session import (
+    find_session_id_by_cwd,
+    iter_session_ids_by_cwd,
+)
 
 
 def _write_rollout(
@@ -197,6 +200,168 @@ class FindSessionIdByCwdTests(unittest.TestCase):
         self.assertEqual(
             find_session_id_by_cwd("/work/repo", sessions_root=self.root),
             "22222222-8888-7888-2222-888888888888",
+        )
+
+
+class IterSessionIdsByCwdTests(unittest.TestCase):
+    """``iter_session_ids_by_cwd`` yields *all* matches in mtime-desc order.
+
+    Lets the caller apply a sidecar-existence (or any other) gate per
+    candidate and continue to the next when the gate rejects — recovers
+    from the case where the newest cwd-matched rollout has no sidecar but
+    an older one does.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_yields_matches_newest_first(self) -> None:
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T09-00-00",
+            session_id="aaaaaaaa-1111-7111-aaaa-111111111111",
+            cwd="/work/repo",
+            mtime=1_000_000.0,
+        )
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T11-00-00",
+            session_id="bbbbbbbb-2222-7222-bbbb-222222222222",
+            cwd="/work/repo",
+            mtime=3_000_000.0,
+        )
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T10-00-00",
+            session_id="cccccccc-3333-7333-cccc-333333333333",
+            cwd="/work/repo",
+            mtime=2_000_000.0,
+        )
+        ids = list(iter_session_ids_by_cwd("/work/repo", sessions_root=self.root))
+        self.assertEqual(
+            ids,
+            [
+                "bbbbbbbb-2222-7222-bbbb-222222222222",
+                "cccccccc-3333-7333-cccc-333333333333",
+                "aaaaaaaa-1111-7111-aaaa-111111111111",
+            ],
+        )
+
+    def test_skips_non_matching_cwd(self) -> None:
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T09-00-00",
+            session_id="dddddddd-4444-7444-dddd-444444444444",
+            cwd="/elsewhere",
+            mtime=2_000_000.0,
+        )
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T08-00-00",
+            session_id="eeeeeeee-5555-7555-eeee-555555555555",
+            cwd="/work/repo",
+            mtime=1_000_000.0,
+        )
+        self.assertEqual(
+            list(iter_session_ids_by_cwd("/work/repo", sessions_root=self.root)),
+            ["eeeeeeee-5555-7555-eeee-555555555555"],
+        )
+
+    def test_empty_when_no_matches(self) -> None:
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T08-00-00",
+            session_id="ffffffff-6666-7666-ffff-666666666666",
+            cwd="/somewhere",
+        )
+        self.assertEqual(
+            list(iter_session_ids_by_cwd("/work/repo", sessions_root=self.root)),
+            [],
+        )
+
+    def test_empty_when_root_missing(self) -> None:
+        self.assertEqual(
+            list(
+                iter_session_ids_by_cwd(
+                    "/work/repo", sessions_root=self.root / "nope",
+                ),
+            ),
+            [],
+        )
+
+
+class CwdCanonicalizationTests(unittest.TestCase):
+    """Cwd matching tolerates symlinks, trailing slashes, and ``./`` paths.
+
+    Codex records ``payload.cwd`` as whatever path codex was invoked
+    with. The bridge CLI is invoked with whatever shell cwd the tool
+    shell happens to be in. Without canonicalisation, a symlinked path
+    on one side and the canonical path on the other would silently fail
+    to match.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / "sessions"
+
+    def test_trailing_slash_normalised(self) -> None:
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T10-00-00",
+            session_id="11111111-aaaa-7aaa-1111-aaaaaaaaaaaa",
+            cwd="/work/repo",
+        )
+        self.assertEqual(
+            find_session_id_by_cwd("/work/repo/", sessions_root=self.root),
+            "11111111-aaaa-7aaa-1111-aaaaaaaaaaaa",
+        )
+
+    def test_dot_segments_normalised(self) -> None:
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T10-00-00",
+            session_id="22222222-bbbb-7bbb-2222-bbbbbbbbbbbb",
+            cwd="/work/repo",
+        )
+        self.assertEqual(
+            find_session_id_by_cwd(
+                "/work/./repo", sessions_root=self.root,
+            ),
+            "22222222-bbbb-7bbb-2222-bbbbbbbbbbbb",
+        )
+
+    def test_symlinked_paths_match(self) -> None:
+        # Create a real directory and a symlink pointing at it. Record one
+        # path on the rollout side and query with the other.
+        real_dir = Path(self._tmp.name) / "real-cwd"
+        real_dir.mkdir()
+        link_dir = Path(self._tmp.name) / "linked-cwd"
+        link_dir.symlink_to(real_dir)
+
+        _write_rollout(
+            self.root,
+            yyyy="2026", mm="05", dd="06",
+            iso_ts="2026-05-06T10-00-00",
+            session_id="33333333-cccc-7ccc-3333-cccccccccccc",
+            cwd=str(link_dir),
+        )
+        # Querying via the canonical path should still match.
+        self.assertEqual(
+            find_session_id_by_cwd(
+                str(real_dir), sessions_root=self.root,
+            ),
+            "33333333-cccc-7ccc-3333-cccccccccccc",
         )
 
 

@@ -28,7 +28,7 @@ import json
 
 from . import sidecar, spawn as spawn_mod
 from .bridge import Bridge, resolve_attachment_path
-from .codex_session import find_session_id_by_cwd
+from .codex_session import iter_session_ids_by_cwd
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .vd_client import VibeDeckClient
@@ -89,12 +89,14 @@ def _current_session_id(sidecar_dir: Path | str | None = None) -> str:
          VibeDeck pins this into the codex tool-shell env via
          ``-c shell_environment_policy.set`` on resume/fork, so any tool
          shell from turn 2 onwards self-identifies cleanly.
-      3. Cwd-matched codex rollout file — fallback for the first-turn
-         case (where the launcher couldn't pre-pin the id, because codex
-         hadn't generated it yet) and for tool shells that outlive the
-         codex process. Only adopted when a sidecar exists at
-         ``sidecar_dir/<id>``, which avoids latching onto an unrelated
-         old codex session that happens to have run in this directory.
+      3. Cwd-matched codex rollout files — fallback for the first turn
+         (where the launcher couldn't pre-pin the id) and for tool
+         shells that outlive the codex process. Walks candidates in
+         most-recently-active order and adopts the first one whose
+         sidecar reads back as a valid channel anchor. The walk avoids
+         two failure modes the simpler "newest only" version had: an
+         unrelated non-bridge codex session being newest in the same
+         cwd, and a corrupt zero-byte sidecar from a crashed write.
 
     The fallback requires *sidecar_dir* — callers without a config
     handy get only the env-var paths.
@@ -106,9 +108,10 @@ def _current_session_id(sidecar_dir: Path | str | None = None) -> str:
     if sid:
         return sid
     if sidecar_dir is not None:
-        candidate = find_session_id_by_cwd(os.getcwd())
-        if candidate and (Path(sidecar_dir) / candidate).exists():
-            return candidate
+        sdir = Path(sidecar_dir)
+        for candidate in iter_session_ids_by_cwd(os.getcwd()):
+            if sidecar.read(sdir, candidate) is not None:
+                return candidate
     raise NotInMattermostChannel(
         "could not determine current session id — checked "
         "CLAUDE_SESSION_ID, MM_BRIDGE_SESSION_ID, and cwd-matched codex "
