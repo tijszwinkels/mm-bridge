@@ -28,6 +28,7 @@ import json
 
 from . import sidecar, spawn as spawn_mod
 from .bridge import Bridge, resolve_attachment_path
+from .codex_session import iter_session_ids_by_cwd
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .vd_client import VibeDeckClient
@@ -78,14 +79,45 @@ def _invite_to_channel(mm, channel_id: str, username: str) -> None:
     mm.invite_user(channel_id, user_id)
 
 
-def _current_session_id() -> str:
+def _current_session_id(sidecar_dir: Path | str | None = None) -> str:
+    """Resolve the current session id, trying multiple sources in order.
+
+    Resolver chain:
+      1. ``CLAUDE_SESSION_ID`` env var — set by the Claude Code SessionStart
+         hook (see ``~/.claude/hooks/export-session-id.sh``).
+      2. ``MM_BRIDGE_SESSION_ID`` env var — backend-agnostic contract.
+         VibeDeck pins this into the codex tool-shell env via
+         ``-c shell_environment_policy.set`` on resume/fork, so any tool
+         shell from turn 2 onwards self-identifies cleanly.
+      3. Cwd-matched codex rollout files — fallback for the first turn
+         (where the launcher couldn't pre-pin the id) and for tool
+         shells that outlive the codex process. Walks candidates in
+         most-recently-active order and adopts the first one whose
+         sidecar reads back as a valid channel anchor. The walk avoids
+         two failure modes the simpler "newest only" version had: an
+         unrelated non-bridge codex session being newest in the same
+         cwd, and a corrupt zero-byte sidecar from a crashed write.
+
+    The fallback requires *sidecar_dir* — callers without a config
+    handy get only the env-var paths.
+    """
     sid = os.environ.get("CLAUDE_SESSION_ID", "").strip()
-    if not sid:
-        raise NotInMattermostChannel(
-            "CLAUDE_SESSION_ID is not set — "
-            "this command only works inside a Claude Code session.",
-        )
-    return sid
+    if sid:
+        return sid
+    sid = os.environ.get("MM_BRIDGE_SESSION_ID", "").strip()
+    if sid:
+        return sid
+    if sidecar_dir is not None:
+        sdir = Path(sidecar_dir)
+        for candidate in iter_session_ids_by_cwd(os.getcwd()):
+            if sidecar.read(sdir, candidate) is not None:
+                return candidate
+    raise NotInMattermostChannel(
+        "could not determine current session id — checked "
+        "CLAUDE_SESSION_ID, MM_BRIDGE_SESSION_ID, and cwd-matched codex "
+        "rollout files. This command only works inside a Claude Code or "
+        "codex session linked to a Mattermost channel.",
+    )
 
 
 def _make_mm_client(cfg: Config) -> MattermostClient:
@@ -184,7 +216,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_channel(args: argparse.Namespace) -> int:
     cfg = Config.load()
     try:
-        session_id = _current_session_id()
+        session_id = _current_session_id(cfg.sidecar_dir)
         anchor = _resolve_anchor_from_session(cfg.sidecar_dir, session_id)
     except NotInMattermostChannel as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -198,7 +230,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
     _require_bot_token(cfg)
 
     try:
-        session_id = _current_session_id()
+        session_id = _current_session_id(cfg.sidecar_dir)
         channel_id = _resolve_anchor_from_session(
             cfg.sidecar_dir, session_id,
         ).channel_id
@@ -347,7 +379,9 @@ def _resolve_post_anchor(
     """
     if explicit_channel:
         return Anchor(explicit_channel, None)
-    return _resolve_anchor_from_session(cfg.sidecar_dir, _current_session_id())
+    return _resolve_anchor_from_session(
+        cfg.sidecar_dir, _current_session_id(cfg.sidecar_dir),
+    )
 
 
 def _resolve_effective_root(
@@ -498,7 +532,7 @@ def _maybe_mirror_cross_channel_post(
     it into the sender's session as a user turn.
     """
     try:
-        sid = _current_session_id()
+        sid = _current_session_id(cfg.sidecar_dir)
         self_anchor = _resolve_anchor_from_session(cfg.sidecar_dir, sid)
     except NotInMattermostChannel:
         return
@@ -739,7 +773,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     _require_bot_token(cfg)
 
     try:
-        parent_session_id = _current_session_id()
+        parent_session_id = _current_session_id(cfg.sidecar_dir)
         parent_anchor = _resolve_anchor_from_session(
             cfg.sidecar_dir, parent_session_id,
         )

@@ -124,6 +124,143 @@ class AnchorLookupTests(unittest.TestCase):
             cli._resolve_anchor_from_session(self.sdir, "sess-empty")
 
 
+class CurrentSessionIdTests(unittest.TestCase):
+    """`cli._current_session_id` — env-var-first resolver chain.
+
+    Order: ``CLAUDE_SESSION_ID`` → ``MM_BRIDGE_SESSION_ID`` → cwd-matched
+    codex rollout (only when a sidecar exists for the candidate id).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sdir = Path(self.tmp.name) / "sessions"
+        self.sdir.mkdir(parents=True)
+
+    def _empty_env(self) -> dict:
+        # patch.dict baseline that strips both session-id env vars.
+        return {"CLAUDE_SESSION_ID": "", "MM_BRIDGE_SESSION_ID": ""}
+
+    def test_claude_session_id_wins(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_SESSION_ID": "from-claude",
+             "MM_BRIDGE_SESSION_ID": "from-bridge"},
+        ):
+            self.assertEqual(cli._current_session_id(), "from-claude")
+
+    def test_mm_bridge_session_id_used_when_claude_absent(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_SESSION_ID": "", "MM_BRIDGE_SESSION_ID": "from-bridge"},
+        ):
+            self.assertEqual(cli._current_session_id(), "from-bridge")
+
+    def test_rollout_fallback_returns_id_when_sidecar_present(self) -> None:
+        sidecar.write(self.sdir, "codex-sid-007", "chan-007")
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter(["codex-sid-007"]),
+             ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir), "codex-sid-007",
+            )
+
+    def test_rollout_fallback_skipped_when_sidecar_absent(self) -> None:
+        # Resolver finds a candidate UUID but no sidecar → not adopted.
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter(["codex-sid-no-sidecar"]),
+             ):
+            with self.assertRaises(cli.NotInMattermostChannel):
+                cli._current_session_id(self.sdir)
+
+    def test_rollout_fallback_walks_until_sidecar_found(self) -> None:
+        """Newest cwd-match without a sidecar must not short-circuit.
+
+        Realistic scenario: a non-bridge codex session ran in the same
+        cwd recently and now has the newest rollout, but the actual
+        bridge-linked session is older. The resolver must keep looking.
+        """
+        sidecar.write(self.sdir, "codex-sid-old-but-linked", "chan-old")
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter([
+                     "codex-sid-newest-no-sidecar",
+                     "codex-sid-old-but-linked",
+                 ]),
+             ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir),
+                "codex-sid-old-but-linked",
+            )
+
+    def test_rollout_fallback_skips_empty_sidecar(self) -> None:
+        """An empty (corrupt) sidecar file must not satisfy the gate.
+
+        Use ``sidecar.read()`` for the gate, not ``Path.exists()`` — an
+        empty file would otherwise be adopted and then crash downstream
+        with an opaque error.
+        """
+        # Write a truly empty file at <sdir>/<sid> — ``Path.exists()`` is
+        # True but ``sidecar.read()`` returns None (no channel id).
+        self.sdir.mkdir(parents=True, exist_ok=True)
+        (self.sdir / "codex-sid-empty-sidecar").write_text("")
+        sidecar.write(self.sdir, "codex-sid-valid-but-older", "chan-real")
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter([
+                     "codex-sid-empty-sidecar",
+                     "codex-sid-valid-but-older",
+                 ]),
+             ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir),
+                "codex-sid-valid-but-older",
+            )
+
+    def test_rollout_fallback_skipped_when_sidecar_dir_not_passed(self) -> None:
+        # Without a sidecar_dir the resolver chain never reaches the
+        # rollout fallback — preserves the original error path for callers
+        # that haven't been migrated yet.
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter(["codex-sid-anything"]),
+             ) as mock_iter:
+            with self.assertRaises(cli.NotInMattermostChannel):
+                cli._current_session_id()
+            mock_iter.assert_not_called()
+
+    def test_raises_when_no_resolver_succeeds(self) -> None:
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter([]),
+             ):
+            with self.assertRaises(cli.NotInMattermostChannel):
+                cli._current_session_id(self.sdir)
+
+    def test_error_mentions_all_resolvers(self) -> None:
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter([]),
+             ):
+            try:
+                cli._current_session_id(self.sdir)
+            except cli.NotInMattermostChannel as exc:
+                msg = str(exc)
+            else:
+                self.fail("expected NotInMattermostChannel")
+        self.assertIn("CLAUDE_SESSION_ID", msg)
+        self.assertIn("MM_BRIDGE_SESSION_ID", msg)
+
+
 class BareInvocationTests(unittest.TestCase):
     """`mm-bridge` with no subcommand prints help and exits 1."""
 
@@ -166,8 +303,13 @@ class InviteCommandTests(unittest.TestCase):
     def test_invite_without_session_env_exits_nonzero(self) -> None:
         with patch("sys.argv", ["mm-bridge", "invite", "tijs"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
-             patch.dict("os.environ", {}, clear=False) as env:
+             patch.dict("os.environ", {}, clear=False) as env, \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter([]),
+             ):
             env.pop("CLAUDE_SESSION_ID", None)
+            env.pop("MM_BRIDGE_SESSION_ID", None)
             with self.assertRaises(SystemExit) as cm:
                 cli.main()
             self.assertNotEqual(cm.exception.code, 0)
@@ -221,6 +363,32 @@ class ChannelCommandTests(unittest.TestCase):
                 cli.main()
             self.assertEqual(cm.exception.code, 0)
         self.assertEqual(buf.getvalue().strip(), "my-channel")
+
+    def test_channel_falls_back_to_codex_rollout_when_env_absent(self) -> None:
+        """Codex tool shells with no session-id env can still resolve.
+
+        Mirrors the post-`mm-bridge spawn --backend codex` situation: env
+        vars unset, but the daemon has written a sidecar keyed by the
+        codex session id, and the resolver finds it via the cwd-matched
+        rollout file.
+        """
+        import io
+        sidecar.write(self.sdir, "codex-sess-xyz", "codex-chan-xyz")
+        buf = io.StringIO()
+        with patch("sys.argv", ["mm-bridge", "channel"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {}, clear=False) as env, \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter(["codex-sess-xyz"]),
+             ), \
+             patch("sys.stdout", buf):
+            env.pop("CLAUDE_SESSION_ID", None)
+            env.pop("MM_BRIDGE_SESSION_ID", None)
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(buf.getvalue().strip(), "codex-chan-xyz")
 
     def test_channel_from_thread_fork_session_prints_channel_id(self) -> None:
         """Thread-fork sessions must self-identify too (was broken before)."""
@@ -448,8 +616,13 @@ class SpawnCommandTests(unittest.TestCase):
     def test_spawn_without_session_env_exits_2(self) -> None:
         with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
-             patch.dict("os.environ", {}, clear=False) as env:
+             patch.dict("os.environ", {}, clear=False) as env, \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter([]),
+             ):
             env.pop("CLAUDE_SESSION_ID", None)
+            env.pop("MM_BRIDGE_SESSION_ID", None)
             with self.assertRaises(SystemExit) as cm:
                 cli.main()
             self.assertEqual(cm.exception.code, 2)
