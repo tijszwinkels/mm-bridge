@@ -127,8 +127,10 @@ class AnchorLookupTests(unittest.TestCase):
 class CurrentSessionIdTests(unittest.TestCase):
     """`cli._current_session_id` — env-var-first resolver chain.
 
-    Order: ``CLAUDE_SESSION_ID`` → ``MM_BRIDGE_SESSION_ID`` → cwd-matched
-    codex rollout (only when a sidecar exists for the candidate id).
+    Order: ``CLAUDE_SESSION_ID`` → ``MM_BRIDGE_SESSION_ID`` → live-codex
+    PPid tie-breaker → cwd-mtime walk over codex rollouts. The fallback
+    steps require a *sidecar_dir* and additionally gate every candidate
+    id on whether a sidecar exists for it.
     """
 
     def setUp(self) -> None:
@@ -136,6 +138,16 @@ class CurrentSessionIdTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.sdir = Path(self.tmp.name) / "sessions"
         self.sdir.mkdir(parents=True)
+        # Stub the PPid tie-breaker to None by default so tests don't
+        # accidentally read the test-runner's real /proc state. Tests
+        # that exercise the tie-breaker override this with their own
+        # patch.
+        ppid_patcher = patch(
+            "mm_bridge.cli.find_active_codex_rollout_uuid",
+            return_value=None,
+        )
+        self.mock_ppid = ppid_patcher.start()
+        self.addCleanup(ppid_patcher.stop)
 
     def _empty_env(self) -> dict:
         # patch.dict baseline that strips both session-id env vars.
@@ -223,6 +235,59 @@ class CurrentSessionIdTests(unittest.TestCase):
                 "codex-sid-valid-but-older",
             )
 
+    def test_ppid_tiebreaker_wins_over_mtime_walk(self) -> None:
+        """When a live codex parent is in our chain, the UUID it has
+        open beats whatever the cwd-mtime walk would have picked.
+
+        Realistic scenario from PR review: an idle same-cwd codex
+        session's rollout was just touched by an unrelated tool call,
+        so its mtime is newer than the active session's. Without the
+        tie-breaker, mm-bridge would route to the idle session's
+        channel; with it, the active session wins.
+        """
+        sidecar.write(self.sdir, "codex-from-ppid", "chan-active")
+        sidecar.write(self.sdir, "codex-from-mtime", "chan-stale")
+        self.mock_ppid.return_value = "codex-from-ppid"
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter(["codex-from-mtime"]),
+             ) as mock_iter:
+            self.assertEqual(
+                cli._current_session_id(self.sdir), "codex-from-ppid",
+            )
+            # Tie-breaker shortcut → mtime walk never consulted.
+            mock_iter.assert_not_called()
+
+    def test_ppid_tiebreaker_falls_through_when_no_sidecar(self) -> None:
+        """A codex parent UUID that has no sidecar (race window between
+        codex start and daemon writing the sidecar) must not block the
+        mtime walk — older candidates with sidecars stay reachable."""
+        sidecar.write(self.sdir, "codex-from-mtime", "chan-mtime")
+        self.mock_ppid.return_value = "codex-without-sidecar"
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter(["codex-from-mtime"]),
+             ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir), "codex-from-mtime",
+            )
+
+    def test_ppid_tiebreaker_none_uses_mtime_walk(self) -> None:
+        """No live codex ancestor (background task, macOS, etc.) — the
+        mtime walk takes over with its existing semantics."""
+        sidecar.write(self.sdir, "codex-from-mtime", "chan-mtime")
+        # Default-mocked tie-breaker already returns None.
+        with patch.dict("os.environ", self._empty_env()), \
+             patch(
+                 "mm_bridge.cli.iter_session_ids_by_cwd",
+                 return_value=iter(["codex-from-mtime"]),
+             ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir), "codex-from-mtime",
+            )
+
     def test_rollout_fallback_skipped_when_sidecar_dir_not_passed(self) -> None:
         # Without a sidecar_dir the resolver chain never reaches the
         # rollout fallback — preserves the original error path for callers
@@ -259,6 +324,7 @@ class CurrentSessionIdTests(unittest.TestCase):
                 self.fail("expected NotInMattermostChannel")
         self.assertIn("CLAUDE_SESSION_ID", msg)
         self.assertIn("MM_BRIDGE_SESSION_ID", msg)
+        self.assertIn("rollout", msg)
 
 
 class BareInvocationTests(unittest.TestCase):

@@ -28,7 +28,7 @@ import json
 
 from . import sidecar, spawn as spawn_mod
 from .bridge import Bridge, resolve_attachment_path
-from .codex_session import iter_session_ids_by_cwd
+from .codex_session import find_active_codex_rollout_uuid, iter_session_ids_by_cwd
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .vd_client import VibeDeckClient
@@ -89,16 +89,26 @@ def _current_session_id(sidecar_dir: Path | str | None = None) -> str:
          VibeDeck pins this into the codex tool-shell env via
          ``-c shell_environment_policy.set`` on resume/fork, so any tool
          shell from turn 2 onwards self-identifies cleanly.
-      3. Cwd-matched codex rollout files — fallback for the first turn
-         (where the launcher couldn't pre-pin the id) and for tool
-         shells that outlive the codex process. Walks candidates in
-         most-recently-active order and adopts the first one whose
-         sidecar reads back as a valid channel anchor. The walk avoids
-         two failure modes the simpler "newest only" version had: an
-         unrelated non-bridge codex session being newest in the same
-         cwd, and a corrupt zero-byte sidecar from a crashed write.
+      3. Live-codex parent (``/proc`` tie-breaker). When env vars miss,
+         walk the parent-pid chain looking for a live ``codex`` ancestor
+         and read the rollout filename from its open fds. This is the
+         in-turn case — first-turn tool shells, where the env wasn't
+         pinned yet — and it's the case where multiple codex sessions
+         share a cwd. Linux-only; macOS / no-``/proc`` falls through.
+      4. Cwd-matched codex rollout files. Mtime-ordered walk of rollouts
+         under ``~/.codex/sessions``; adopts the first candidate whose
+         sidecar reads back. Catches the cases (3) misses: shells that
+         outlive their codex parent (background tasks, stale shells)
+         and macOS hosts where ``/proc`` doesn't exist.
 
-    The fallback requires *sidecar_dir* — callers without a config
+    Why this order: the env-vars are authoritative when present.
+    Step (3) only fires when a codex process is actually in our
+    ancestor chain — that's the strongest "this shell belongs to that
+    session" signal we can get. Step (4)'s mtime ordering is a heuristic
+    that fails when an idle same-cwd session's rollout is newer than
+    the active session's; (3) prevents that miscall.
+
+    The fallback steps require *sidecar_dir* — callers without a config
     handy get only the env-var paths.
     """
     sid = os.environ.get("CLAUDE_SESSION_ID", "").strip()
@@ -109,14 +119,20 @@ def _current_session_id(sidecar_dir: Path | str | None = None) -> str:
         return sid
     if sidecar_dir is not None:
         sdir = Path(sidecar_dir)
+        # 3. PPid tie-breaker — live codex ancestor wins outright.
+        active_uuid = find_active_codex_rollout_uuid()
+        if active_uuid is not None and sidecar.read(sdir, active_uuid) is not None:
+            return active_uuid
+        # 4. Mtime walk — newest cwd-matched rollout with a sidecar.
         for candidate in iter_session_ids_by_cwd(os.getcwd()):
             if sidecar.read(sdir, candidate) is not None:
                 return candidate
     raise NotInMattermostChannel(
         "could not determine current session id — checked "
-        "CLAUDE_SESSION_ID, MM_BRIDGE_SESSION_ID, and cwd-matched codex "
-        "rollout files. This command only works inside a Claude Code or "
-        "codex session linked to a Mattermost channel.",
+        "CLAUDE_SESSION_ID, MM_BRIDGE_SESSION_ID, the codex parent's "
+        "open rollout file, and cwd-matched codex rollout files. This "
+        "command only works inside a Claude Code or codex session "
+        "linked to a Mattermost channel.",
     )
 
 
