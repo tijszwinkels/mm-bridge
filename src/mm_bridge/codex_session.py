@@ -220,11 +220,21 @@ def _rollout_uuid_for_pid(
 ) -> str | None:
     """Find the rollout-file UUID held open by codex *pid*, or ``None``.
 
-    Scans ``/proc/<pid>/fd/*`` symlinks. A target counts only when it
-    canonicalises to a path under *sessions_root* AND matches the
-    ``rollout-*-<uuid>.jsonl`` filename shape. The sessions-root check
-    keeps us from being fooled by a binary called ``codex`` that has
-    other unrelated files open.
+    Scans ``/proc/<pid>/fd/*`` symlinks for targets under *sessions_root*
+    matching the ``rollout-*-<uuid>.jsonl`` filename shape. The
+    sessions-root check keeps us from being fooled by a binary called
+    ``codex`` with other unrelated files open.
+
+    A single codex process can have **multiple** rollout fds open at
+    the same time — codex's review/fork/subagent workflows keep the
+    parent rollout open alongside the spawned subagent's. Returning the
+    first fd ``iterdir()`` happens to yield is non-deterministic and
+    routinely lands on the parent (wrong session). Resolve by picking
+    the candidate whose rollout file has the newest mtime: codex
+    appends to the active rollout on every event, so its mtime
+    overtakes the parent's within microseconds of the subagent
+    starting. Files that ``stat`` fails on (raced delete) sort below
+    any real-mtime candidate.
     """
     fd_dir = proc_root / str(pid) / "fd"
     try:
@@ -234,6 +244,7 @@ def _rollout_uuid_for_pid(
         return None
 
     sessions_root_str = _canonicalise(sessions_root)
+    candidates: list[tuple[float, str]] = []
     for entry in entries:
         try:
             target = os.readlink(entry)
@@ -244,9 +255,22 @@ def _rollout_uuid_for_pid(
                 and target_canon != sessions_root_str:
             continue
         match = _ROLLOUT_UUID_RE.search(os.path.basename(target_canon))
-        if match:
-            return match.group(1)
-    return None
+        if not match:
+            continue
+        try:
+            mtime = os.stat(target_canon).st_mtime
+        except OSError as exc:
+            logger.debug(
+                "codex_session: cannot stat rollout %s for pid=%s: %s",
+                target_canon, pid, exc,
+            )
+            mtime = 0.0
+        candidates.append((mtime, match.group(1)))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return candidates[0][1]
 
 
 def find_active_codex_rollout_uuid(

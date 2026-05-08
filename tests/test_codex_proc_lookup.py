@@ -70,6 +70,19 @@ def _rollout(sessions_root: Path, ymd: str, iso_ts: str, uuid: str) -> Path:
     return sessions_root / yyyy / mm / dd / f"rollout-{iso_ts}-{uuid}.jsonl"
 
 
+def _materialise(rollout_path: Path, mtime: float) -> Path:
+    """Create *rollout_path* on disk with the given mtime.
+
+    Used by tests that need ``os.stat()`` to succeed — the
+    multi-rollout-fd disambiguation walks `os.stat(target).st_mtime`
+    over each fd target, so the targets must exist and be stat-able.
+    """
+    rollout_path.parent.mkdir(parents=True, exist_ok=True)
+    rollout_path.write_text("")
+    os.utime(rollout_path, (mtime, mtime))
+    return rollout_path
+
+
 class FindActiveCodexRolloutUuidTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()
@@ -276,6 +289,48 @@ class FindActiveCodexRolloutUuidTests(unittest.TestCase):
                 proc_root=self.proc_root,
                 sessions_root=self.sessions_root,
             ),
+        )
+
+    def test_multiple_rollout_fds_picks_newest_mtime(self) -> None:
+        """Codex can hold parent + subagent rollouts open simultaneously.
+
+        Reproduces the bug observed during codex review: the review
+        subagent kept fds 32 and 56 pointing at the parent rollout
+        ``019e07df-4ea6...`` AND the subagent's own ``019e07df-4f01...``.
+        Returning the first ``iterdir()``-yielded fd would route to the
+        parent UUID and (if a sidecar exists) misroute commands to the
+        wrong Mattermost channel. The active subagent's rollout has the
+        newer mtime — codex appends to it on every event — so picking
+        by newest mtime resolves correctly.
+        """
+        parent_rollout = _materialise(
+            _rollout(
+                self.sessions_root, "2026-05-08",
+                "2026-05-08T15-55-35",
+                "019e07df-4ea6-7eb0-8eaa-5b7fe18807bf",
+            ),
+            mtime=1_700_000_000.0,
+        )
+        subagent_rollout = _materialise(
+            _rollout(
+                self.sessions_root, "2026-05-08",
+                "2026-05-08T15-55-35",
+                "019e07df-4f01-7762-ac84-16061809a810",
+            ),
+            mtime=1_700_000_010.0,  # 10s newer — subagent is the active writer
+        )
+        _make_proc_entry(
+            self.proc_root, 9000, comm="codex", ppid=1,
+            fds={32: str(parent_rollout), 56: str(subagent_rollout)},
+        )
+        _make_proc_entry(self.proc_root, 9001, comm="bash", ppid=9000)
+        self.assertEqual(
+            find_active_codex_rollout_uuid(
+                starting_pid=9001,
+                proc_root=self.proc_root,
+                sessions_root=self.sessions_root,
+            ),
+            "019e07df-4f01-7762-ac84-16061809a810",
         )
 
     def test_default_starting_pid_uses_getppid(self) -> None:
