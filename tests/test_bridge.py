@@ -472,17 +472,56 @@ class ForwardingTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.sent, [])
 
-    async def test_posted_with_from_bridge_cli_prop_is_skipped(self):
-        """Posts authored by the bridge CLI (e.g. ``mm-bridge spawn``'s
-        parent-channel announcement) carry a ``props.from_bridge_cli``
-        marker so the daemon can recognise them on the WS echo and
-        avoid forwarding them to the linked session as a user turn.
-        Without this, the parent session reads its own spawn
-        announcement back as if a human had typed it."""
+    async def test_posted_with_marker_and_matching_channel_is_skipped(self):
+        """Own-channel echo: a CLI-authored post (e.g. ``mm-bridge spawn``'s
+        parent-channel announcement, or ``mm-bridge post`` without
+        ``--channel``) records its origin channel. When that channel
+        matches the channel the post landed in, the dispatcher drops it
+        — the linked session would otherwise read its own bridge
+        artifact back as if a human had typed it."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": ":thread: Spawned ...",
+            "user_id": "u1", "type": "",
+            "props": {
+                "from_bridge_cli": "spawn-announcement",
+                "from_bridge_cli_channel": "c1",
+            },
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_posted_with_marker_and_mismatching_channel_forwards(self):
+        """Cross-channel agentcom: a CLI ``mm-bridge post --channel <other>``
+        records the SENDER's own channel id. When the post lands in a
+        different channel (the destination), the dispatcher must forward
+        it as a normal user turn so the recipient session receives the
+        message. This is the regression that broke claude/codex
+        cross-channel agentcom after the original marker drop landed."""
+        self.bridge.mapping.link(Anchor("c-target"), "s-target")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-target", "message": "Hello from sibling",
+            "user_id": "u1", "type": "",
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "c-sender",
+            },
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s-target", "Hello from sibling")])
+
+    async def test_posted_with_marker_and_no_channel_field_is_skipped(self):
+        """Backwards compat: posts that carry the marker but no
+        ``from_bridge_cli_channel`` (older CLI in flight, or any future
+        marker without an origin channel) preserve the original
+        drop-on-marker behaviour. The set of marker authors is
+        contained to this codebase, so we err on the safe side."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "legacy artifact",
             "user_id": "u1", "type": "",
             "props": {"from_bridge_cli": "spawn-announcement"},
         })

@@ -392,14 +392,23 @@ class Bridge:
         if _is_mm_system_post(post):
             return
         # Bridge CLI subcommands stamp `props.from_bridge_cli` on posts
-        # they author themselves (e.g. `mm-bridge spawn`'s parent-channel
-        # announcement). Those posts are visible to humans but must not
-        # be forwarded to the linked session as a user turn — the daemon
-        # didn't author them, so its per-process own-post tracker can't
-        # suppress the WS echo on its own.
+        # they author themselves (spawn's parent announcement, spawn's
+        # kickoff in the new channel, `mm-bridge post`, the cross-channel
+        # mirror). The marker pairs with `from_bridge_cli_channel`: the
+        # channel id of the session that should NOT see the post as a
+        # user turn — typically the channel the post lands in. We drop
+        # only when the recorded channel matches the post's channel
+        # (real own-channel echo); cross-channel agentcom posts carry
+        # the SENDER's channel id, which differs from the destination,
+        # so they pass through to the recipient session. Marker present
+        # without a channel field is treated as "drop" for backwards
+        # compatibility with older CLI processes in flight — the only
+        # authors of the marker live in this codebase.
         props = post.get("props") or {}
         if isinstance(props, dict) and props.get("from_bridge_cli"):
-            return
+            origin_channel = props.get("from_bridge_cli_channel")
+            if origin_channel is None or origin_channel == post["channel_id"]:
+                return
         message = (post.get("message") or "").strip()
         if not message and not post.get("file_ids"):
             return
