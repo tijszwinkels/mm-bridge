@@ -132,12 +132,17 @@ class PostCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(mm.posted[0]["channel_id"], "sidecar-chan")
         self.assertIsNone(mm.posted[0]["root_id"])
-        # Same-channel posts must also carry the marker so the daemon's
-        # dispatcher skips the WS echo. This is the exact path that was
-        # looping `mm-bridge post "MILESTONE: ..."` calls back into the
-        # author's own session as a delayed user turn.
+        # Same-channel posts carry the marker AND the sender's own channel
+        # id so the daemon recognises this as an own-channel echo and
+        # drops it. This is the exact path that was looping
+        # `mm-bridge post "MILESTONE: ..."` calls back into the author's
+        # own session as a delayed user turn.
         self.assertEqual(
-            mm.posted[0]["props"], {"from_bridge_cli": "post"},
+            mm.posted[0]["props"],
+            {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "sidecar-chan",
+            },
         )
 
     def test_no_channel_and_no_sidecar_exits_2(self) -> None:
@@ -408,29 +413,56 @@ class CrossChannelMirrorTests(unittest.TestCase):
             mirror["message"],
             "hello\n\n_→ also sent to ~other-slug~_",
         )
+        # The mirror is the sender's own-channel echo: marker + the
+        # sender's channel id (which equals the channel the mirror lands
+        # in) → daemon drops it on the sender's own session.
         self.assertEqual(
-            mirror["props"], {"from_bridge_cli": "cross-post-mirror"},
+            mirror["props"],
+            {
+                "from_bridge_cli": "cross-post-mirror",
+                "from_bridge_cli_channel": "self-chan",
+            },
         )
         self.assertEqual(mirror["file_ids"], [])
         self.assertIsNone(mirror["root_id"])
 
-    def test_original_post_carries_bridge_cli_marker_prop(self) -> None:
-        """Every ``mm-bridge post`` is authored by the CLI process; without
-        the marker the daemon's per-process own-post tracker can't suppress
-        the WS echo and forwards the post into the linked session as a
-        user turn (delayed, because VD queues it behind the agent's
-        in-flight turn). Both same-channel and cross-channel target posts
-        need to carry the marker; the cross-channel mirror has its own
-        marker value covered by the previous test."""
+    def test_cross_channel_original_carries_sender_channel_id(self) -> None:
+        """Cross-channel agentcom: when ``--channel <other>`` is given
+        from inside a bridge session, the original post carries the
+        marker AND the SENDER's own channel id. Because the post lands
+        in `<other>` (which is NOT the sender's channel), the daemon's
+        channel-scoped predicate forwards the post to the recipient
+        session as a user turn. This is the regression that broke
+        claude/codex cross-channel agentcom in PR #8."""
         sidecar.write(self.sdir, "my-sess", "self-chan")
         mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
         rc, _, _ = self._invoke(
             mm, ["mm-bridge", "post", "--channel", "other-chan", "hi"],
         )
         self.assertEqual(rc, 0)
+        self.assertEqual(mm.posted[0]["channel_id"], "other-chan")
         self.assertEqual(
-            mm.posted[0]["props"], {"from_bridge_cli": "post"},
+            mm.posted[0]["props"],
+            {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "self-chan",
+            },
         )
+
+    def test_post_without_session_omits_marker(self) -> None:
+        """A `mm-bridge post --channel <X>` call from a shell that is
+        NOT inside a bridge session has no own-channel echo to
+        suppress, so the CLI must omit the marker entirely. The daemon
+        then forwards the post normally to whatever session is linked
+        to <X>."""
+        mm = FakeMM()
+        rc, _, _ = self._invoke(
+            mm,
+            ["mm-bridge", "post", "--channel", "explicit-chan", "hi"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIsNone(mm.posted[0]["props"])
 
     def test_mirror_falls_back_to_channel_id_when_get_channel_raises(
         self,

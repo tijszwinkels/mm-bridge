@@ -400,6 +400,22 @@ def _resolve_post_anchor(
     )
 
 
+def _resolve_self_channel_id(cfg: Config) -> str | None:
+    """Return the channel id of the current session's bridge anchor, if any.
+
+    Used to stamp ``props.from_bridge_cli_channel`` on CLI-authored
+    posts. The recorded channel is the one whose linked session must
+    NOT see the post as a user turn (own-channel echo). When the CLI
+    is invoked from outside any bridge session, returns ``None`` and
+    the caller omits the marker — there is no echo to suppress.
+    """
+    try:
+        sid = _current_session_id(cfg.sidecar_dir)
+        return _resolve_anchor_from_session(cfg.sidecar_dir, sid).channel_id
+    except NotInMattermostChannel:
+        return None
+
+
 def _resolve_effective_root(
     anchor: Anchor, thread: str | None, no_thread: bool,
 ) -> str | None:
@@ -510,17 +526,26 @@ def cmd_post(args: argparse.Namespace) -> int:
             )
             return 3
 
+    # Marker only matters when the CLI is running inside a bridge
+    # session: the daemon's per-process own-post tracker can't suppress
+    # the WS echo for posts that the CLI authored, so we tag those
+    # posts with the SENDER's channel id. The dispatcher drops a
+    # tagged post iff it lands in the recorded channel (own-channel
+    # echo) — cross-channel posts pass through. From a non-session
+    # shell there is no echo concern, so emit no marker at all.
+    self_channel_id = _resolve_self_channel_id(cfg)
+    post_props: dict | None = None
+    if self_channel_id is not None:
+        post_props = {
+            "from_bridge_cli": "post",
+            "from_bridge_cli_channel": self_channel_id,
+        }
     try:
         post = mm.post(
             anchor.channel_id, body,
             file_ids=file_ids or None,
             root_id=root_id,
-            # The daemon's per-process own-post tracker only sees IDs
-            # created by *its own* MattermostClient. Without this marker,
-            # `mm-bridge post` posts would be forwarded into the linked
-            # session as a user turn (delayed, because VD queues them
-            # behind the agent's in-flight turn).
-            props={"from_bridge_cli": "post"},
+            props=post_props,
         )
     except Exception as exc:
         print(f"Error: post failed: {exc}", file=sys.stderr)
@@ -574,7 +599,15 @@ def _maybe_mirror_cross_channel_post(
         mm.post(
             self_anchor.channel_id, mirror_body,
             root_id=self_anchor.root_id,
-            props={"from_bridge_cli": "cross-post-mirror"},
+            # The mirror lands in the sender's own channel by design —
+            # it exists only for transcript visibility in the sender's
+            # session view. Recording the same channel id makes the
+            # daemon's predicate fire and drop it, instead of looping
+            # it back as a user turn.
+            props={
+                "from_bridge_cli": "cross-post-mirror",
+                "from_bridge_cli_channel": self_anchor.channel_id,
+            },
         )
     except Exception:
         logger.warning(
@@ -898,8 +931,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 # not a duplicate user input — without this marker the
                 # daemon would forward it into the new session as a
                 # second copy of the prompt, queued behind the agent's
-                # in-flight first turn.
-                props={"from_bridge_cli": "spawn-kickoff"},
+                # in-flight first turn. The recorded channel is the new
+                # channel itself so the daemon's channel-scoped
+                # predicate drops it on the new session.
+                props={
+                    "from_bridge_cli": "spawn-kickoff",
+                    "from_bridge_cli_channel": new_channel_id,
+                },
             )
         except Exception:
             logger.warning(
@@ -927,9 +965,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 # The daemon's per-process own-post tracker only sees
                 # IDs created by *its own* MattermostClient, so a CLI-
                 # authored post would otherwise be forwarded to the
-                # parent session as a user turn. The marker lets the
-                # dispatcher recognise and skip the WS echo.
-                props={"from_bridge_cli": "spawn-announcement"},
+                # parent session as a user turn. The recorded channel
+                # is the parent channel — the dispatcher's predicate
+                # drops it on the parent session via own-channel echo.
+                props={
+                    "from_bridge_cli": "spawn-announcement",
+                    "from_bridge_cli_channel": parent_channel_id,
+                },
             )
         except Exception:
             logger.warning(

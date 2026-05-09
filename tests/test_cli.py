@@ -634,7 +634,13 @@ class SpawnCommandTests(unittest.TestCase):
         the WS echo would be forwarded to the linked session as a user turn.
         VD already received ``args.prompt`` via ``create_session`` and
         delivered it as the new session's first turn; the kickoff post is
-        a visual record for the channel, not a duplicate user input."""
+        a visual record for the channel, not a duplicate user input.
+
+        Both posts also carry ``from_bridge_cli_channel`` set to the
+        channel they land in — the daemon's channel-scoped predicate
+        treats that as own-channel echo and drops them. (The kickoff is
+        also delivered via VD, so it must not arrive twice as a user
+        turn in the new session.)"""
         rc = self._invoke([
             "mm-bridge", "spawn", "fix the bug", "--title", "Bug Fix",
         ])
@@ -644,13 +650,19 @@ class SpawnCommandTests(unittest.TestCase):
         announcement = posts_by_chan["parent-chan"]
         self.assertEqual(
             announcement.get("props"),
-            {"from_bridge_cli": "spawn-announcement"},
+            {
+                "from_bridge_cli": "spawn-announcement",
+                "from_bridge_cli_channel": "parent-chan",
+            },
         )
 
         kickoff = posts_by_chan["new-chan"]
         self.assertEqual(
             kickoff.get("props"),
-            {"from_bridge_cli": "spawn-kickoff"},
+            {
+                "from_bridge_cli": "spawn-kickoff",
+                "from_bridge_cli_channel": "new-chan",
+            },
         )
 
     def test_spawn_without_title_does_not_rename(self) -> None:
