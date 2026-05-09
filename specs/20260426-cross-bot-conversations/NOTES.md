@@ -88,6 +88,19 @@ Possible fixes, in increasing order of complexity:
 Recommendation: marker prop — same idea as MM's own integration markers,
 no new transport.
 
+**Update 2026-05-10:** the bare marker (`from_bridge_cli` only) was
+extended to all `mm-bridge post` calls and broke cross-channel
+agentcom: posts authored from session A and addressed to channel B
+(via `--channel B`) were dropped by the dispatcher before reaching
+B's session. The fix pairs the marker with `from_bridge_cli_channel`
+— the channel id of the session that should NOT receive the post as
+a user turn (typically the channel the post lands in). The dispatcher
+drops only when the recorded channel matches the post's actual channel
+(real own-channel echo); cross-channel posts carry the SENDER's channel
+id, which differs from the destination, and pass through. From a
+non-session shell (no echo concern) the marker is omitted entirely.
+See `tests/test_bridge.py::ForwardingTests::test_posted_with_marker_and_*`.
+
 ### 3. Loop control — chosen approach: prompt-level `cslhi` (not bridge-side)
 
 We considered a bridge-side per-channel turn budget but explicitly rejected
