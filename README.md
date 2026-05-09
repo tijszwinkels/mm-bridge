@@ -10,11 +10,12 @@ A daemon connects a Mattermost bot account (conventionally `@claude`) to a local
 
 Each session gets a small **sidecar file** (`~/.mm-bridge/sessions/<session_id>`) so a Claude Code or codex session running on the same machine can self-identify as "live in Mattermost" and use the CLI helpers (`invite`, `spawn`, `channel`).
 
-The CLI discovers the current session id from one of three sources, in order:
+The CLI discovers the current session id from one of four sources, in order:
 
 1. **`CLAUDE_SESSION_ID`** — populated by Claude Code's SessionStart hook (`~/.claude/hooks/export-session-id.sh`).
 2. **`MM_BRIDGE_SESSION_ID`** — backend-agnostic env var. VibeDeck pins this into the codex tool-shell environment via `-c shell_environment_policy.set` on `codex exec resume` and `codex fork`.
-3. **Cwd-matched codex rollout** — fallback that scans `~/.codex/sessions/.../rollout-*.jsonl` in most-recently-active order and walks candidates whose `payload.cwd` matches the (canonicalised) caller cwd, adopting the first one whose sidecar reads back as a valid channel anchor. Helps tool shells whose codex launcher couldn't pre-pin the env var (typically the very first turn of a fresh session) and tool shells that outlive their codex parent. Note: there's a brief startup race between codex starting and the daemon writing the sidecar — if mm-bridge is invoked in that window the fallback fails cleanly with a "not in MM channel" error, which is the same behaviour the Claude Code path has had.
+3. **Live-codex parent (`/proc` tie-breaker)** — Linux-only. When env vars miss, walk the parent-pid chain (depth ≤ 8) for a process whose `/proc/<pid>/comm` is `codex` and read the rollout filename out of its open fds. The UUID embedded in that filename is adopted directly. This is what disambiguates the "multiple codex sessions in the same cwd" case: only the codex actually in our ancestor chain is the one we belong to. Returns nothing on macOS (no `/proc`), background tasks where the codex parent already exited, or when the codex ancestor has no rollout fd held open — those cases fall through to step 4.
+4. **Cwd-matched codex rollout** — final fallback that scans `~/.codex/sessions/.../rollout-*.jsonl` in most-recently-active order and walks candidates whose `payload.cwd` matches the (canonicalised) caller cwd, adopting the first one whose sidecar reads back as a valid channel anchor. Helps tool shells whose codex launcher couldn't pre-pin the env var (typically the very first turn of a fresh session) and tool shells that outlive their codex parent. Note: there's a brief startup race between codex starting and the daemon writing the sidecar — if mm-bridge is invoked in that window the fallback fails cleanly with a "not in MM channel" error, which is the same behaviour the Claude Code path has had.
 
 ## Install
 
