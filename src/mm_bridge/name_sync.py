@@ -1,4 +1,4 @@
-"""Bidirectional name-sync debouncer for the Mattermost <-> VibeDeck bridge.
+"""Bidirectional name-sync debouncer for bridge-side rename flows.
 
 When the bridge writes a rename to one side (e.g. MM), the remote server will
 reflect that change back as a ``channel_updated`` event. Without a debounce,

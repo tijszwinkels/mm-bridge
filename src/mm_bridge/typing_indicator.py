@@ -10,9 +10,8 @@ logger = logging.getLogger(__name__)
 
 class TypingIndicator:
     """Publish 'bot is typing' to Mattermost every `refresh_s` while a session
-    is running. Caller drives start/stop from VibeDeck's `session_status` SSE
-    events; a watchdog in the bridge can call `stop` if the event stream
-    goes silent.
+    is active. Caller drives start/stop from backend lifecycle/activity events;
+    a watchdog in the bridge can call `stop` if the event stream goes silent.
     """
 
     def __init__(self, mm_client, refresh_s: float):

@@ -2318,18 +2318,6 @@ class Bridge:
             await self.typing.stop(session_id)
         self._mention_triggerer_on_done(session_id)
 
-    async def _on_vd_session_status(self, data: dict) -> None:
-        """Compatibility wrapper for old tests during the backend port."""
-        session_id = data.get("session_id", "")
-        if data.get("running"):
-            await self._on_harness_run_lifecycle(
-                "run.started", {"session_id": session_id, "run_id": data.get("run_id")},
-            )
-            return
-        await self._on_harness_run_lifecycle(
-            "run.completed", {"session_id": session_id, "run_id": data.get("run_id")},
-        )
-
     def _mention_triggerer_on_done(self, session_id: str) -> None:
         """Post ``@<username>`` in the session's channel/thread so the user
         whose MM message triggered this run gets a push notification. No-op
