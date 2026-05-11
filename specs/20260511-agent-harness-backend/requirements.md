@@ -228,16 +228,22 @@ The purpose parser's `available_models_for(backend) → list[str]` callback
 keeps its signature, but the body is reduced to:
 
 1. Try `GET /v1/backends/{name}/models`. On 200, return `data: list[str]`.
-2. On 404 / network error, return `[]`.
+2. On 404 (unknown backend name) or network error, return `[]`.
 
-When the callback returns `[]`, the parser falls through its existing "could
-not parse … using defaults" path. The token is still recorded as
-`PurposeConfig.model` for new tokens that match no known list — i.e. the
-parser MUST accept the raw token as the model name (best-effort) so the
-operator can use models the bridge hasn't enumerated. **Note**: as of
-2026-05-11 the live harness returns 404 for `/v1/backends/claude-code/models`
-and `/v1/backends/codex/models`. This requirement covers both the "endpoint
-ships later" and "endpoint stays absent" worlds — flag for Echo.
+**Important — empty list semantics**: as of 2026-05-11 the live harness
+returns `200 {"data": []}` for both `claude-code` and `codex` because it
+has no authoritative model catalog yet (`unknown` backend names still
+return 404). The bridge MUST treat an empty `data` list as **"no catalog
+available"**, NOT **"no models supported"** — i.e. the parser still
+records unknown tokens as `PurposeConfig.model` and passes them verbatim
+to `POST /v1/sessions`. The parser MUST accept the raw token as the
+model name (best-effort) so the operator can use models the harness
+hasn't enumerated.
+
+When the callback returns `[]`, the parser falls through its existing
+"could not parse … using defaults" path while preserving the raw model
+token. The `test_parse_passes_unknown_model_through` test in §5 below
+guards this behaviour against future regression.
 
 ### US-5.4: Config + env rename
 
@@ -264,10 +270,13 @@ URL knob short.
 
 ### US-5.5: Health probe is best-effort
 
-Startup health log: try `GET /v1/sessions` and log the count, but never fail
-startup on a connection error (matches current VibeDeck behaviour at
-`bridge.py:285-289`). Harness has no documented `/health` endpoint as of
-2026-05-11; the list endpoint doubles as a liveness check.
+Startup health log: try `GET /v1/health` (live as of 2026-05-11, returns
+`200 {"status": "ok"}`) and log the status. Never fail startup on a
+connection error (matches current VibeDeck behaviour at `bridge.py:285-289`).
+
+If `/v1/health` returns 404 (legacy harness build), fall back to
+`GET /v1/sessions` as a connectivity probe. Both forms are best-effort
+and log-only.
 
 ### US-5.6: SSE reconnect uses `?after=<sequence>`
 
@@ -310,16 +319,16 @@ silently and just resumes following.
 - Persisting harness session ids across daemon restarts — already covered
   by the existing `ChannelMapping` state.
 
-## 8. Open questions for Aster / Echo
+## 8. Resolved questions
 
-1. **Endpoint gap** (Echo): is `GET /v1/backends/{name}/models` expected to
-   ship in the live harness, or is the OpenAPI listing aspirational? US-5.3
-   handles both worlds; just want a confirmation so design.md can settle
-   on a default expectation.
-2. **External-run interrupt UX** (Aster): on `@claude stop` for an external
-   session, do we prefer the friendly-text path (US-4.7) or attempt the
-   DELETE and surface the 409 body? Same observable behaviour; pick one for
-   the spec.
-3. **Health endpoint** (Echo): is there or will there be a `/v1/health` (or
-   `/v1/ping`) that's cheaper than `GET /v1/sessions`? Not blocking — US-5.5
-   uses the list endpoint as a fallback.
+All three open questions from the initial draft have been resolved by Echo
+and Aster between 2026-05-11 spec submission and sign-off:
+
+1. **`GET /v1/backends/{name}/models`** (Echo): live on `pillar:8877`,
+   returns `200 {"data": []}` for known backends (no catalog yet) and 404
+   for unknown names. Spec at US-5.3 covers the empty-list semantics.
+2. **External-run interrupt UX** (Aster): friendly-text path with NO DELETE
+   attempt when `current_run_id_by_session` is empty. design.md §2.7
+   already matches.
+3. **Health endpoint** (Echo): `GET /v1/health` live, returns
+   `200 {"status": "ok"}`. Spec at US-5.5 uses it as the primary probe.
