@@ -262,9 +262,37 @@ class MattermostClient:
             self._bot_user_id, self._team_id,
         )
 
+    # Page size for paginated team-channel listing. 200 is the Mattermost
+    # API's documented maximum (`per_page`), so it keeps round-trips
+    # bounded on teams up to a few thousand channels.
+    _PUBLIC_CHANNELS_PAGE_SIZE = 200
+    # Hard cap on the number of pages we'll fetch before giving up — a
+    # safety net against a misbehaving server returning full pages
+    # indefinitely. At 200 channels/page this still allows up to 10k
+    # channels per team before the cap kicks in.
+    _PUBLIC_CHANNELS_MAX_PAGES = 50
+
     def list_public_team_channels(self) -> list[dict]:
-        """List all public channels in the bot's team."""
-        return self._driver.channels.get_public_channels_for_team(self._team_id)
+        """List all public channels in the bot's team.
+
+        Pages through ``GET /teams/{team_id}/channels`` until a short or
+        empty page signals the end of the list. Without explicit
+        pagination, the Mattermost API defaults to ``per_page=60``,
+        which silently truncates the result on teams with >60 public
+        channels — the symptom was that newly-created public channels
+        beyond the first page were never auto-joined by the reconciler.
+        """
+        out: list[dict] = []
+        per_page = self._PUBLIC_CHANNELS_PAGE_SIZE
+        for page in range(self._PUBLIC_CHANNELS_MAX_PAGES):
+            chunk = self._driver.channels.get_public_channels_for_team(
+                self._team_id,
+                params={"page": page, "per_page": per_page},
+            ) or []
+            out.extend(chunk)
+            if len(chunk) < per_page:
+                break
+        return out
 
     def join_channel(self, channel_id: str) -> None:
         """Add the bot to `channel_id`."""
