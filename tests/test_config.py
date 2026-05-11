@@ -96,5 +96,38 @@ class PublicUrlTests(unittest.TestCase):
         self.assertEqual(cfg.mm_public_url, "https://mm.example.com")
 
 
+class DangerousPermissionsTests(unittest.TestCase):
+    """Bridge-owned dangerous-permissions config mirrors VibeDeck operator mode."""
+
+    def test_default_is_false(self) -> None:
+        cfg = Config()
+        self.assertFalse(cfg.dangerous_permissions)
+
+    def test_env_true_sets_dangerous_permissions(self) -> None:
+        cfg = Config()
+        with patch.dict(
+            "os.environ",
+            {"MM_BRIDGE_DANGEROUS_PERMISSIONS": "true"},
+            clear=True,
+        ):
+            cfg._apply_env()
+        self.assertTrue(cfg.dangerous_permissions)
+
+    def test_env_zero_clears_dangerous_permissions(self) -> None:
+        cfg = Config(dangerous_permissions=True)
+        with patch.dict(
+            "os.environ",
+            {"MM_BRIDGE_DANGEROUS_PERMISSIONS": "0"},
+            clear=True,
+        ):
+            cfg._apply_env()
+        self.assertFalse(cfg.dangerous_permissions)
+
+    def test_toml_sets_dangerous_permissions(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"dangerous_permissions": True})
+        self.assertTrue(cfg.dangerous_permissions)
+
+
 if __name__ == "__main__":
     unittest.main()

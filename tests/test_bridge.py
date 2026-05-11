@@ -35,6 +35,7 @@ class FakeMattermostClient:
     removed: list[str] = field(default_factory=list)
     typing: list[tuple[str, str | None]] = field(default_factory=list)
     uploaded: list[tuple[str, str]] = field(default_factory=list)
+    headers: list[tuple[str, str]] = field(default_factory=list)
     users: dict = field(default_factory=dict)
     posts_by_channel: dict = field(default_factory=dict)
     posts_by_id: dict = field(default_factory=dict)
@@ -102,7 +103,8 @@ class FakeMattermostClient:
         self.renames.append((channel_id, display_name))
 
     def set_channel_header(self, channel_id: str, header: str) -> None:
-        pass
+        self.headers.append((channel_id, header))
+        self.channels.setdefault(channel_id, {"id": channel_id})["header"] = header
 
     def set_channel_purpose(self, channel_id: str, purpose: str) -> None:
         self.channels.setdefault(channel_id, {"id": channel_id})["purpose"] = purpose
@@ -333,7 +335,10 @@ class InviteFlowTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-new")
         # No orphan auto-channel created by _create_channel_for_session
-        self.assertEqual(self.bridge.mm.channels, {"c1": {"id": "c1", "purpose": ""}})
+        # (the claim does write a Resume: line into c1's header — that's
+        # the resume-header feature, asserted separately; here we only
+        # care that no second channel was conjured up).
+        self.assertEqual(set(self.bridge.mm.channels), {"c1"})
 
     async def test_invite_sets_vd_session_title_from_mm_display_name(self):
         """On claim, the VD session title mirrors the MM channel's display_name."""
@@ -1522,6 +1527,96 @@ class SessionAddedClaimTests(_BridgeTestCase):
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "sess-new")
         self.assertNotIn("c1", self.bridge.pending_mm_sessions)
 
+    async def test_invite_claim_adds_claude_resume_header(self):
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude", "header": "Parent: ~root~",
+        }
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="claude",
+            initial_message="placeholder", requested_at=_time.monotonic(),
+        )
+
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-new", "projectPath": "/tmp/proj",
+            "firstMessage": "placeholder", "backend": "Claude Code",
+        })
+
+        self.assertEqual(
+            self.bridge.mm.channels["c1"]["header"],
+            "Parent: ~root~\nResume: claude --resume sess-new",
+        )
+        self.assertEqual(
+            self.bridge.mm.headers[-1],
+            ("c1", "Parent: ~root~\nResume: claude --resume sess-new"),
+        )
+
+    async def test_invite_claim_adds_codex_dangerous_resume_header(self):
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.config.dangerous_permissions = True
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "codex", "header": "",
+        }
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="codex",
+            initial_message="placeholder", requested_at=_time.monotonic(),
+        )
+
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-codex", "projectPath": "/tmp/proj",
+            "firstMessage": "placeholder", "backend": "Codex",
+        })
+
+        self.assertEqual(
+            self.bridge.mm.channels["c1"]["header"],
+            "Resume: codex resume sess-codex "
+            "--dangerously-bypass-approvals-and-sandbox",
+        )
+
+    async def test_invite_claim_unsupported_backend_leaves_header_unchanged(self):
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "pi", "header": "Operator note",
+        }
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="pi",
+            initial_message="placeholder", requested_at=_time.monotonic(),
+        )
+
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-pi", "projectPath": "/tmp/proj",
+            "firstMessage": "placeholder", "backend": "pi",
+        })
+
+        self.assertEqual(self.bridge.mm.channels["c1"]["header"], "Operator note")
+        self.assertEqual(self.bridge.mm.headers, [])
+
+    async def test_reconcile_resume_headers_refreshes_existing_mappings(self):
+        from mm_bridge.purpose import PurposeConfig
+
+        self.bridge.mapping.link(Anchor("c1"), "sess-codex")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1",
+            "purpose": "codex",
+            "header": "Parent: ~root~\nResume: codex resume old",
+        }
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="codex", model="gpt-5.4",
+        )
+
+        await self.bridge._reconcile_resume_headers()
+
+        self.assertEqual(
+            self.bridge.mm.channels["c1"]["header"],
+            "Parent: ~root~\nResume: codex resume sess-codex",
+        )
+
     async def test_session_added_without_pending_creates_channel(self):
         await self.bridge._on_vd_event("session_added", {
             "id": "sess-cli", "projectPath": "/tmp/proj",
@@ -1530,6 +1625,62 @@ class SessionAddedClaimTests(_BridgeTestCase):
 
         self.assertTrue(self.bridge.mapping.get_anchor("sess-cli"))
         self.assertTrue(self.bridge.mm.channels)
+
+    async def test_reconcile_uses_mm_purpose_when_cache_empty(self):
+        """After a daemon restart `purpose_by_channel` is empty, so reconcile
+        must re-parse the channel's persisted MM Purpose — otherwise it would
+        write a default-backend Resume line for codex/pi channels."""
+        self.bridge.mapping.link(Anchor("c1"), "sess-codex")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1",
+            "purpose": "codex, gpt-5.4",
+            "header": "",
+        }
+        # purpose_by_channel is intentionally NOT populated.
+
+        await self.bridge._reconcile_resume_headers()
+
+        self.assertEqual(
+            self.bridge.mm.channels["c1"]["header"],
+            "Resume: codex resume sess-codex",
+        )
+
+    async def test_reconcile_unsupported_mm_purpose_skips_header(self):
+        """A channel whose persisted MM Purpose names an unsupported backend
+        (e.g. `pi`) must NOT receive a default-backend Resume line during
+        reconcile."""
+        self.bridge.mapping.link(Anchor("c2"), "sess-pi")
+        self.bridge.mm.channels["c2"] = {
+            "id": "c2",
+            "purpose": "pi",
+            "header": "Operator note",
+        }
+
+        await self.bridge._reconcile_resume_headers()
+
+        self.assertEqual(self.bridge.mm.channels["c2"]["header"], "Operator note")
+        self.assertEqual(self.bridge.mm.headers, [])
+
+    async def test_auto_created_channel_for_cli_session_gets_resume_header(self):
+        """CLI-originated sessions are bound by creating a fresh MM channel
+        in `_create_channel_for_session`. That path must also set the
+        Resume line — otherwise the new feature is missing on this
+        binding path until a daemon restart."""
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-cli",
+            "projectPath": "/tmp/proj",
+            "projectName": "my-project",
+            "firstMessage": "hi from CLI",
+            "backend": "Codex",
+        })
+
+        anchor = self.bridge.mapping.get_anchor("sess-cli")
+        self.assertIsNotNone(anchor)
+        new_channel = self.bridge.mm.channels[anchor.channel_id]
+        self.assertEqual(
+            new_channel.get("header"),
+            "Resume: codex resume sess-cli",
+        )
 
 
 class ThreadForkTests(_BridgeTestCase):

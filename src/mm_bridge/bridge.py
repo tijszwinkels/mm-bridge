@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import attribution, directives, name_sync, purpose, vd_client
+from . import attribution, directives, name_sync, purpose, resume_header, vd_client
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .typing_indicator import TypingIndicator
@@ -292,6 +292,13 @@ class Bridge:
             "Connected — Mattermost (team=%s, bot=%s) + VibeDeck (%s)",
             self.config.mm_team, self.mm.bot_username, self.config.vd_url,
         )
+
+        try:
+            await self._reconcile_resume_headers()
+        except Exception:
+            logger.warning(
+                "resume-header: startup reconcile failed", exc_info=True,
+            )
 
         await asyncio.gather(
             self._run_mm_listener(),
@@ -1705,7 +1712,7 @@ class Bridge:
         if await self._claim_pending_invite(session_id, data):
             return
         # Otherwise — CLI-originated session: create a fresh channel.
-        self._create_channel_for_session(data)
+        await self._create_channel_for_session(data)
 
     def _expire_pending(self) -> None:
         now = time.monotonic()
@@ -1721,6 +1728,108 @@ class Bridge:
             p for p in self.pending_forks
             if now - p.requested_at < window
         ]
+
+    async def _update_resume_header(
+        self, channel_id: str, session_id: str, backend: str | None,
+    ) -> None:
+        """Best-effort: write a `Resume: <cmd>` line into the channel header.
+
+        Skipped (no MM calls made) when the backend has no resume command,
+        when the channel can't be fetched, or when the merge produces no
+        change. All errors are logged and swallowed — header writes must
+        never break the calling claim/reconcile path.
+
+        Accepts either a lowercase purpose token (`claude` / `codex`), the
+        ``vd_client.canon_backend`` output (`claudecode`), or a raw SSE
+        display string (`Claude Code`, `Codex`); normalised internally so
+        callers don't have to canonicalise at every entrypoint.
+        """
+        if not session_id:
+            return
+        canonical = resume_header.normalize_backend(backend)
+        if canonical is None:
+            return  # unsupported backend → leave header alone (US-2.5)
+        resume_line = resume_header.format_resume_line(
+            canonical, session_id, dangerous=self.config.dangerous_permissions,
+        )
+        if resume_line is None:
+            return  # defensive — already covered by the canonical guard above
+        try:
+            channel = self.mm.get_channel(channel_id)
+        except Exception:
+            logger.warning(
+                "resume-header: could not fetch channel %s", channel_id,
+                exc_info=True,
+            )
+            return
+        current = channel.get("header") or ""
+        merged = resume_header.merge_into_header(current, resume_line)
+        if merged == current:
+            return
+        try:
+            self.mm.set_channel_header(channel_id, merged)
+        except Exception:
+            logger.warning(
+                "resume-header: set_channel_header failed for %s", channel_id,
+                exc_info=True,
+            )
+
+    async def _reconcile_resume_headers(self) -> None:
+        """Refresh the Resume line on every channel-level mapping.
+
+        Runs once at startup. Thread-fork anchors are skipped — a fork
+        session lives inside a thread; setting the parent channel's
+        header to point at the fork would clobber the channel-session
+        resume command. Per-channel failures are logged and the loop
+        continues.
+        """
+        for anchor, session_id in list(self.mapping.anchor_to_session.items()):
+            if anchor.is_thread:
+                continue
+            backend = self._backend_for_channel(anchor.channel_id)
+            try:
+                await self._update_resume_header(
+                    anchor.channel_id, session_id, backend,
+                )
+            except Exception:
+                logger.warning(
+                    "resume-header: reconcile failed for %s", anchor.channel_id,
+                    exc_info=True,
+                )
+
+    def _backend_for_channel(self, channel_id: str) -> str | None:
+        """Backend used to resume a session in `channel_id`.
+
+        Resolution order:
+
+        1. The cached ``PurposeConfig`` (populated when the bridge
+           handled an invite/fork/spawn in this daemon's lifetime).
+        2. Re-parse the channel's persisted Mattermost Purpose. The
+           cache is empty after a daemon restart, and falling straight
+           to ``default_backend`` here would write the wrong Resume
+           command for codex/pi channels whose Purpose was set during
+           a previous run.
+        3. ``config.default_backend`` as a last resort (channels with
+           no Purpose at all).
+        """
+        cached = self.purpose_by_channel.get(channel_id)
+        if cached and cached.backend:
+            return cached.backend
+        try:
+            ch = self.mm.get_channel(channel_id)
+        except Exception:
+            return self.config.default_backend or None
+        raw = (ch.get("purpose") or "").strip()
+        if not raw:
+            return self.config.default_backend or None
+        parsed = purpose.parse(
+            raw,
+            default_backend=self.config.default_backend,
+            default_model=self.config.default_model,
+            available_models_for=lambda _b: [],
+            default_autorespond=self.config.default_autorespond,
+        )
+        return parsed.backend or self.config.default_backend or None
 
     async def _claim_pending_invite(self, session_id: str, data: dict) -> bool:
         self._expire_pending()
@@ -1779,6 +1888,9 @@ class Bridge:
                     "Failed to seed VD session title for %s", session_id[:8],
                     exc_info=True,
                 )
+        await self._update_resume_header(
+            channel_id, session_id, pending.backend,
+        )
         await self._flush_queued(channel_id, session_id, pending)
         return True
 
@@ -1860,7 +1972,7 @@ class Bridge:
                     pass
                 break
 
-    def _create_channel_for_session(self, data: dict) -> str | None:
+    async def _create_channel_for_session(self, data: dict) -> str | None:
         session_id = data.get("id") or data.get("session_id") or ""
         if not session_id:
             return None
@@ -1884,10 +1996,15 @@ class Bridge:
                 "Created channel %s (%s) for VD session %s",
                 display_name, channel_name, session_id[:12],
             )
-            return channel_id
         except Exception:
             logger.exception("Failed to create channel for session %s", session_id[:12])
             return None
+        # CLI-originated sessions get bound here rather than through
+        # `_claim_pending_invite`, so the Resume header has to be set
+        # explicitly. The SSE event carries the backend as a display name
+        # (`Claude Code`, `Codex`); `_update_resume_header` normalises it.
+        await self._update_resume_header(channel_id, session_id, data.get("backend"))
+        return channel_id
 
     # ----- VibeDeck message → Mattermost post -----
 
