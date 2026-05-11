@@ -1,13 +1,14 @@
-"""Channel-header resume command helpers.
+"""Channel-Purpose resume command helpers.
 
 Each Mattermost channel bound to a VibeDeck session gets a copy-pasteable
-``Resume: <cmd>`` line written into its Header field. The CLI shape
-depends on the backend; when the bridge daemon is configured for
-elevated permissions, the matching dangerous-permission flag is
-appended so a resumed local session matches the daemon's permission
-level.
+``cd <cwd> && <backend> --resume <id>`` command written into its Channel
+Purpose (trailing section, after the section separator defined in
+:mod:`mm_bridge.purpose`). The bridge daemon's
+``Config.dangerous_permissions`` controls whether the elevated-permission
+flag is appended so the resumed local session matches the daemon's
+permission level.
 
-Spec: ``specs/20260508-channel-header-resume-command/{requirements,design}.md``
+Spec: ``specs/20260511-resume-purpose-with-cwd/{requirements,design}.md``
 
 All helpers here are pure — no MM/VD client imports — so they are
 trivially covered by ``tests/test_resume_header.py``.
@@ -15,8 +16,13 @@ trivially covered by ``tests/test_resume_header.py``.
 
 from __future__ import annotations
 
+import shlex
 
-RESUME_PREFIX = "Resume: "
+from . import purpose
+
+
+RESUME_BLOCK_HEADING = "Resume:"
+_CODE_FENCE = "```"
 
 _RESUME_CMD_BY_BACKEND: dict[str, str] = {
     "claude": "claude --resume {sid}",
@@ -25,14 +31,14 @@ _RESUME_CMD_BY_BACKEND: dict[str, str] = {
 
 _DANGEROUS_FLAG_BY_BACKEND: dict[str, str] = {
     "claude": "--dangerously-skip-permissions",
-    "codex": "--dangerously-bypass-approvals-and-sandbox",
+    # Codex accepts `--yolo` as an undocumented short alias for
+    # `--dangerously-bypass-approvals-and-sandbox` (verified against
+    # codex-cli 0.128.0; the flag is hidden from `codex --help` but
+    # silently accepted by the CLI). Using the short form keeps the
+    # copy-pasted command terse.
+    "codex": "--yolo",
 }
 
-# Accepted aliases for each formatter backend token. Both the lowercase
-# Channel-Purpose token (`claude`, `codex`) and `vd_client.canon_backend`'s
-# output (`claudecode`, `codex`) — plus a few raw SSE display names — map
-# to a single formatter token here so callers don't have to canonicalise
-# at every entrypoint.
 _BACKEND_ALIASES: dict[str, str] = {
     "claude": "claude",
     "claudecode": "claude",
@@ -45,10 +51,11 @@ _BACKEND_ALIASES: dict[str, str] = {
 def normalize_backend(name: str | None) -> str | None:
     """Return the formatter token for `name`, or None if unsupported.
 
-    Accepts the lowercase purpose tokens, the canonical-form output of
-    ``vd_client.canon_backend``, and raw SSE display strings like
-    ``"Claude Code"``. Empty/unknown inputs return None so callers can
-    feed it directly into :func:`format_resume_command`.
+    Accepts the lowercase purpose tokens (`claude`, `codex`), the
+    canonical-form output of ``vd_client.canon_backend`` (`claudecode`),
+    and raw SSE display strings (`Claude Code`, `Codex`). Empty/unknown
+    inputs return None so callers can feed it directly into
+    :func:`format_resume_command`.
     """
     if not name:
         return None
@@ -58,13 +65,16 @@ def normalize_backend(name: str | None) -> str | None:
 def format_resume_command(
     backend: str,
     session_id: str,
+    cwd: str | None,
     *,
     dangerous: bool,
 ) -> str | None:
-    """Return the bare CLI command for `(backend, session_id)`, or None.
+    """Return the bare CLI command, or None for unsupported inputs.
 
-    Returns None for unsupported backends and for an empty ``session_id``
-    so callers can pass through without a special-case skip.
+    With a non-empty ``cwd``, the output is prefixed by
+    ``cd <quoted-cwd> && `` so the operator lands in the right directory
+    before resuming. Paths are shell-quoted via :mod:`shlex` so spaces and
+    metacharacters survive copy-paste.
     """
     if not session_id:
         return None
@@ -74,48 +84,46 @@ def format_resume_command(
     cmd = template.format(sid=session_id)
     if dangerous:
         cmd = f"{cmd} {_DANGEROUS_FLAG_BY_BACKEND[backend]}"
+    if cwd:
+        cmd = f"cd {shlex.quote(cwd)} && {cmd}"
     return cmd
 
 
-def format_resume_line(
+def format_resume_block(
     backend: str,
     session_id: str,
+    cwd: str | None,
     *,
     dangerous: bool,
 ) -> str | None:
-    """Return ``Resume: <cmd>`` or None if no command is available."""
-    cmd = format_resume_command(backend, session_id, dangerous=dangerous)
+    """Return the heading + fenced command block ready for Channel Purpose.
+
+    Shape::
+
+        Resume:
+        ```
+        cd <cwd> && <backend> --resume <id> [--dangerous-flag]
+        ```
+
+    Mattermost renders triple-backtick fences as a code block in the
+    channel-info panel, giving operators a one-click copy. Returns None
+    when the backend has no resume command or ``session_id`` is empty.
+    """
+    cmd = format_resume_command(backend, session_id, cwd, dangerous=dangerous)
     if cmd is None:
         return None
-    return f"{RESUME_PREFIX}{cmd}"
+    return f"{RESUME_BLOCK_HEADING}\n{_CODE_FENCE}\n{cmd}\n{_CODE_FENCE}"
 
 
-def merge_into_header(existing: str, resume_line: str | None) -> str:
-    """Combine an existing channel header with a fresh resume line.
+def merge_into_purpose(existing: str, resume_block: str | None) -> str:
+    """Combine an existing Channel Purpose with a fresh resume block.
 
-    Behaviour:
-
-    * ``resume_line is None`` → return ``existing`` unchanged. This keeps
-      operator-set content intact when the backend has no resume command
-      (US-2.5).
-    * Otherwise split ``existing`` on ``\\n``, strip per-line whitespace,
-      drop empty lines and any prior ``Resume:`` line, append the new
-      ``resume_line``, and re-join with ``\\n``.
-
-    The split/strip is tolerant of operator edits (e.g. extra spaces
-    around lines) without losing siblings like ``Parent: ~channel~`` or
-    free-form notes.
+    Strategy: split ``existing`` on the section separator defined in
+    :mod:`mm_bridge.purpose`, keep the config part untouched, and stitch
+    the new ``resume_block`` in as the trailing section. Passing
+    ``resume_block=None`` strips any existing trailing section and returns
+    only the config part — used when the bound session's backend has no
+    resume command (the operator's other Purpose content stays intact).
     """
-    if resume_line is None:
-        return existing
-
-    kept: list[str] = []
-    for raw in existing.split("\n"):
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith(RESUME_PREFIX):
-            continue
-        kept.append(line)
-    kept.append(resume_line)
-    return "\n".join(kept)
+    config_section, _existing_block = purpose.split_config_section(existing)
+    return purpose.join_sections(config_section, resume_block or "")

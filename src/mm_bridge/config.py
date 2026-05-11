@@ -102,14 +102,18 @@ class Config:
     name_sync_window_seconds: float = 10.0
 
     # Mirrors VibeDeck's `--dangerously-skip-permissions` mode. When True,
-    # the resume command written into each bridged channel's Header includes
-    # the matching elevated-permission flag (`--dangerously-skip-permissions`
-    # for claude, `--dangerously-bypass-approvals-and-sandbox` for codex),
-    # so resuming a session locally lands in the same permission state the
-    # daemon is running in. VibeDeck does not expose its own
-    # `_skip_permissions` state via a public API, so this is operator-owned;
-    # set it to match how `vibedeck` was launched.
-    dangerous_permissions: bool = False
+    # the resume command written into each bridged channel's Purpose
+    # includes the matching elevated-permission flag
+    # (`--dangerously-skip-permissions` for claude,
+    # `--dangerously-bypass-approvals-and-sandbox` for codex), so resuming
+    # a session locally lands in the same permission state the daemon is
+    # running in. VibeDeck does not expose its own `_skip_permissions`
+    # state via a public API, so this is operator-owned. Defaults to True
+    # because the typical operator runs the bridge alongside a
+    # `vibedeck --dangerously-skip-permissions` daemon; set
+    # ``MM_BRIDGE_DANGEROUS_PERMISSIONS=0`` (or the TOML key to false) to
+    # opt out for constrained deployments.
+    dangerous_permissions: bool = True
 
     @classmethod
     def load(cls) -> "Config":

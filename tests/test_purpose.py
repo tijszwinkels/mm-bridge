@@ -10,7 +10,10 @@ import pytest
 from mm_bridge.purpose import (
     KNOWN_BACKENDS,
     PurposeConfig,
+    SECTION_SEPARATOR,
+    join_sections,
     parse,
+    split_config_section,
     to_purpose_string,
 )
 
@@ -407,6 +410,81 @@ def test_to_purpose_string_parseable_again():
     assert reparsed.mention_only == orig.mention_only
     assert reparsed.cwd == orig.cwd
     assert reparsed.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Section split / join (config vs. resume block)
+# ---------------------------------------------------------------------------
+
+
+def test_section_separator_is_three_dashes():
+    assert SECTION_SEPARATOR == "---"
+
+
+@pytest.mark.parametrize(
+    ("text", "config", "rest"),
+    [
+        ("", "", ""),
+        ("claude, opus", "claude, opus", ""),
+        (
+            "claude, opus\n---\nResume:\n```cd /p && claude --resume s1```",
+            "claude, opus",
+            "Resume:\n```cd /p && claude --resume s1```",
+        ),
+        # Separator alone at the top → empty config, full body in rest.
+        ("---\nResume: ...", "", "Resume: ..."),
+        # Multiple separators — only the first one splits.
+        ("a\n---\nb\n---\nc", "a", "b\n---\nc"),
+        # Lines with trailing whitespace around the separator are tolerated.
+        ("config  \n  ---  \nresume", "config  ", "resume"),
+        # A line containing dashes but not just `---` doesn't trigger a split.
+        ("claude, opus\n--- not really ---\nstill config", "claude, opus\n--- not really ---\nstill config", ""),
+    ],
+)
+def test_split_config_section_pulls_config_before_separator(
+    text: str, config: str, rest: str,
+) -> None:
+    assert split_config_section(text) == (config, rest)
+
+
+@pytest.mark.parametrize(
+    ("config", "rest", "expected"),
+    [
+        ("", "", ""),
+        ("claude, opus", "", "claude, opus"),
+        ("", "Resume: …", "---\nResume: …"),
+        ("claude, opus", "Resume: …", "claude, opus\n\n---\n\nResume: …"),
+        # Strips leading/trailing whitespace per section.
+        ("  claude  ", "  Resume  ", "claude\n\n---\n\nResume"),
+    ],
+)
+def test_join_sections_canonical_layout(
+    config: str, rest: str, expected: str,
+) -> None:
+    assert join_sections(config, rest) == expected
+
+
+def test_section_split_join_roundtrip_preserves_payload():
+    """`split → join → split` is a no-op on the canonical layout."""
+    config, rest = "claude, opus, autorespond", "Resume:\n```cmd```"
+    rebuilt = join_sections(config, rest)
+    again = split_config_section(rebuilt)
+    assert again == (config, rest)
+
+
+def test_parse_ignores_resume_section():
+    """Tokens after the separator must not produce warnings or override config."""
+    text = (
+        "claude, opus, mention-only\n"
+        "---\n"
+        "Resume:\n"
+        "```\ncd /home/foo && claude --resume sess-123\n```\n"
+    )
+    cfg = parse(text, "claude", "opus", lambda b: ["opus", "haiku"])
+    assert cfg.backend == "claude"
+    assert cfg.model == "opus"
+    assert cfg.mention_only is True
+    assert cfg.warnings == []  # critical: no warnings from the resume body
 
 
 if __name__ == "__main__":

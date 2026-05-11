@@ -15,6 +15,16 @@ from typing import Callable
 
 KNOWN_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "pi", "opencode"})
 
+# A standalone line equal to this string splits the Channel Purpose into a
+# config section (parsed by `parse()`) and a trailing section reserved for
+# informational content such as the resume-command block written by
+# `resume_header`. Anything after the first standalone separator line is
+# ignored by `parse()`, so adding/refreshing a resume block never mutates
+# the parsed config — and the bridge can update either section
+# independently as long as it round-trips through `split_config_section`
+# and `join_sections`.
+SECTION_SEPARATOR = "---"
+
 MENTION_ONLY_TOKEN = "mention-only"
 NOAUTORESPOND_TOKEN = "noautorespond"  # synonym for mention-only
 AUTORESPOND_TOKEN = "autorespond"       # explicit mention_only=False
@@ -36,6 +46,40 @@ class PurposeConfig:
     mention_only: bool = False
     cwd: str | None = None
     warnings: list[str] = field(default_factory=list)
+
+
+def split_config_section(text: str) -> tuple[str, str]:
+    """Return ``(config, rest)`` split on the first standalone separator line.
+
+    A "standalone" separator is a line that equals ``SECTION_SEPARATOR``
+    after stripping surrounding whitespace. Both halves are separator-free.
+    Either may be empty. A line that contains ``---`` as part of a longer
+    string (e.g. ``"--- not really ---"``) does NOT trigger a split.
+    """
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip() == SECTION_SEPARATOR:
+            head = "\n".join(lines[:i]).rstrip("\n")
+            tail = "\n".join(lines[i + 1:]).strip("\n")
+            return head, tail
+    return text, ""
+
+
+def join_sections(config: str, rest: str) -> str:
+    """Glue a config section and a trailing section with a separator line.
+
+    Each side is stripped of surrounding whitespace. If either side is empty
+    the separator is omitted (so empty input round-trips cleanly through
+    ``split_config_section``). Layout uses blank lines around the separator
+    for readability in Mattermost's Purpose panel.
+    """
+    c = config.strip()
+    r = rest.strip()
+    if not r:
+        return c
+    if not c:
+        return f"{SECTION_SEPARATOR}\n{r}"
+    return f"{c}\n\n{SECTION_SEPARATOR}\n\n{r}"
 
 
 def _tokenize(purpose: str) -> list[str]:
@@ -110,7 +154,11 @@ def parse(
     """
     default_mention_only = not default_autorespond
 
-    raw_tokens = _tokenize(purpose)
+    # Ignore the resume-block trailing section — operators must be able to
+    # extend Purpose with documentation/links/code blocks without those
+    # generating spurious warnings or fighting the config parser.
+    config_section, _trailing = split_config_section(purpose)
+    raw_tokens = _tokenize(config_section)
 
     if not raw_tokens:
         return PurposeConfig(
