@@ -544,7 +544,7 @@ class WaitForNewSidecarTests(unittest.TestCase):
 
 
 class SpawnCommandTests(unittest.TestCase):
-    """End-to-end dispatch of `mm-bridge spawn` with mocked MM/VD/sidecar."""
+    """End-to-end dispatch of `mm-bridge spawn` with mocked MM/harness/sidecar."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -578,8 +578,8 @@ class SpawnCommandTests(unittest.TestCase):
     def _simulate_daemon_creates_sidecar(
         self, sess_id: str = "new-sess", chan_id: str = "new-chan",
     ):
-        """Return an async stub that mimics VD → daemon → sidecar appearance."""
-        async def _stub(vd_url, message, cwd, backend):
+        """Return an async stub that mimics harness → daemon → sidecar appearance."""
+        async def _stub(harness_url, message, cwd, backend):
             sidecar.write(self.sdir, sess_id, chan_id)
             return {"status": "started"}
         return _stub
@@ -592,7 +592,7 @@ class SpawnCommandTests(unittest.TestCase):
              ), \
              patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
              patch(
-                 "mm_bridge.cli._vd_create_session",
+                 "mm_bridge.cli._harness_create_session",
                  side_effect=self._simulate_daemon_creates_sidecar(),
              ):
             with self.assertRaises(SystemExit) as cm:
@@ -720,7 +720,7 @@ class SpawnCommandTests(unittest.TestCase):
              ), \
              patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
              patch(
-                 "mm_bridge.cli._vd_create_session",
+                 "mm_bridge.cli._harness_create_session",
                  side_effect=self._simulate_daemon_creates_sidecar(),
              ):
             with self.assertRaises(SystemExit) as cm:
@@ -744,7 +744,7 @@ class SpawnCommandTests(unittest.TestCase):
              ), \
              patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
              patch(
-                 "mm_bridge.cli._vd_create_session",
+                 "mm_bridge.cli._harness_create_session",
                  side_effect=self._simulate_daemon_creates_sidecar(),
              ):
             with self.assertRaises(SystemExit) as cm:
@@ -765,9 +765,9 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertIn("[thread](", header_text)
         self.assertIn("/pl/root-9", header_text)
 
-    def test_spawn_vd_failure_exits_3(self) -> None:
-        async def _boom(vd_url, message, cwd, backend):
-            raise RuntimeError("VD down")
+    def test_spawn_harness_failure_exits_3(self) -> None:
+        async def _boom(harness_url, message, cwd, backend):
+            raise RuntimeError("harness down")
         with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
              patch.dict(
@@ -776,7 +776,7 @@ class SpawnCommandTests(unittest.TestCase):
              patch(
                  "mm_bridge.cli._make_mm_client", return_value=self.fake_mm,
              ), \
-             patch("mm_bridge.cli._vd_create_session", side_effect=_boom):
+             patch("mm_bridge.cli._harness_create_session", side_effect=_boom):
             with self.assertRaises(SystemExit) as cm:
                 cli.main()
             self.assertEqual(cm.exception.code, 3)
