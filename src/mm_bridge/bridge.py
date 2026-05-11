@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import attribution, directives, name_sync, purpose, vd_client
+from . import attribution, directives, name_sync, purpose, resume_header, vd_client
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .typing_indicator import TypingIndicator
@@ -292,6 +292,13 @@ class Bridge:
             "Connected — Mattermost (team=%s, bot=%s) + VibeDeck (%s)",
             self.config.mm_team, self.mm.bot_username, self.config.vd_url,
         )
+
+        try:
+            await self._reconcile_resume_headers()
+        except Exception:
+            logger.warning(
+                "resume-header: startup reconcile failed", exc_info=True,
+            )
 
         await asyncio.gather(
             self._run_mm_listener(),
@@ -1713,6 +1720,79 @@ class Bridge:
             if now - p.requested_at < window
         ]
 
+    async def _update_resume_header(
+        self, channel_id: str, session_id: str, backend: str | None,
+    ) -> None:
+        """Best-effort: write a `Resume: <cmd>` line into the channel header.
+
+        Skipped (no MM calls made) when the backend has no resume command,
+        when the channel can't be fetched, or when the merge produces no
+        change. All errors are logged and swallowed — header writes must
+        never break the calling claim/reconcile path.
+        """
+        if not backend or not session_id:
+            return
+        resume_line = resume_header.format_resume_line(
+            backend, session_id, dangerous=self.config.dangerous_permissions,
+        )
+        if resume_line is None:
+            return  # unsupported backend → leave header alone (US-2.5)
+        try:
+            channel = self.mm.get_channel(channel_id)
+        except Exception:
+            logger.warning(
+                "resume-header: could not fetch channel %s", channel_id,
+                exc_info=True,
+            )
+            return
+        current = channel.get("header") or ""
+        merged = resume_header.merge_into_header(current, resume_line)
+        if merged == current:
+            return
+        try:
+            self.mm.set_channel_header(channel_id, merged)
+        except Exception:
+            logger.warning(
+                "resume-header: set_channel_header failed for %s", channel_id,
+                exc_info=True,
+            )
+
+    async def _reconcile_resume_headers(self) -> None:
+        """Refresh the Resume line on every channel-level mapping.
+
+        Runs once at startup. Thread-fork anchors are skipped — a fork
+        session lives inside a thread; setting the parent channel's
+        header to point at the fork would clobber the channel-session
+        resume command. Per-channel failures are logged and the loop
+        continues.
+        """
+        for anchor, session_id in list(self.mapping.anchor_to_session.items()):
+            if anchor.is_thread:
+                continue
+            backend = self._backend_for_channel(anchor.channel_id)
+            try:
+                await self._update_resume_header(
+                    anchor.channel_id, session_id, backend,
+                )
+            except Exception:
+                logger.warning(
+                    "resume-header: reconcile failed for %s", anchor.channel_id,
+                    exc_info=True,
+                )
+
+    def _backend_for_channel(self, channel_id: str) -> str | None:
+        """Backend used to resume a session in `channel_id`.
+
+        Prefer the parsed Channel Purpose (set when the session was
+        created); fall back to the daemon's configured default backend
+        so reconciliation still emits a Resume line for channels whose
+        purpose wasn't cached (e.g. mappings persisted across restarts).
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        if cfg and cfg.backend:
+            return cfg.backend
+        return self.config.default_backend or None
+
     async def _claim_pending_invite(self, session_id: str, data: dict) -> bool:
         self._expire_pending()
         incoming_cwd = _normalize_path(data.get("projectPath"))
@@ -1770,6 +1850,9 @@ class Bridge:
                     "Failed to seed VD session title for %s", session_id[:8],
                     exc_info=True,
                 )
+        await self._update_resume_header(
+            channel_id, session_id, pending.backend,
+        )
         await self._flush_queued(channel_id, session_id, pending)
         return True
 

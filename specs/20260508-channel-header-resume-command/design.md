@@ -48,14 +48,27 @@ existing header unchanged so unsupported backends satisfy US-2.5.
 
 ### `bridge.py` — claim paths
 
-Both `_claim_pending_invite` (around `bridge.py:1716`) and
-`_claim_pending_fork` (around `bridge.py:1776`) end with
+`_claim_pending_invite` (around `bridge.py:1716`) ends with
 `self.mapping.link(...)`. After a successful link, before the
 follow-up posts:
 
 ```python
 await self._update_resume_header(channel_id, session_id, pending_backend)
 ```
+
+**Implementation note — fork claims do NOT update the header.** An
+earlier draft of requirements US-3.1 listed `_claim_pending_fork` as a
+second write-point. On implementation we found this is wrong: a
+thread-fork session lives *inside* a thread, but the Mattermost header
+field is a channel-level attribute. Writing the fork session's resume
+command into the channel header would clobber the channel-session's
+own resume line every time someone started a thread, leaving the
+header pointing at a side-branch session rather than the primary
+channel session. So the wiring only triggers from `_claim_pending_invite`.
+Fork sessions remain addressable via the sidecar / `ig`-style lookups
+and don't need their resume command in the parent channel's topbar.
+`_reconcile_resume_headers` likewise skips thread anchors
+(`anchor.is_thread`).
 
 `_update_resume_header` is a small new method on the bridge:
 
