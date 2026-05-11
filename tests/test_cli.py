@@ -579,7 +579,8 @@ class SpawnCommandTests(unittest.TestCase):
         self, sess_id: str = "new-sess", chan_id: str = "new-chan",
     ):
         """Return an async stub that mimics harness → daemon → sidecar appearance."""
-        async def _stub(harness_url, message, cwd, backend):
+        async def _stub(harness_url, message, cwd, backend, model):
+            self.assertEqual(model, self.cfg.default_model)
             sidecar.write(self.sdir, sess_id, chan_id)
             return {"status": "started"}
         return _stub
@@ -766,7 +767,7 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertIn("/pl/root-9", header_text)
 
     def test_spawn_harness_failure_exits_3(self) -> None:
-        async def _boom(harness_url, message, cwd, backend):
+        async def _boom(harness_url, message, cwd, backend, model):
             raise RuntimeError("harness down")
         with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
