@@ -54,8 +54,8 @@ team = "workspace"
 # localhost but humans reach it via a Tailscale hostname.
 public_url = "http://pillar.tail72f2bc.ts.net:8065"
 
-[vibedeck]
-url = "http://localhost:8765"
+[agent_harness]
+url = "http://localhost:8877"
 
 # Session defaults applied when a new session is created.
 default_backend   = "claude"   # or "codex"
@@ -107,11 +107,11 @@ catch_up_max_n     = 500
 | `MM_PORT`, `MM_SCHEME`   | Override parts of the URL.                                         |
 | `MM_TEAM`                | Team slug the bot operates in.                                     |
 | `MM_PUBLIC_URL`          | User-facing base URL for permalinks (see TOML `public_url`).       |
-| `VD_URL`                 | VibeDeck server URL.                                               |
-| `VD_DEFAULT_CWD`         | Default working directory for new sessions.                        |
-| `VD_DEFAULT_BACKEND`     | `claude` or `codex`.                                               |
-| `VD_DEFAULT_MODEL`       | Model slug (empty string → unset).                                 |
-| `VD_DEFAULT_AUTORESPOND` | `1/true/yes/on` to enable autorespond by default.                  |
+| `AH_URL`                 | agent-harness server URL.                                          |
+| `MM_BRIDGE_DEFAULT_CWD`  | Default working directory for new sessions.                        |
+| `MM_BRIDGE_DEFAULT_BACKEND` | `claude` or `codex`.                                            |
+| `MM_BRIDGE_DEFAULT_MODEL` | Model slug (empty string → unset).                                |
+| `MM_BRIDGE_DEFAULT_AUTORESPOND` | `1/true/yes/on` to enable autorespond by default.           |
 | `MM_SHOW_TOOL_USE`       | Toggle `show_tool_use` without editing TOML.                       |
 | `MM_MIRROR_DIRECT_USER_MESSAGES` | Toggle `mirror_direct_user_messages` without editing TOML. |
 | `MM_AUTO_JOIN`           | Toggle `auto_join_public_channels` without editing TOML.           |
