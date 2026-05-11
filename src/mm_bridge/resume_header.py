@@ -1,6 +1,6 @@
 """Channel-Purpose resume command helpers.
 
-Each Mattermost channel bound to a VibeDeck session gets a copy-pasteable
+Each Mattermost channel bound to an agent session gets a copy-pasteable
 ``cd <cwd> && <backend> --resume <id>`` command written into its Channel
 Purpose (trailing section, after the section separator defined in
 :mod:`mm_bridge.purpose`). The bridge daemon's
@@ -10,7 +10,7 @@ permission level.
 
 Spec: ``specs/20260511-resume-purpose-with-cwd/{requirements,design}.md``
 
-All helpers here are pure — no MM/VD client imports — so they are
+All helpers here are pure — no MM/backend client imports — so they are
 trivially covered by ``tests/test_resume_header.py``.
 """
 
@@ -52,9 +52,8 @@ def normalize_backend(name: str | None) -> str | None:
     """Return the formatter token for `name`, or None if unsupported.
 
     Accepts the lowercase purpose tokens (`claude`, `codex`), the
-    canonical-form output of ``vd_client.canon_backend`` (`claudecode`),
-    and raw SSE display strings (`Claude Code`, `Codex`). Empty/unknown
-    inputs return None so callers can feed it directly into
+    historical canonical form (`claudecode`), and raw SSE display strings
+    (`Claude Code`, `Codex`). Empty/unknown inputs return None so callers can feed it directly into
     :func:`format_resume_command`.
     """
     if not name:
