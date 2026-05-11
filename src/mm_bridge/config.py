@@ -101,6 +101,16 @@ class Config:
     # Name-sync debounce window
     name_sync_window_seconds: float = 10.0
 
+    # Mirrors VibeDeck's `--dangerously-skip-permissions` mode. When True,
+    # the resume command written into each bridged channel's Header includes
+    # the matching elevated-permission flag (`--dangerously-skip-permissions`
+    # for claude, `--dangerously-bypass-approvals-and-sandbox` for codex),
+    # so resuming a session locally lands in the same permission state the
+    # daemon is running in. VibeDeck does not expose its own
+    # `_skip_permissions` state via a public API, so this is operator-owned;
+    # set it to match how `vibedeck` was launched.
+    dangerous_permissions: bool = False
+
     @classmethod
     def load(cls) -> "Config":
         """Precedence: class defaults < TOML file < env vars. Fatal on bad TOML."""
@@ -173,6 +183,7 @@ class Config:
             "typing_stop_after_silence_seconds",
             "pending_session_merge_window_seconds",
             "name_sync_window_seconds",
+            "dangerous_permissions",
         ):
             if key in data:
                 setattr(self, key, data[key])
@@ -240,6 +251,11 @@ class Config:
             self.state_file = env["MM_BRIDGE_STATE"]
         if "MM_BRIDGE_SIDECAR_DIR" in env:
             self.sidecar_dir = env["MM_BRIDGE_SIDECAR_DIR"]
+        if "MM_BRIDGE_DANGEROUS_PERMISSIONS" in env:
+            self.dangerous_permissions = (
+                env["MM_BRIDGE_DANGEROUS_PERMISSIONS"].strip().lower()
+                in ("1", "true", "yes", "on")
+            )
 
 
 @dataclass(frozen=True)
