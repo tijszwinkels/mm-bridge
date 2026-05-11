@@ -36,6 +36,7 @@ class FakeMattermostClient:
     typing: list[tuple[str, str | None]] = field(default_factory=list)
     uploaded: list[tuple[str, str]] = field(default_factory=list)
     headers: list[tuple[str, str]] = field(default_factory=list)
+    purposes: list[tuple[str, str]] = field(default_factory=list)
     users: dict = field(default_factory=dict)
     posts_by_channel: dict = field(default_factory=dict)
     posts_by_id: dict = field(default_factory=dict)
@@ -107,6 +108,7 @@ class FakeMattermostClient:
         self.channels.setdefault(channel_id, {"id": channel_id})["header"] = header
 
     def set_channel_purpose(self, channel_id: str, purpose: str) -> None:
+        self.purposes.append((channel_id, purpose))
         self.channels.setdefault(channel_id, {"id": channel_id})["purpose"] = purpose
 
     def get_channel(self, channel_id: str) -> dict:
@@ -1527,7 +1529,10 @@ class SessionAddedClaimTests(_BridgeTestCase):
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "sess-new")
         self.assertNotIn("c1", self.bridge.pending_mm_sessions)
 
-    async def test_invite_claim_adds_claude_resume_header(self):
+    async def test_invite_claim_writes_claude_resume_block_to_purpose(self):
+        """Default `dangerous_permissions=True` → include the elevated flag.
+        Block lives in Purpose under the section separator; Header is left
+        alone (operator content like `Parent: ~root~` stays untouched)."""
         from mm_bridge.bridge import PendingMattermostSession
         import time as _time
 
@@ -1545,19 +1550,27 @@ class SessionAddedClaimTests(_BridgeTestCase):
         })
 
         self.assertEqual(
-            self.bridge.mm.channels["c1"]["header"],
-            "Parent: ~root~\nResume: claude --resume sess-new",
+            self.bridge.mm.channels["c1"]["purpose"],
+            "claude\n"
+            "\n"
+            "---\n"
+            "\n"
+            "Resume:\n"
+            "```\n"
+            "cd /tmp/proj && claude --resume sess-new "
+            "--dangerously-skip-permissions\n"
+            "```",
         )
-        self.assertEqual(
-            self.bridge.mm.headers[-1],
-            ("c1", "Parent: ~root~\nResume: claude --resume sess-new"),
-        )
+        # Header is NOT touched.
+        self.assertEqual(self.bridge.mm.channels["c1"]["header"], "Parent: ~root~")
+        self.assertEqual(self.bridge.mm.headers, [])
 
-    async def test_invite_claim_adds_codex_dangerous_resume_header(self):
+    async def test_invite_claim_without_dangerous_permissions_omits_flag(self):
+        """Operator opted out via `dangerous_permissions=False` → no flag."""
         from mm_bridge.bridge import PendingMattermostSession
         import time as _time
 
-        self.bridge.config.dangerous_permissions = True
+        self.bridge.config.dangerous_permissions = False
         self.bridge.mm.channels["c1"] = {
             "id": "c1", "purpose": "codex", "header": "",
         }
@@ -1572,12 +1585,21 @@ class SessionAddedClaimTests(_BridgeTestCase):
         })
 
         self.assertEqual(
-            self.bridge.mm.channels["c1"]["header"],
-            "Resume: codex resume sess-codex "
-            "--dangerously-bypass-approvals-and-sandbox",
+            self.bridge.mm.channels["c1"]["purpose"],
+            "codex\n"
+            "\n"
+            "---\n"
+            "\n"
+            "Resume:\n"
+            "```\n"
+            "cd /tmp/proj && codex resume sess-codex\n"
+            "```",
         )
 
-    async def test_invite_claim_unsupported_backend_leaves_header_unchanged(self):
+    async def test_invite_claim_unsupported_backend_leaves_purpose_unchanged(self):
+        """`pi` is a known purpose token but has no resume command — the
+        bridge must not write to Purpose at all (no spurious clobber of
+        the operator-set config section)."""
         from mm_bridge.bridge import PendingMattermostSession
         import time as _time
 
@@ -1594,28 +1616,41 @@ class SessionAddedClaimTests(_BridgeTestCase):
             "firstMessage": "placeholder", "backend": "pi",
         })
 
-        self.assertEqual(self.bridge.mm.channels["c1"]["header"], "Operator note")
-        self.assertEqual(self.bridge.mm.headers, [])
+        self.assertEqual(self.bridge.mm.channels["c1"]["purpose"], "pi")
+        self.assertEqual(self.bridge.mm.purposes, [])
 
-    async def test_reconcile_resume_headers_refreshes_existing_mappings(self):
-        from mm_bridge.purpose import PurposeConfig
-
+    async def test_reconcile_resume_purposes_uses_vd_meta_for_cwd_and_backend(self):
+        """Reconcile is the only path that runs after a daemon restart, so
+        backend + cwd both come from VibeDeck's session metadata. The
+        pre-existing resume block is replaced, the config section preserved."""
         self.bridge.mapping.link(Anchor("c1"), "sess-codex")
         self.bridge.mm.channels["c1"] = {
             "id": "c1",
-            "purpose": "codex",
-            "header": "Parent: ~root~\nResume: codex resume old",
+            "purpose": (
+                "codex\n\n---\n\nResume:\n```\ncd /old && codex resume old\n```"
+            ),
+            "header": "Parent: ~root~",
         }
-        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
-            backend="codex", model="gpt-5.4",
-        )
+        self.bridge.vd.sessions_meta = [
+            {"id": "sess-codex", "projectPath": "/srv/new", "backend": "Codex"},
+        ]
 
-        await self.bridge._reconcile_resume_headers()
+        await self.bridge._reconcile_resume_purposes()
 
         self.assertEqual(
-            self.bridge.mm.channels["c1"]["header"],
-            "Parent: ~root~\nResume: codex resume sess-codex",
+            self.bridge.mm.channels["c1"]["purpose"],
+            "codex\n"
+            "\n"
+            "---\n"
+            "\n"
+            "Resume:\n"
+            "```\n"
+            "cd /srv/new && codex resume sess-codex "
+            "--dangerously-bypass-approvals-and-sandbox\n"
+            "```",
         )
+        # Header is NOT touched by reconcile.
+        self.assertEqual(self.bridge.mm.channels["c1"]["header"], "Parent: ~root~")
 
     async def test_session_added_without_pending_creates_channel(self):
         await self.bridge._on_vd_event("session_added", {
@@ -1626,46 +1661,56 @@ class SessionAddedClaimTests(_BridgeTestCase):
         self.assertTrue(self.bridge.mapping.get_anchor("sess-cli"))
         self.assertTrue(self.bridge.mm.channels)
 
-    async def test_reconcile_uses_mm_purpose_when_cache_empty(self):
-        """After a daemon restart `purpose_by_channel` is empty, so reconcile
-        must re-parse the channel's persisted MM Purpose — otherwise it would
-        write a default-backend Resume line for codex/pi channels."""
+    async def test_reconcile_falls_back_to_mm_purpose_when_vd_meta_missing(self):
+        """If VibeDeck doesn't know about the session (stale mapping), the
+        reconcile pass still emits a Resume block by re-parsing the MM
+        Purpose for the backend. Cwd is omitted (no source to trust)."""
         self.bridge.mapping.link(Anchor("c1"), "sess-codex")
         self.bridge.mm.channels["c1"] = {
             "id": "c1",
             "purpose": "codex, gpt-5.4",
             "header": "",
         }
-        # purpose_by_channel is intentionally NOT populated.
+        self.bridge.vd.sessions_meta = []  # VD doesn't know this session.
 
-        await self.bridge._reconcile_resume_headers()
+        await self.bridge._reconcile_resume_purposes()
 
         self.assertEqual(
-            self.bridge.mm.channels["c1"]["header"],
-            "Resume: codex resume sess-codex",
+            self.bridge.mm.channels["c1"]["purpose"],
+            "codex, gpt-5.4\n"
+            "\n"
+            "---\n"
+            "\n"
+            "Resume:\n"
+            "```\n"
+            "codex resume sess-codex "
+            "--dangerously-bypass-approvals-and-sandbox\n"
+            "```",
         )
 
-    async def test_reconcile_unsupported_mm_purpose_skips_header(self):
+    async def test_reconcile_unsupported_mm_purpose_skips_write(self):
         """A channel whose persisted MM Purpose names an unsupported backend
-        (e.g. `pi`) must NOT receive a default-backend Resume line during
-        reconcile."""
+        (e.g. `pi`) must NOT have its Purpose touched during reconcile."""
         self.bridge.mapping.link(Anchor("c2"), "sess-pi")
         self.bridge.mm.channels["c2"] = {
             "id": "c2",
             "purpose": "pi",
             "header": "Operator note",
         }
+        self.bridge.vd.sessions_meta = [
+            {"id": "sess-pi", "projectPath": "/srv", "backend": "pi"},
+        ]
 
-        await self.bridge._reconcile_resume_headers()
+        await self.bridge._reconcile_resume_purposes()
 
-        self.assertEqual(self.bridge.mm.channels["c2"]["header"], "Operator note")
-        self.assertEqual(self.bridge.mm.headers, [])
+        self.assertEqual(self.bridge.mm.channels["c2"]["purpose"], "pi")
+        self.assertEqual(self.bridge.mm.purposes, [])
 
-    async def test_auto_created_channel_for_cli_session_gets_resume_header(self):
+    async def test_auto_created_channel_for_cli_session_gets_resume_block(self):
         """CLI-originated sessions are bound by creating a fresh MM channel
-        in `_create_channel_for_session`. That path must also set the
-        Resume line — otherwise the new feature is missing on this
-        binding path until a daemon restart."""
+        in `_create_channel_for_session`. That path writes the Resume
+        block straight into the newly-created Purpose using the SSE
+        backend + projectPath, without waiting for a daemon restart."""
         await self.bridge._on_vd_event("session_added", {
             "id": "sess-cli",
             "projectPath": "/tmp/proj",
@@ -1678,8 +1723,49 @@ class SessionAddedClaimTests(_BridgeTestCase):
         self.assertIsNotNone(anchor)
         new_channel = self.bridge.mm.channels[anchor.channel_id]
         self.assertEqual(
-            new_channel.get("header"),
-            "Resume: codex resume sess-cli",
+            new_channel.get("purpose"),
+            "VibeDeck session sess-cli\n"
+            "\n"
+            "---\n"
+            "\n"
+            "Resume:\n"
+            "```\n"
+            "cd /tmp/proj && codex resume sess-cli "
+            "--dangerously-bypass-approvals-and-sandbox\n"
+            "```",
+        )
+
+    async def test_persist_purpose_preserves_existing_resume_section(self):
+        """`_persist_purpose` is the canonical-write path for config changes
+        (autorespond toggle, model swap). It must NOT clobber an existing
+        resume block — that block lives below the section separator and
+        the bridge owns the bottom half independently of config edits."""
+        from mm_bridge.purpose import PurposeConfig
+
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1",
+            "purpose": (
+                "claude, opus\n"
+                "\n"
+                "---\n"
+                "\n"
+                "Resume:\n```\ncd /tmp && claude --resume s1\n```"
+            ),
+        }
+        cfg = PurposeConfig(
+            backend="claude", model="sonnet", mention_only=True,
+        )
+        self.bridge._persist_purpose("c1", cfg)
+
+        new = self.bridge.mm.channels["c1"]["purpose"]
+        # Config section is rewritten in canonical form...
+        config_section, resume_section = new.split("\n\n---\n\n", 1)
+        self.assertIn("sonnet", config_section)
+        self.assertIn("mention-only", config_section)
+        # ...and the resume section is preserved verbatim.
+        self.assertEqual(
+            resume_section,
+            "Resume:\n```\ncd /tmp && claude --resume s1\n```",
         )
 
 

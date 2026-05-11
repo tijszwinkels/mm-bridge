@@ -294,10 +294,10 @@ class Bridge:
         )
 
         try:
-            await self._reconcile_resume_headers()
+            await self._reconcile_resume_purposes()
         except Exception:
             logger.warning(
-                "resume-header: startup reconcile failed", exc_info=True,
+                "resume-purpose: startup reconcile failed", exc_info=True,
             )
 
         await asyncio.gather(
@@ -1033,12 +1033,28 @@ class Bridge:
     ) -> None:
         """Write the canonical form of `cfg` back to the MM channel's Purpose.
 
-        Marks the resulting `channel_updated` event as self-triggered so the
-        bridge doesn't post a "purpose changed" notice to itself.
+        Preserves any trailing resume block below the section separator —
+        that block is owned by ``_update_resume_purpose`` and lives
+        independently of the config tokens. Without the preserve step,
+        any operator-triggered config change (autorespond toggle, model
+        swap) would silently strip the resume block until the next daemon
+        restart.
+
+        Marks the resulting `channel_updated` event as self-triggered so
+        the bridge doesn't post a "purpose changed" notice to itself.
         """
-        serialized = purpose.to_purpose_string(
+        config_section = purpose.to_purpose_string(
             cfg, default_autorespond=self.config.default_autorespond,
         )
+        try:
+            ch = self.mm.get_channel(channel_id)
+        except Exception:
+            resume_section = ""
+        else:
+            _, resume_section = purpose.split_config_section(
+                ch.get("purpose") or "",
+            )
+        serialized = purpose.join_sections(config_section, resume_section)
         self._note_self_wrote_purpose(channel_id, serialized)
         try:
             self.mm.set_channel_purpose(channel_id, serialized)
@@ -1729,73 +1745,116 @@ class Bridge:
             if now - p.requested_at < window
         ]
 
-    async def _update_resume_header(
-        self, channel_id: str, session_id: str, backend: str | None,
+    async def _update_resume_purpose(
+        self,
+        channel_id: str,
+        session_id: str,
+        backend: str | None,
+        cwd: str | None,
     ) -> None:
-        """Best-effort: write a `Resume: <cmd>` line into the channel header.
+        """Best-effort: refresh the Resume block in the channel Purpose.
 
-        Skipped (no MM calls made) when the backend has no resume command,
-        when the channel can't be fetched, or when the merge produces no
-        change. All errors are logged and swallowed — header writes must
-        never break the calling claim/reconcile path.
+        Reads current Purpose, swaps the trailing resume section for a
+        fresh one (preserving the config section above the separator),
+        and writes back. Skipped (no MM call) when the backend has no
+        resume command, the channel fetch fails, or the merge produces
+        no change. All errors are logged and swallowed — Purpose writes
+        must never break the calling claim/reconcile path.
 
-        Accepts either a lowercase purpose token (`claude` / `codex`), the
-        ``vd_client.canon_backend`` output (`claudecode`), or a raw SSE
-        display string (`Claude Code`, `Codex`); normalised internally so
-        callers don't have to canonicalise at every entrypoint.
+        The backend argument accepts purpose tokens, canon names, and
+        raw SSE display strings; normalisation happens inside
+        :func:`resume_header.format_resume_block`.
         """
         if not session_id:
             return
         canonical = resume_header.normalize_backend(backend)
         if canonical is None:
-            return  # unsupported backend → leave header alone (US-2.5)
-        resume_line = resume_header.format_resume_line(
-            canonical, session_id, dangerous=self.config.dangerous_permissions,
+            return  # unsupported backend — leave Purpose alone.
+        block = resume_header.format_resume_block(
+            canonical, session_id, cwd,
+            dangerous=self.config.dangerous_permissions,
         )
-        if resume_line is None:
-            return  # defensive — already covered by the canonical guard above
+        if block is None:
+            return  # defensive — covered by the canonical guard above
         try:
             channel = self.mm.get_channel(channel_id)
         except Exception:
             logger.warning(
-                "resume-header: could not fetch channel %s", channel_id,
+                "resume-purpose: could not fetch channel %s", channel_id,
                 exc_info=True,
             )
             return
-        current = channel.get("header") or ""
-        merged = resume_header.merge_into_header(current, resume_line)
+        current = channel.get("purpose") or ""
+        merged = resume_header.merge_into_purpose(current, block)
         if merged == current:
             return
+        # The MM channel_updated event we receive after our own write would
+        # otherwise be mistaken for an operator edit; tag it as self-written
+        # so the bridge skips its "purpose changed" notice post.
+        self._note_self_wrote_purpose(channel_id, merged)
         try:
-            self.mm.set_channel_header(channel_id, merged)
+            self.mm.set_channel_purpose(channel_id, merged)
         except Exception:
             logger.warning(
-                "resume-header: set_channel_header failed for %s", channel_id,
+                "resume-purpose: set_channel_purpose failed for %s", channel_id,
                 exc_info=True,
             )
 
-    async def _reconcile_resume_headers(self) -> None:
-        """Refresh the Resume line on every channel-level mapping.
+    async def _reconcile_resume_purposes(self) -> None:
+        """Refresh the Resume block on every channel-level mapping.
 
-        Runs once at startup. Thread-fork anchors are skipped — a fork
-        session lives inside a thread; setting the parent channel's
-        header to point at the fork would clobber the channel-session
-        resume command. Per-channel failures are logged and the loop
-        continues.
+        Runs once at startup. Pulls each session's metadata from VibeDeck
+        so the resume command points at the right backend AND cwd even
+        after a daemon restart (when ``purpose_by_channel`` is empty and
+        the persisted MM Purpose may not name a backend either). Falls
+        back to the MM Purpose for backend resolution when VD doesn't
+        know the session. Thread-fork anchors are skipped — a fork
+        session lives inside a thread; writing its resume command into
+        the parent channel's Purpose would clobber the channel session's
+        own block.
         """
         for anchor, session_id in list(self.mapping.anchor_to_session.items()):
             if anchor.is_thread:
                 continue
-            backend = self._backend_for_channel(anchor.channel_id)
+            backend, cwd = await self._resume_meta_for(anchor.channel_id, session_id)
             try:
-                await self._update_resume_header(
-                    anchor.channel_id, session_id, backend,
+                await self._update_resume_purpose(
+                    anchor.channel_id, session_id, backend, cwd,
                 )
             except Exception:
                 logger.warning(
-                    "resume-header: reconcile failed for %s", anchor.channel_id,
+                    "resume-purpose: reconcile failed for %s", anchor.channel_id,
                     exc_info=True,
                 )
+
+    async def _resume_meta_for(
+        self, channel_id: str, session_id: str,
+    ) -> tuple[str | None, str | None]:
+        """Resolve (backend, cwd) for a reconcile-time resume write.
+
+        Prefers VibeDeck's session metadata (the source of truth for cwd).
+        Falls back to the MM-side backend resolution when VD doesn't know
+        the session (stale mapping, VD restart since the mapping was
+        persisted). Cwd is left None in the fallback path because we don't
+        have a trustworthy source — the resume command stays runnable but
+        omits the `cd` prefix.
+        """
+        backend: str | None = None
+        cwd: str | None = None
+        try:
+            meta = await self.vd.get_session_meta(session_id)
+        except Exception:
+            meta = {}
+            logger.debug(
+                "resume-purpose: VD meta lookup failed for %s",
+                session_id[:8], exc_info=True,
+            )
+        if meta:
+            backend = meta.get("backend") or meta.get("backendName") or None
+            cwd = meta.get("projectPath") or meta.get("cwd") or None
+        if not backend:
+            backend = self._backend_for_channel(channel_id)
+        return backend, cwd
 
     def _backend_for_channel(self, channel_id: str) -> str | None:
         """Backend used to resume a session in `channel_id`.
@@ -1888,8 +1947,8 @@ class Bridge:
                     "Failed to seed VD session title for %s", session_id[:8],
                     exc_info=True,
                 )
-        await self._update_resume_header(
-            channel_id, session_id, pending.backend,
+        await self._update_resume_purpose(
+            channel_id, session_id, pending.backend, pending.cwd,
         )
         await self._flush_queued(channel_id, session_id, pending)
         return True
@@ -2000,10 +2059,14 @@ class Bridge:
             logger.exception("Failed to create channel for session %s", session_id[:12])
             return None
         # CLI-originated sessions get bound here rather than through
-        # `_claim_pending_invite`, so the Resume header has to be set
+        # `_claim_pending_invite`, so the Resume block has to be set
         # explicitly. The SSE event carries the backend as a display name
-        # (`Claude Code`, `Codex`); `_update_resume_header` normalises it.
-        await self._update_resume_header(channel_id, session_id, data.get("backend"))
+        # (`Claude Code`, `Codex`) and the cwd as `projectPath`;
+        # `_update_resume_purpose` normalises the backend internally.
+        await self._update_resume_purpose(
+            channel_id, session_id,
+            data.get("backend"), data.get("projectPath"),
+        )
         return channel_id
 
     # ----- VibeDeck message → Mattermost post -----
