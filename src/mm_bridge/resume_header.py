@@ -28,6 +28,32 @@ _DANGEROUS_FLAG_BY_BACKEND: dict[str, str] = {
     "codex": "--dangerously-bypass-approvals-and-sandbox",
 }
 
+# Accepted aliases for each formatter backend token. Both the lowercase
+# Channel-Purpose token (`claude`, `codex`) and `vd_client.canon_backend`'s
+# output (`claudecode`, `codex`) — plus a few raw SSE display names — map
+# to a single formatter token here so callers don't have to canonicalise
+# at every entrypoint.
+_BACKEND_ALIASES: dict[str, str] = {
+    "claude": "claude",
+    "claudecode": "claude",
+    "claude-code": "claude",
+    "claude code": "claude",
+    "codex": "codex",
+}
+
+
+def normalize_backend(name: str | None) -> str | None:
+    """Return the formatter token for `name`, or None if unsupported.
+
+    Accepts the lowercase purpose tokens, the canonical-form output of
+    ``vd_client.canon_backend``, and raw SSE display strings like
+    ``"Claude Code"``. Empty/unknown inputs return None so callers can
+    feed it directly into :func:`format_resume_command`.
+    """
+    if not name:
+        return None
+    return _BACKEND_ALIASES.get(name.strip().lower())
+
 
 def format_resume_command(
     backend: str,

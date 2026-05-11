@@ -9,6 +9,7 @@ from mm_bridge.resume_header import (
     format_resume_command,
     format_resume_line,
     merge_into_header,
+    normalize_backend,
 )
 
 
@@ -96,3 +97,23 @@ def test_merge_into_header_adds_or_replaces_resume_line(
 def test_merge_into_header_none_leaves_header_unchanged() -> None:
     existing = "Owner: Tijs\nResume: claude --resume old"
     assert merge_into_header(existing, None) == existing
+
+
+@pytest.mark.parametrize(
+    ("alias", "expected"),
+    [
+        ("claude", "claude"),
+        ("Claude Code", "claude"),
+        ("claude-code", "claude"),
+        ("claudecode", "claude"),  # vd_client.canon_backend output
+        ("codex", "codex"),
+        ("Codex", "codex"),
+    ],
+)
+def test_normalize_backend_known_aliases(alias: str, expected: str) -> None:
+    assert normalize_backend(alias) == expected
+
+
+@pytest.mark.parametrize("alias", ["pi", "opencode", "", None, "unknown"])
+def test_normalize_backend_unknown_returns_none(alias) -> None:
+    assert normalize_backend(alias) is None
