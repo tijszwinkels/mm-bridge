@@ -376,6 +376,37 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         self.assertEqual(len(created), 1)
         self.assertIsNotNone(self.bridge.mapping.get_anchor("codex_new"))
 
+    async def test_bootstrap_creates_channel_for_unmapped_external_session(self):
+        self.bridge.harness.sessions_meta = [{
+            "id": "codex_existing",
+            "backend": "codex",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "title": "Existing external",
+            "origin": "external",
+        }]
+
+        await self.bridge._bootstrap_known_sessions()
+
+        self.assertIsNotNone(self.bridge.mapping.get_anchor("codex_existing"))
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(len(created), 1)
+
+    async def test_bootstrap_does_not_recreate_already_mapped_session(self):
+        self.bridge.mapping.link(Anchor("c1"), "codex_existing")
+        self.bridge.harness.sessions_meta = [{
+            "id": "codex_existing",
+            "backend": "codex",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "title": "Existing external",
+            "origin": "external",
+        }]
+
+        await self.bridge._bootstrap_known_sessions()
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [])
+        self.assertIn("codex_existing", self.bridge._known_sessions)
+
 
 class InviteFlowTests(_BridgeTestCase):
     async def test_bot_invited_to_unmapped_channel_creates_session(self):
