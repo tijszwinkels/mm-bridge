@@ -1,6 +1,6 @@
-"""Poster attribution tracking for the Mattermost <-> VibeDeck bridge.
+"""Poster attribution tracking for the Mattermost <-> agent backend bridge.
 
-When a VibeDeck session has only one human participant, forwarded posts
+When a backend session has only one human participant, forwarded posts
 don't need a username prefix (it's obvious who wrote them). Once a second
 distinct human speaks, every subsequent post in that session gets prefixed
 with ``<username>: `` so readers can tell the posters apart.

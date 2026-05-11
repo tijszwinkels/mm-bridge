@@ -1,12 +1,10 @@
-"""Parse assistant output for VibeDeck-style XML directives.
+"""Parse assistant output for mm-bridge XML directives.
 
 Supported directives:
     <openFile path="..." [line="..."] [follow="..."] />
     <leaveChannel [reason="..."] />
 
-Directive regex mirrors VibeDeck's JS parser in
-``VibeDeck/src/vibedeck/templates/static/js/commands.js``. Unlike the JS
-side, this parser is markdown-fence-aware: directives appearing inside
+The parser is markdown-fence-aware: directives appearing inside
 triple-backtick fenced blocks or inline backtick code spans are treated
 as documentation and left intact in the visible text.
 """

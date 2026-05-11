@@ -86,9 +86,8 @@ def _current_session_id(sidecar_dir: Path | str | None = None) -> str:
       1. ``CLAUDE_SESSION_ID`` env var — set by the Claude Code SessionStart
          hook (see ``~/.claude/hooks/export-session-id.sh``).
       2. ``MM_BRIDGE_SESSION_ID`` env var — backend-agnostic contract.
-         VibeDeck pins this into the codex tool-shell env via
-         ``-c shell_environment_policy.set`` on resume/fork, so any tool
-         shell from turn 2 onwards self-identifies cleanly.
+         Backend launchers can pin this into tool-shell environments so
+         follow-up commands self-identify cleanly.
       3. Live-codex parent (``/proc`` tie-breaker). When env vars miss,
          walk the parent-pid chain looking for a live ``codex`` ancestor
          and read the rollout filename from its open fds. This is the

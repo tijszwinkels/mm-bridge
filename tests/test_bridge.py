@@ -2477,7 +2477,13 @@ class FirstMessagePreambleTests(_BridgeTestCase):
 
 class MentionUserWhenDoneTests(_BridgeTestCase):
     """`mention_user_when_done` — post `@<username>` in the session's anchor
-    when the VD run ends, targeted at the user whose MM post triggered it."""
+    when the harness run ends, targeted at the user whose MM post triggered it."""
+
+    async def _complete_run(self, session_id: str) -> None:
+        await self.bridge._on_harness_run_lifecycle(
+            "run.completed",
+            {"session_id": session_id},
+        )
 
     async def _trigger_run(self, channel_id: str, user_id: str, session_id: str) -> None:
         self.bridge.mapping.link(Anchor(channel_id), session_id)
@@ -2489,9 +2495,7 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
     async def test_posts_mention_to_channel_on_run_end(self) -> None:
         await self._trigger_run("c1", "u1", "s1")
 
-        await self.bridge._on_vd_session_status({
-            "session_id": "s1", "running": False,
-        })
+        await self._complete_run("s1")
 
         mentions = [p for p in self.bridge.mm.posted if p.message.startswith("@")]
         self.assertEqual(len(mentions), 1)
@@ -2509,9 +2513,7 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
             "hi", "root-post", first_message=False,
         )
 
-        await self.bridge._on_vd_session_status({
-            "session_id": "s-thread", "running": False,
-        })
+        await self._complete_run("s-thread")
 
         mentions = [p for p in self.bridge.mm.posted if p.message.startswith("@")]
         self.assertEqual(len(mentions), 1)
@@ -2522,9 +2524,7 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
         # Session exists but no user post was forwarded (e.g. autorespond loop).
         self.bridge.mapping.link(Anchor("c1"), "s1")
 
-        await self.bridge._on_vd_session_status({
-            "session_id": "s1", "running": False,
-        })
+        await self._complete_run("s1")
 
         self.assertFalse(any(p.message.startswith("@") for p in self.bridge.mm.posted))
 
@@ -2532,13 +2532,9 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
         await self._trigger_run("c1", "u1", "s1")
 
         # First completion event pings.
-        await self.bridge._on_vd_session_status({
-            "session_id": "s1", "running": False,
-        })
+        await self._complete_run("s1")
         # A second running=false (e.g. spurious duplicate) must NOT re-ping.
-        await self.bridge._on_vd_session_status({
-            "session_id": "s1", "running": False,
-        })
+        await self._complete_run("s1")
 
         mentions = [p for p in self.bridge.mm.posted if p.message.startswith("@")]
         self.assertEqual(len(mentions), 1)
@@ -2547,9 +2543,7 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
         self.bridge.config.mention_user_when_done = False
         await self._trigger_run("c1", "u1", "s1")
 
-        await self.bridge._on_vd_session_status({
-            "session_id": "s1", "running": False,
-        })
+        await self._complete_run("s1")
 
         self.assertFalse(any(p.message.startswith("@") for p in self.bridge.mm.posted))
 
@@ -2557,16 +2551,12 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
         # Alice triggers → run ends → ping @alice. Then Bob triggers → run
         # ends → ping @bob, not @alice.
         await self._trigger_run("c1", "u-alice", "s1")
-        await self.bridge._on_vd_session_status({
-            "session_id": "s1", "running": False,
-        })
+        await self._complete_run("s1")
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "my turn",
             "user_id": "u-bob", "type": "",
         })
-        await self.bridge._on_vd_session_status({
-            "session_id": "s1", "running": False,
-        })
+        await self._complete_run("s1")
 
         mentions = [p.message for p in self.bridge.mm.posted if p.message.startswith("@")]
         self.assertEqual(mentions, ["@u-u-al", "@u-u-bo"])
