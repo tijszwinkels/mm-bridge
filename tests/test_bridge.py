@@ -1599,7 +1599,9 @@ class SessionAddedClaimTests(_BridgeTestCase):
     async def test_invite_claim_unsupported_backend_leaves_purpose_unchanged(self):
         """`pi` is a known purpose token but has no resume command — the
         bridge must not write to Purpose at all (no spurious clobber of
-        the operator-set config section)."""
+        the operator-set config section). Only asserts behaviour when
+        there is no prior resume block to clean up; the stale-block case
+        is covered by `test_invite_claim_unsupported_backend_strips_stale_resume_block`."""
         from mm_bridge.bridge import PendingMattermostSession
         import time as _time
 
@@ -1618,6 +1620,42 @@ class SessionAddedClaimTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.mm.channels["c1"]["purpose"], "pi")
         self.assertEqual(self.bridge.mm.purposes, [])
+
+    async def test_invite_claim_unsupported_backend_strips_stale_resume_block(self):
+        """A channel that switched from claude/codex to pi/opencode must
+        not keep advertising a copy-paste command for the abandoned
+        previous session. When the bridge claims a session for an
+        unsupported backend AND a stale resume block exists in Purpose,
+        the stale block is removed."""
+        from mm_bridge.bridge import PendingMattermostSession
+        import time as _time
+
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1",
+            "purpose": (
+                "pi\n"
+                "\n"
+                "---\n"
+                "\n"
+                "Resume:\n```\ncd /old && claude --resume old-sess\n```"
+            ),
+        }
+        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
+            channel_id="c1", cwd="/tmp/proj", backend="pi",
+            initial_message="placeholder", requested_at=_time.monotonic(),
+        )
+
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-pi", "projectPath": "/tmp/proj",
+            "firstMessage": "placeholder", "backend": "pi",
+        })
+
+        # Stale resume block stripped; config section preserved.
+        self.assertEqual(self.bridge.mm.channels["c1"]["purpose"], "pi")
+        self.assertEqual(
+            self.bridge.mm.purposes[-1],
+            ("c1", "pi"),
+        )
 
     async def test_reconcile_resume_purposes_uses_vd_meta_for_cwd_and_backend(self):
         """Reconcile is the only path that runs after a daemon restart, so

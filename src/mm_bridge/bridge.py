@@ -1767,15 +1767,21 @@ class Bridge:
         """
         if not session_id:
             return
+        # Unsupported backend → fall through with block=None so any
+        # *stale* resume block from a previous (supported) binding is
+        # stripped from Purpose. The merge layer is a no-op when
+        # Purpose has no resume section, so this path is safe even for
+        # channels that never had one.
         canonical = resume_header.normalize_backend(backend)
         if canonical is None:
-            return  # unsupported backend — leave Purpose alone.
-        block = resume_header.format_resume_block(
-            canonical, session_id, cwd,
-            dangerous=self.config.dangerous_permissions,
-        )
-        if block is None:
-            return  # defensive — covered by the canonical guard above
+            block: str | None = None
+        else:
+            block = resume_header.format_resume_block(
+                canonical, session_id, cwd,
+                dangerous=self.config.dangerous_permissions,
+            )
+            if block is None:
+                return  # defensive — covered by the canonical guard above
         try:
             channel = self.mm.get_channel(channel_id)
         except Exception:
