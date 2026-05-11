@@ -56,9 +56,28 @@ class FakePostsApi:
 
 
 @dataclass
+class FakeChannelsApi:
+    """Stand-in for Driver.channels — records pagination calls + returns
+    pre-staged pages from ``page_responses``."""
+    page_responses: list[list[dict]] = field(default_factory=list)
+    calls: list[tuple[str, dict]] = field(default_factory=list)
+
+    def get_public_channels_for_team(self, team_id, params=None):
+        self.calls.append((team_id, dict(params or {})))
+        idx = len(self.calls) - 1
+        if idx >= len(self.page_responses):
+            raise AssertionError(
+                "list_public_team_channels did not stop paginating after "
+                "the last staged response"
+            )
+        return self.page_responses[idx]
+
+
+@dataclass
 class FakeDriver:
     client: FakeDriverClient = field(default_factory=FakeDriverClient)
     posts: FakePostsApi = field(default_factory=FakePostsApi)
+    channels: FakeChannelsApi = field(default_factory=FakeChannelsApi)
 
 
 def _make_client_with_driver(driver: FakeDriver) -> MattermostClient:
@@ -119,6 +138,70 @@ def test_get_posts_since_breaks_when_pagination_repeats_page():
 
     assert [p["id"] for p in posts] == ["p1", "p2"]
     assert [params["page"] for _, params in driver.posts.channel_calls] == [0, 1]
+
+
+# ───────────────────── list_public_team_channels pagination ─────────────
+
+
+def test_list_public_team_channels_paginates_until_short_page():
+    """Regression: a single un-paginated call returned only the first 60
+    channels, so newly-created public channels beyond that prefix never
+    showed up in the auto-join reconciler. The client must page through
+    until a short page signals the end of the list."""
+    full_page_a = [{"id": f"c-a{i}", "type": "O"} for i in range(200)]
+    full_page_b = [{"id": f"c-b{i}", "type": "O"} for i in range(200)]
+    last_page = [{"id": "c-tail", "type": "O"}]
+
+    driver = FakeDriver()
+    driver.channels.page_responses = [full_page_a, full_page_b, last_page]
+    client = _make_client_with_driver(driver)
+
+    out = client.list_public_team_channels()
+
+    assert [c["id"] for c in out] == (
+        [f"c-a{i}" for i in range(200)]
+        + [f"c-b{i}" for i in range(200)]
+        + ["c-tail"]
+    )
+    assert [params["page"] for _, params in driver.channels.calls] == [0, 1, 2]
+    # Per-page large enough to keep the round-trip count bounded on big teams.
+    assert all(params["per_page"] >= 100 for _, params in driver.channels.calls)
+
+
+def test_list_public_team_channels_stops_on_empty_page():
+    """If the last page returns exactly per_page items, the next call
+    yields an empty list — the loop must stop there, not loop forever."""
+    full = [{"id": f"c{i}", "type": "O"} for i in range(200)]
+    empty: list[dict] = []
+
+    driver = FakeDriver()
+    driver.channels.page_responses = [full, empty]
+    client = _make_client_with_driver(driver)
+
+    out = client.list_public_team_channels()
+
+    assert len(out) == 200
+    assert [params["page"] for _, params in driver.channels.calls] == [0, 1]
+
+
+def test_list_public_team_channels_safety_cap_aborts_runaway():
+    """Defensive cap: if MM keeps returning full pages forever (server bug
+    or malicious response), the loop terminates at the cap instead of
+    spinning. Test stages enough full pages to exceed any reasonable cap
+    and asserts the call count is bounded."""
+    page = [{"id": f"c{i}", "type": "O"} for i in range(200)]
+    driver = FakeDriver()
+    # Stage way more pages than the cap to prove the loop bails.
+    driver.channels.page_responses = [page] * 1000
+    client = _make_client_with_driver(driver)
+
+    out = client.list_public_team_channels()
+
+    # The method returns whatever it collected before hitting the cap;
+    # we don't pin the exact cap value here, only that the loop did NOT
+    # consume all 1000 staged pages.
+    assert len(driver.channels.calls) < 1000
+    assert len(out) == len(driver.channels.calls) * 200
 
 
 # ───────────────────── Own-post tracking ──────────────────────────────────
