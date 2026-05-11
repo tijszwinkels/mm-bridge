@@ -40,8 +40,8 @@ class Config:
     # to the daemon's own ``mm_scheme://mm_url:mm_port``.
     mm_public_url: str = ""
 
-    # VibeDeck
-    vd_url: str = "http://localhost:8765"
+    # agent-harness
+    agent_harness_url: str = "http://localhost:8877"
 
     # Session defaults
     default_backend: str = "claude"
@@ -93,7 +93,7 @@ class Config:
 
     # Typing indicator
     typing_refresh_seconds: float = 3.0
-    typing_stop_after_silence_seconds: float = 10.0
+    typing_stop_after_silence_seconds: float = 15.0
 
     # Claim window for matching session_added → pending MM invite
     pending_session_merge_window_seconds: float = 30.0
@@ -101,17 +101,17 @@ class Config:
     # Name-sync debounce window
     name_sync_window_seconds: float = 10.0
 
-    # Mirrors VibeDeck's `--dangerously-skip-permissions` mode. When True,
+    # Mirrors the coding-agent elevated-permissions mode. When True,
     # the resume command written into each bridged channel's Purpose
     # includes the matching elevated-permission flag
     # (`--dangerously-skip-permissions` for claude,
     # `--dangerously-bypass-approvals-and-sandbox` for codex), so resuming
     # a session locally lands in the same permission state the daemon is
-    # running in. VibeDeck does not expose its own `_skip_permissions`
+    # running in. The backend does not expose its own `_skip_permissions`
     # state via a public API, so this is operator-owned. Defaults to True
-    # because the typical operator runs the bridge alongside a
-    # `vibedeck --dangerously-skip-permissions` daemon; set
-    # ``MM_BRIDGE_DANGEROUS_PERMISSIONS=0`` (or the TOML key to false) to
+    # because the typical operator runs the bridge with elevated local
+    # coding-agent sessions; set ``MM_BRIDGE_DANGEROUS_PERMISSIONS=0``
+    # (or the TOML key to false) to
     # opt out for constrained deployments.
     dangerous_permissions: bool = True
 
@@ -204,9 +204,9 @@ class Config:
         if "public_url" in mm:
             self.mm_public_url = mm["public_url"]
 
-        vd = data.get("vibedeck", {}) or {}
-        if "url" in vd:
-            self.vd_url = vd["url"]
+        ah = data.get("agent_harness", {}) or {}
+        if "url" in ah:
+            self.agent_harness_url = ah["url"]
 
     def _apply_env(self) -> None:
         env = os.environ
@@ -222,16 +222,16 @@ class Config:
             self.mm_team = env["MM_TEAM"]
         if "MM_PUBLIC_URL" in env:
             self.mm_public_url = env["MM_PUBLIC_URL"]
-        if "VD_URL" in env:
-            self.vd_url = env["VD_URL"]
-        if "VD_DEFAULT_CWD" in env:
-            self.default_cwd = env["VD_DEFAULT_CWD"]
-        if "VD_DEFAULT_BACKEND" in env:
-            self.default_backend = env["VD_DEFAULT_BACKEND"]
-        if "VD_DEFAULT_MODEL" in env:
-            self.default_model = env["VD_DEFAULT_MODEL"] or None
-        if "VD_DEFAULT_AUTORESPOND" in env:
-            self.default_autorespond = env["VD_DEFAULT_AUTORESPOND"].lower() in (
+        if "AH_URL" in env:
+            self.agent_harness_url = env["AH_URL"]
+        if "MM_BRIDGE_DEFAULT_CWD" in env:
+            self.default_cwd = env["MM_BRIDGE_DEFAULT_CWD"]
+        if "MM_BRIDGE_DEFAULT_BACKEND" in env:
+            self.default_backend = env["MM_BRIDGE_DEFAULT_BACKEND"]
+        if "MM_BRIDGE_DEFAULT_MODEL" in env:
+            self.default_model = env["MM_BRIDGE_DEFAULT_MODEL"] or None
+        if "MM_BRIDGE_DEFAULT_AUTORESPOND" in env:
+            self.default_autorespond = env["MM_BRIDGE_DEFAULT_AUTORESPOND"].lower() in (
                 "1", "true", "yes", "on",
             )
         if "MM_SHOW_TOOL_USE" in env:
