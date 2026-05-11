@@ -15,6 +15,15 @@ from typing import Callable
 
 KNOWN_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "pi", "opencode"})
 
+# Purpose backend tokens the user may write that canonicalise to one of
+# ``KNOWN_BACKENDS``. Lets operators paste the harness-wire name
+# (``claude-code``) into Channel Purpose without it being treated as an
+# unknown token. Aliases are matched case-insensitively.
+_BACKEND_ALIASES: dict[str, str] = {
+    "claude-code": "claude",
+    "claudecode": "claude",
+}
+
 # A standalone line equal to this string splits the Channel Purpose into a
 # config section (parsed by `parse()`) and a trailing section reserved for
 # informational content such as the resume-command block written by
@@ -214,18 +223,23 @@ def parse(
 
     first, *rest = remaining
     first_lc = first.lower()
+    first_canon = _BACKEND_ALIASES.get(first_lc, first_lc)
 
     # Step 3: resolve the first token to a backend (and maybe a model).
     backend: str
     model: str | None
-    if first_lc in KNOWN_BACKENDS:
-        backend = first_lc
+    if first_canon in KNOWN_BACKENDS:
+        backend = first_canon
         model = None
     else:
         # If the first token is a model name under the default backend,
-        # interpret it as "use default backend + this model".
+        # interpret it as "use default backend + this model". When the
+        # default backend has no enumerated catalog (US-5.3: live harness
+        # returns ``data: []`` for known backends), still accept the token
+        # as a model so operators can use models the harness hasn't
+        # enumerated.
         default_models = _models_for(default_backend, available_models_for)
-        if first_lc in default_models:
+        if first_lc in default_models or not default_models:
             backend = default_backend
             model = first_lc
         else:
@@ -239,10 +253,13 @@ def parse(
     backend_models = _models_for(backend, available_models_for)
 
     # Step 4: walk remaining tokens (mention-only / autorespond / cwd were
-    # already extracted in Step 2a).
+    # already extracted in Step 2a). With an empty catalog (US-5.3) any
+    # otherwise-unrecognised token is taken as a model name verbatim so the
+    # bridge can pass it to ``POST /v1/sessions`` unchanged.
+    catalog_empty = not backend_models
     for token in rest:
         token_lc = token.lower()
-        if token_lc in backend_models:
+        if token_lc in backend_models or (catalog_empty and model is None):
             if model is not None and model != token_lc:
                 warnings.append(
                     f"Multiple model tokens in Channel Purpose — ignoring `{model}`, using `{token_lc}`."
