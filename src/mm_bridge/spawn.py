@@ -2,7 +2,7 @@
 
 The CLI orchestration lives in ``cli.cmd_spawn``; this module just owns
 the small string-formatting primitives so they're trivially unit-tested
-without mocking Mattermost or VibeDeck.
+without mocking Mattermost or the agent backend.
 """
 
 from __future__ import annotations
@@ -74,8 +74,8 @@ def format_spawn_announcement(
 def format_spawn_kickoff(parent_channel_name: str, prompt: str) -> str:
     """Kickoff message posted into a newly-spawned sub-channel.
 
-    VD's initial prompt stays inside VibeDeck and never reaches MM, so
-    without this post the new channel would appear empty until the
+    The backend's initial prompt stays inside the backend and never reaches
+    MM, so without this post the new channel would appear empty until the
     backend emits its first assistant reply.
     """
     header = f":thread: Spawned from ~{parent_channel_name}~"
