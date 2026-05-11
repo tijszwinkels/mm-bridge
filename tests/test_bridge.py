@@ -1646,7 +1646,7 @@ class SessionAddedClaimTests(_BridgeTestCase):
             "Resume:\n"
             "```\n"
             "cd /srv/new && codex resume sess-codex "
-            "--dangerously-bypass-approvals-and-sandbox\n"
+            "--yolo\n"
             "```",
         )
         # Header is NOT touched by reconcile.
@@ -1684,7 +1684,7 @@ class SessionAddedClaimTests(_BridgeTestCase):
             "Resume:\n"
             "```\n"
             "codex resume sess-codex "
-            "--dangerously-bypass-approvals-and-sandbox\n"
+            "--yolo\n"
             "```",
         )
 
@@ -1731,7 +1731,7 @@ class SessionAddedClaimTests(_BridgeTestCase):
             "Resume:\n"
             "```\n"
             "cd /tmp/proj && codex resume sess-cli "
-            "--dangerously-bypass-approvals-and-sandbox\n"
+            "--yolo\n"
             "```",
         )
 

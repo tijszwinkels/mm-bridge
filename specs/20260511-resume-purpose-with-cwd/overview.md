@@ -62,7 +62,7 @@ by the bridge.
 | cwd prefix      | `cd <shlex-quoted-cwd> && ` (omitted if cwd unset)|
 | backend         | `claude --resume <sid>` / `codex resume <sid>`    |
 | dangerous flag  | `--dangerously-skip-permissions` (claude)         |
-|                 | `--dangerously-bypass-approvals-and-sandbox` (codex)|
+|                 | `--yolo` (codex; hidden alias for `--dangerously-bypass-approvals-and-sandbox`, verified against codex-cli 0.128.0) |
 
 Wrapped in `Resume:\n\`\`\`\n<cmd>\n\`\`\`` so Mattermost renders a
 code-block with a copy button.

@@ -31,7 +31,12 @@ _RESUME_CMD_BY_BACKEND: dict[str, str] = {
 
 _DANGEROUS_FLAG_BY_BACKEND: dict[str, str] = {
     "claude": "--dangerously-skip-permissions",
-    "codex": "--dangerously-bypass-approvals-and-sandbox",
+    # Codex accepts `--yolo` as an undocumented short alias for
+    # `--dangerously-bypass-approvals-and-sandbox` (verified against
+    # codex-cli 0.128.0; the flag is hidden from `codex --help` but
+    # silently accepted by the CLI). Using the short form keeps the
+    # copy-pasted command terse.
+    "codex": "--yolo",
 }
 
 _BACKEND_ALIASES: dict[str, str] = {

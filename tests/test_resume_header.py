@@ -36,13 +36,13 @@ from mm_bridge.resume_header import (
         (
             "codex", "/srv/proj", True,
             "cd /srv/proj && codex resume sess-123 "
-            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
         ),
         # No cwd → no `cd …`, just the bare backend command.
         ("claude", None, False, "claude --resume sess-123"),
         ("claude", "", False, "claude --resume sess-123"),
         ("codex", None, True, "codex resume sess-123 "
-                              "--dangerously-bypass-approvals-and-sandbox"),
+                              "--yolo"),
         # Paths with spaces are shell-quoted so the `cd` line still works.
         (
             "claude", "/home/foo/my project", False,
@@ -96,7 +96,7 @@ def test_format_resume_block_includes_dangerous_flag() -> None:
         "Resume:\n"
         "```\n"
         "cd /srv && codex resume sess-xyz "
-        "--dangerously-bypass-approvals-and-sandbox\n"
+        "--yolo\n"
         "```"
     )
 
