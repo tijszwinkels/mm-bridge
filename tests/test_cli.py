@@ -556,7 +556,7 @@ class SpawnCommandTests(unittest.TestCase):
             mm_bot_token="t",
             sidecar_dir=str(self.sdir),
             state_file=f"{self.tmp.name}/state.json",
-            vd_url="http://vd.invalid",
+            agent_harness_url="http://harness.invalid",
             default_cwd="/tmp",
             default_backend="claude",
         )

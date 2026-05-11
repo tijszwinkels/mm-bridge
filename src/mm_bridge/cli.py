@@ -855,7 +855,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     try:
         resp = asyncio.run(
-            _vd_create_session(cfg.vd_url, args.prompt, cwd, backend),
+            _vd_create_session(cfg.agent_harness_url, args.prompt, cwd, backend),
         )
     except Exception as exc:
         print(f"Error: VibeDeck create_session failed: {exc}", file=sys.stderr)

@@ -231,7 +231,7 @@ class Bridge:
             token=config.mm_bot_token,
             team_name=config.mm_team,
         )
-        self.vd = VibeDeckClient(config.vd_url)
+        self.vd = VibeDeckClient(config.agent_harness_url)
         self.posters = attribution.PosterTracker()
         self.name_sync = name_sync.NameSync(
             window_seconds=config.name_sync_window_seconds
@@ -290,7 +290,7 @@ class Bridge:
 
         logger.info(
             "Connected — Mattermost (team=%s, bot=%s) + VibeDeck (%s)",
-            self.config.mm_team, self.mm.bot_username, self.config.vd_url,
+            self.config.mm_team, self.mm.bot_username, self.config.agent_harness_url,
         )
 
         try:

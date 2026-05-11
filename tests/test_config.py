@@ -65,6 +65,61 @@ class ApplyEnvMmUrlTests(unittest.TestCase):
         self.assertEqual(cfg.mm_scheme, "https")
 
 
+class AgentHarnessConfigTests(unittest.TestCase):
+    """agent-harness backend URL and session-default config."""
+
+    def _apply(self, env: dict[str, str]) -> Config:
+        cfg = Config()
+        with patch.dict("os.environ", env, clear=True):
+            cfg._apply_env()
+        return cfg
+
+    def test_defaults_point_at_agent_harness(self) -> None:
+        cfg = Config()
+        self.assertEqual(cfg.agent_harness_url, "http://localhost:8877")
+        self.assertEqual(cfg.typing_stop_after_silence_seconds, 15.0)
+
+    def test_toml_agent_harness_url_sets_field(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"agent_harness": {"url": "http://pillar:8877"}})
+        self.assertEqual(cfg.agent_harness_url, "http://pillar:8877")
+
+    def test_env_renamed_backend_knobs(self) -> None:
+        cfg = self._apply({
+            "AH_URL": "http://harness:8877",
+            "MM_BRIDGE_DEFAULT_CWD": "/work",
+            "MM_BRIDGE_DEFAULT_BACKEND": "codex",
+            "MM_BRIDGE_DEFAULT_MODEL": "gpt-5.4",
+            "MM_BRIDGE_DEFAULT_AUTORESPOND": "yes",
+        })
+
+        self.assertEqual(cfg.agent_harness_url, "http://harness:8877")
+        self.assertEqual(cfg.default_cwd, "/work")
+        self.assertEqual(cfg.default_backend, "codex")
+        self.assertEqual(cfg.default_model, "gpt-5.4")
+        self.assertTrue(cfg.default_autorespond)
+
+    def test_empty_default_model_env_unsets_model(self) -> None:
+        cfg = self._apply({"MM_BRIDGE_DEFAULT_MODEL": ""})
+        self.assertIsNone(cfg.default_model)
+
+    def test_old_vd_env_and_toml_are_ignored(self) -> None:
+        cfg = self._apply({
+            "VD_URL": "http://vd.invalid",
+            "VD_DEFAULT_CWD": "/old",
+            "VD_DEFAULT_BACKEND": "pi",
+            "VD_DEFAULT_MODEL": "old-model",
+            "VD_DEFAULT_AUTORESPOND": "true",
+        })
+        cfg._apply_toml({"vibedeck": {"url": "http://vd.toml"}})
+
+        self.assertEqual(cfg.agent_harness_url, "http://localhost:8877")
+        self.assertNotEqual(cfg.default_cwd, "/old")
+        self.assertEqual(cfg.default_backend, "claude")
+        self.assertEqual(cfg.default_model, "opus")
+        self.assertFalse(cfg.default_autorespond)
+
+
 class PublicUrlTests(unittest.TestCase):
     """``mm_public_url`` — optional user-facing base URL for permalinks.
 
