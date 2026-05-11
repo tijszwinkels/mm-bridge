@@ -2562,5 +2562,84 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
         self.assertEqual(mentions, ["@u-u-al", "@u-u-bo"])
 
 
+class HarnessEventEnvelopeTests(_BridgeTestCase):
+    """The live harness places ``session_id`` and ``run_id`` at the top
+    level of the SSE Event envelope, NOT inside the inner ``data`` payload
+    (see ``models.py: class Event`` in agent-harness-echo). Bridge handlers
+    must see them through ``_on_harness_event``'s dispatch.
+    """
+
+    async def test_message_event_with_top_level_session_id_dispatches(self):
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        await self.bridge._on_harness_event(
+            "message",
+            {
+                "sequence": 5,
+                "event": "message",
+                "data": {
+                    "backend": "codex",
+                    "origin": "harness",
+                    "message": {
+                        "role": "assistant",
+                        "blocks": [{"type": "text", "text": "hello there"}],
+                    },
+                },
+                "session_id": "codex_s1",
+                "run_id": "run-1",
+            },
+        )
+
+        self.assertTrue(
+            any(p.message == "hello there" for p in self.bridge.mm.posted),
+            f"assistant text was dropped; posts={[p.message for p in self.bridge.mm.posted]}",
+        )
+
+    async def test_run_completed_with_top_level_run_id_clears_state(self):
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+        self.bridge.current_run_id_by_session["codex_s1"] = "run-1"
+
+        await self.bridge._on_harness_event(
+            "run.completed",
+            {
+                "sequence": 10,
+                "event": "run.completed",
+                "data": {"stop_reason": "end_turn"},
+                "session_id": "codex_s1",
+                "run_id": "run-1",
+            },
+        )
+
+        self.assertNotIn("codex_s1", self.bridge.current_run_id_by_session)
+
+    async def test_tool_use_block_uses_name_field(self):
+        """The harness ToolUseBlock serialises the tool identifier as
+        ``name`` (per ``models.py: class ToolUseBlock``), not ``tool_name``.
+        Bridge must read ``name`` so the placeholder shows the real tool.
+        """
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        await self.bridge._on_harness_event(
+            "message",
+            {
+                "sequence": 7,
+                "event": "message",
+                "data": {
+                    "message": {
+                        "role": "assistant",
+                        "blocks": [{"type": "tool_use", "name": "Bash"}],
+                    },
+                },
+                "session_id": "codex_s1",
+                "run_id": "run-1",
+            },
+        )
+
+        tool_posts = [p for p in self.bridge.mm.posted if "Using tool" in p.message]
+        self.assertEqual(len(tool_posts), 1)
+        self.assertIn("Bash", tool_posts[0].message)
+        self.assertNotIn("unknown", tool_posts[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()
