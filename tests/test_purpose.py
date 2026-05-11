@@ -280,15 +280,18 @@ def test_three_model_tokens_warn_on_each_earlier():
 
 
 def test_never_raises_when_models_callable_fails():
+    """When the model-list callback raises, parsing still completes. Under
+    US-5.3, a failing or empty catalog means "no model verification
+    available" — the raw token is recorded verbatim and passed to
+    ``POST /v1/sessions``, so a transient harness hiccup doesn't block the
+    operator from naming the model they want."""
     def broken(backend: str) -> list[str]:
-        raise RuntimeError("vibedeck unreachable")
+        raise RuntimeError("harness unreachable")
 
     cfg = parse("claude, opus", "claude", "sonnet", broken)
-    # Can't verify opus since model lookup failed — it becomes an unknown token.
     assert cfg.backend == "claude"
-    assert cfg.model == "sonnet"  # default_model fallback
-    assert len(cfg.warnings) == 1
-    assert "opus" in cfg.warnings[0]
+    assert cfg.model == "opus"
+    assert cfg.warnings == []
 
 
 def test_never_raises_on_garbage_input():
@@ -485,6 +488,44 @@ def test_parse_ignores_resume_section():
     assert cfg.model == "opus"
     assert cfg.mention_only is True
     assert cfg.warnings == []  # critical: no warnings from the resume body
+
+
+# ---------------------------------------------------------------------------
+# US-5.3: empty `available_models_for(...)` means "no catalog", not "no models"
+# ---------------------------------------------------------------------------
+
+
+def test_parse_passes_unknown_model_through_when_catalog_empty():
+    """The live harness returns 200 ``{"data": []}`` for known backends until
+    it has an authoritative model catalog (see US-5.3). The parser MUST
+    record the raw token as the model and pass it verbatim to
+    ``POST /v1/sessions`` so operators can use models the harness hasn't
+    enumerated."""
+    cfg = parse("claude, claude-opus-4-7", "claude", "opus", lambda _b: [])
+    assert cfg.backend == "claude"
+    assert cfg.model == "claude-opus-4-7"
+    assert cfg.warnings == []
+
+
+def test_parse_passes_unknown_model_through_with_known_default_backend():
+    """Same as above but the user typed only a model token; we still
+    canonicalise the default backend and pass the model through."""
+    cfg = parse("custom-model-x", "claude", "opus", lambda _b: [])
+    # When the catalog is empty for the default backend, a single
+    # unrecognised token is treated as a model under the default backend.
+    assert cfg.backend == "claude"
+    assert cfg.model == "custom-model-x"
+    assert cfg.warnings == []
+
+
+def test_parse_accepts_claude_code_backend_alias():
+    """US-5.2: the bridge accepts both ``claude`` (legacy purpose token)
+    and ``claude-code`` (display/harness wire) at parse time and
+    canonicalises internally."""
+    cfg = parse("claude-code, opus", "claude", "opus", _models_for)
+    assert cfg.backend == "claude"
+    assert cfg.model == "opus"
+    assert cfg.warnings == []
 
 
 if __name__ == "__main__":
