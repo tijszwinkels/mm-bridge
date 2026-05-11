@@ -707,9 +707,18 @@ class Bridge:
         post_welcome: bool = True,
         exclude_post_id: str | None = None,
     ) -> None:
+        # Reserve the channel-id slot first so any MM post that lands while
+        # we're still fetching channel metadata / model lists / catch-up
+        # transcript is queued instead of dropped. The entry is cleared on
+        # the success path (after the run starts) and on every error
+        # branch below.
+        if channel_id not in self.warming_up_sessions:
+            self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
+
         try:
             ch = self.mm.get_channel(channel_id)
         except Exception:
+            self.warming_up_sessions.pop(channel_id, None)
             logger.exception("Failed to fetch channel %s on invite", channel_id)
             return
         purpose_text = ch.get("purpose", "") or ""
@@ -746,7 +755,8 @@ class Bridge:
             channel_id, initial_message, exclude_post_id=exclude_post_id,
         )
 
-        self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
+        # ``warming_up_sessions[channel_id]`` was set at function entry so
+        # any race-arriving MM post is queued; reuse that entry here.
         self.purpose_by_channel[channel_id] = cfg
         session_id: str | None = None
         queued: WarmingUpChannel | None = None
@@ -1776,8 +1786,13 @@ class Bridge:
             return  # already mapped
         if session_id in self._known_sessions:
             return
-        self._known_sessions.add(session_id)
-        await self._create_channel_for_session(session)
+        # Only mark known after the channel actually exists; otherwise a
+        # transient MM error means we'd silently skip future
+        # ``session.updated`` events for this session and never spawn its
+        # channel. ``_create_channel_for_session`` returns None on failure
+        # and logs at error level.
+        if await self._create_channel_for_session(session):
+            self._known_sessions.add(session_id)
 
     async def _update_resume_purpose(
         self,
