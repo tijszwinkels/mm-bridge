@@ -1723,11 +1723,19 @@ class Bridge:
     # ─────────────────────── agent-harness SSE handlers ───────────────────
 
     async def _on_harness_event(self, event_type: str, data: dict) -> None:
-        inner = data.get("data", data) or {}
+        # The harness SSE Event envelope (see agent_harness/models.py: Event)
+        # carries ``session_id`` and ``run_id`` at the TOP level, alongside the
+        # event-specific ``data`` payload. Flatten them into the dict handed
+        # to handlers so a single ``data.get("session_id")`` works regardless
+        # of whether the field came from the envelope or the inner payload.
+        inner = dict(data.get("data") or {})
+        for key in ("session_id", "run_id"):
+            if inner.get(key) is None and data.get(key) is not None:
+                inner[key] = data[key]
+
         session_id = (
             inner.get("session_id")
             or (inner.get("session") or {}).get("id")
-            or data.get("session_id")
         )
         if session_id and event_type in HARNESS_ACTIVITY_EVENTS:
             self.last_activity_ts[session_id] = time.monotonic()
@@ -2003,7 +2011,7 @@ class Bridge:
             if btype == "tool_use":
                 if not self.config.show_tool_use:
                     continue
-                tool = block.get("tool_name", "unknown")
+                tool = block.get("name") or block.get("tool_name") or "unknown"
                 self._upsert_tool_use(session_id, channel_id, thread_root, tool)
             elif btype == "tool_result" and block.get("is_error"):
                 self._end_tool_use_run(session_id)
