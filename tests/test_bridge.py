@@ -52,6 +52,8 @@ class FakeMattermostClient:
     channel_members: dict = field(default_factory=dict)
     # Permanent-delete failure simulation:
     permanent_delete_disabled: bool = False
+    # Channel-create failure simulation (used by retry-semantics tests):
+    fail_create_channel: bool = False
     _post_counter: int = 0
     # Mirror of MattermostClient's own-post tracking — populated
     # whenever the fake creates or edits a post.
@@ -96,6 +98,8 @@ class FakeMattermostClient:
         self.deletes.append((post_id, permanent))
 
     def create_channel(self, name: str, display_name: str, purpose: str = "") -> dict:
+        if self.fail_create_channel:
+            raise RuntimeError("simulated MM create_channel failure")
         cid = f"c-{name}"
         self.channels[cid] = {
             "id": cid, "name": name, "display_name": display_name, "purpose": purpose,
@@ -390,6 +394,36 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         self.assertIsNotNone(self.bridge.mapping.get_anchor("codex_existing"))
         created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
         self.assertEqual(len(created), 1)
+
+    async def test_failed_channel_create_does_not_block_future_retry(self):
+        """A transient MM failure on first ``session.updated`` must NOT
+        leave the session permanently in ``_known_sessions`` — otherwise
+        the bridge silently abandons it. Subsequent ``session.updated``
+        events for the same id must trigger another channel-create
+        attempt."""
+        session = {
+            "id": "codex_retry",
+            "backend": "codex",
+            "project": {"path": "/tmp/project", "name": "project"},
+        }
+        self.bridge.mm.fail_create_channel = True
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session": session}, "session_id": "codex_retry"},
+        )
+
+        self.assertNotIn("codex_retry", self.bridge._known_sessions)
+        self.assertIsNone(self.bridge.mapping.get_anchor("codex_retry"))
+
+        self.bridge.mm.fail_create_channel = False
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session": session}, "session_id": "codex_retry"},
+        )
+
+        self.assertIn("codex_retry", self.bridge._known_sessions)
+        self.assertIsNotNone(self.bridge.mapping.get_anchor("codex_retry"))
 
     async def test_bootstrap_does_not_recreate_already_mapped_session(self):
         self.bridge.mapping.link(Anchor("c1"), "codex_existing")
