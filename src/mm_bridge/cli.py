@@ -4,7 +4,7 @@ Subcommands:
   - `serve`                 → run the bridge daemon
   - `invite <username>`     → invite a MM user to this session's channel
   - `channel`               → print this session's MM channel_id (debug)
-  - `spawn <prompt>`        → start a VD sub-session in a new sibling channel
+  - `spawn <prompt>`        → start a sub-session in a new sibling channel
 
 A bare `mm-bridge` prints help and exits with status 1 — this is intentional
 so that a typo like `mm-bridge` (meaning to ask a question inside a channel)
@@ -27,11 +27,11 @@ from typing import Callable
 import json
 
 from . import sidecar, spawn as spawn_mod
+from .agent_harness_client import AgentHarnessClient
 from .bridge import Bridge, resolve_attachment_path
 from .codex_session import find_active_codex_rollout_uuid, iter_session_ids_by_cwd
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
-from .vd_client import VibeDeckClient
 
 logger = logging.getLogger(__name__)
 
@@ -275,17 +275,28 @@ def cmd_invite(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _vd_create_session(
-    vd_url: str, message: str, cwd: str, backend: str | None,
+async def _harness_create_session(
+    harness_url: str, message: str, cwd: str, backend: str | None,
 ) -> dict:
-    """Async wrapper — one-shot VD client for the spawn CLI path."""
-    vd = VibeDeckClient(vd_url)
+    """Async wrapper: one-shot harness client for the spawn CLI path."""
+    harness = AgentHarnessClient(harness_url)
     try:
-        return await vd.create_session(
-            message=message, cwd=cwd, backend=backend,
+        session = await harness.create_session(
+            backend=backend or "claude",
+            model=None,
+            cwd=cwd,
         )
+        session_id = session.get("id")
+        if not session_id:
+            raise RuntimeError("agent-harness create_session response missing id")
+        run = await harness.create_run(session_id, message)
+        return {
+            "status": "started",
+            "session_id": session_id,
+            "run_id": run.get("run_id") or run.get("id"),
+        }
     finally:
-        await vd.close()
+        await harness.close()
 
 
 _PURPOSE_BADGE_CAP = 40
@@ -855,15 +866,15 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     try:
         resp = asyncio.run(
-            _vd_create_session(cfg.agent_harness_url, args.prompt, cwd, backend),
+            _harness_create_session(cfg.agent_harness_url, args.prompt, cwd, backend),
         )
     except Exception as exc:
-        print(f"Error: VibeDeck create_session failed: {exc}", file=sys.stderr)
+        print(f"Error: agent-harness create_session failed: {exc}", file=sys.stderr)
         return 3
     status = resp.get("status")
     if status != "started":
         print(
-            f"Error: VibeDeck returned unexpected status {status!r}",
+            f"Error: agent-harness returned unexpected status {status!r}",
             file=sys.stderr,
         )
         return 3
