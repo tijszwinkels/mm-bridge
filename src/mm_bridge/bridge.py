@@ -1,4 +1,4 @@
-"""Bridge orchestrator — dispatches Mattermost ↔ VibeDeck events to handlers."""
+"""Bridge orchestrator — dispatches Mattermost ↔ agent-harness events to handlers."""
 
 from __future__ import annotations
 
@@ -10,16 +10,22 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import attribution, directives, name_sync, purpose, resume_header, vd_client
+from . import attribution, directives, name_sync, purpose, resume_header
+from .agent_harness_client import (
+    AgentHarnessClient,
+    HarnessForkUnsupported,
+    HarnessInterruptUnsupported,
+    HarnessResumeUnsupported,
+    HarnessRunNotFound,
+)
 from .config import Anchor, ChannelMapping, Config
 from .mm_client import MattermostClient
 from .typing_indicator import TypingIndicator
-from .vd_client import VibeDeckClient
 
 logger = logging.getLogger(__name__)
 
-# Placeholder used when creating an invite-driven session, since VibeDeck's
-# /sessions/new rejects empty messages.
+# Placeholder used when creating an invite-driven session, since the backend
+# needs a first user turn to start useful work.
 INVITE_PLACEHOLDER = (
     "Hello! I've just been added to a Mattermost channel. "
     "I'll wait for the user to start the conversation."
@@ -27,7 +33,16 @@ INVITE_PLACEHOLDER = (
 
 MM_POST_MAX_LEN = 16000
 MM_DISPLAY_NAME_MAX = 64
-VD_TITLE_MAX = 200
+HARNESS_ACTIVITY_EVENTS = {
+    "session.updated",
+    "message",
+    "message.delta",
+    "tool.call",
+    "tool.result",
+    "run.started",
+    "permission.denied",
+}
+HARNESS_RUN_TERMINAL_EVENTS = {"run.completed", "run.failed", "run.interrupted"}
 
 _CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _LEAVE_CMD_RE = re.compile(r"^@claude\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
@@ -38,28 +53,12 @@ _RUNTIME_TOGGLE_RE = re.compile(
 
 
 @dataclass
-class PendingMattermostSession:
-    """A channel that invited the bot and is waiting for VD session_added."""
+class WarmingUpChannel:
+    """A channel with a session create/link HTTP round trip in progress."""
+
     channel_id: str
-    cwd: str
-    backend: str | None
-    initial_message: str
-    requested_at: float
-    purpose_cfg: purpose.PurposeConfig | None = None
-    is_fork: bool = False
-    # For fork-originated pending sessions:
-    fork_parent_session: str | None = None
-    fork_thread_channel: str | None = None
-    fork_thread_root: str | None = None
     queued_messages: list[str] = field(default_factory=list)
-    # Whether the next user post in this channel may be parsed as a
-    # Channel Purpose reconfiguration. True for explicit invites, false
-    # for engagement-triggered sessions in auto-joined channels (the
-    # engagement message is already the user's first real post).
-    allow_first_message_config: bool = True
-    # MM channel display_name at invite time, used to seed the VD session
-    # title on claim so the VibeDeck panel mirrors the MM channel name.
-    channel_display_name: str | None = None
+    started_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -90,7 +89,7 @@ def _bump_or_append(run: ToolUseRun, tool: str) -> None:
 def _extract_text_from_blocks(blocks: list[dict]) -> str:
     """Flatten text + error blocks (not tool_use). Used for the real
     assistant response; tool_use blocks are handled separately via the
-    ToolUseRun coalescing path in `_on_vd_message`.
+    ToolUseRun coalescing path in `_on_harness_message`.
     """
     parts: list[str] = []
     for block in blocks:
@@ -219,7 +218,7 @@ def resolve_attachment_path(
 
 
 class Bridge:
-    """Mediates Mattermost ↔ VibeDeck traffic."""
+    """Mediates Mattermost ↔ agent-harness traffic."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -231,18 +230,19 @@ class Bridge:
             token=config.mm_bot_token,
             team_name=config.mm_team,
         )
-        self.vd = VibeDeckClient(config.agent_harness_url)
+        self.harness = AgentHarnessClient(config.agent_harness_url)
         self.posters = attribution.PosterTracker()
         self.name_sync = name_sync.NameSync(
             window_seconds=config.name_sync_window_seconds
         )
         self.typing: TypingIndicator | None = None  # created after login
         self.purpose_by_channel: dict[str, purpose.PurposeConfig] = {}
-        self.pending_mm_sessions: dict[str, PendingMattermostSession] = {}
-        self.pending_forks: list[PendingMattermostSession] = []
+        self.warming_up_sessions: dict[str, WarmingUpChannel] = {}
         self.dead_threads: set[tuple[str, str]] = set()
         self.last_channel_state: dict[str, dict] = {}
-        self.last_status_ts: dict[str, float] = {}
+        self.last_activity_ts: dict[str, float] = {}
+        self.current_run_id_by_session: dict[str, str] = {}
+        self._known_sessions: set[str] = set()
         # Channels waiting on their first user message; those messages are
         # parsed as config tokens when possible.
         self.awaiting_first_message: set[str] = set()
@@ -270,11 +270,11 @@ class Bridge:
         # the run ends. Cleared on use, so a single completion event only
         # pings once, and on session teardown (see `*_forget_session`).
         self._session_triggerer: dict[str, str] = {}
-        # Recently-sent VD message bodies, keyed by session_id. Used to
-        # de-duplicate the role=user echo VD broadcasts when the bridge
+        # Recently-sent backend message bodies, keyed by session_id. Used to
+        # de-duplicate the role=user echo the harness broadcasts when the bridge
         # itself shipped the message (MM forwards, catch-up blocks,
         # firstMessage on invite/fork claims). Capped per session.
-        self._recent_vd_sends: dict[str, deque[tuple[float, str]]] = {}
+        self._recent_harness_sends: dict[str, deque[tuple[float, str]]] = {}
 
     # ----- lifecycle -----
 
@@ -283,13 +283,19 @@ class Bridge:
         self.typing = TypingIndicator(self.mm, self.config.typing_refresh_seconds)
 
         try:
-            health = await self.vd.health()
-            logger.info("VibeDeck health: %s", health)
+            health = await self.harness.health()
+            logger.info("agent-harness health: %s", health)
         except Exception:
-            logger.exception("VibeDeck health check failed — continuing anyway")
+            try:
+                await self.harness.list_sessions()
+                logger.info("agent-harness session list probe succeeded")
+            except Exception:
+                logger.exception("agent-harness health check failed — continuing anyway")
+
+        await self._bootstrap_known_sessions()
 
         logger.info(
-            "Connected — Mattermost (team=%s, bot=%s) + VibeDeck (%s)",
+            "Connected — Mattermost (team=%s, bot=%s) + agent-harness (%s)",
             self.config.mm_team, self.mm.bot_username, self.config.agent_harness_url,
         )
 
@@ -302,7 +308,7 @@ class Bridge:
 
         await asyncio.gather(
             self._run_mm_listener(),
-            self._run_vd_listener(),
+            self._run_harness_listener(),
             self._run_typing_watchdog(),
             self._run_auto_join_reconciler(),
         )
@@ -310,7 +316,26 @@ class Bridge:
     async def stop(self) -> None:
         if self.typing:
             await self.typing.shutdown()
-        await self.vd.close()
+        await self.harness.close()
+
+    async def _bootstrap_known_sessions(self) -> None:
+        try:
+            sessions = await self.harness.list_sessions()
+        except Exception:
+            logger.warning(
+                "Bootstrap GET /v1/sessions failed — falling back to mapping",
+                exc_info=True,
+            )
+            sessions = []
+        self._known_sessions = {s["id"] for s in sessions if s.get("id")}
+        self._known_sessions.update(self.mapping.session_to_anchor.keys())
+
+    def _track_run_response(self, session_id: str, run: dict | None) -> None:
+        if not run:
+            return
+        run_id = run.get("run_id") or run.get("id")
+        if run_id:
+            self.current_run_id_by_session[session_id] = run_id
 
     # ----- listener loops -----
 
@@ -372,9 +397,9 @@ class Bridge:
         if joined:
             logger.info("Auto-join reconciler joined %d channel(s)", joined)
 
-    async def _run_vd_listener(self) -> None:
-        logger.info("Starting VibeDeck SSE listener...")
-        await self.vd.stream_events(self._on_vd_event)
+    async def _run_harness_listener(self) -> None:
+        logger.info("Starting agent-harness SSE listener...")
+        await self.harness.stream_events(self._on_harness_event)
 
     async def _run_typing_watchdog(self) -> None:
         """Stop a typing loop if session_status hasn't been heard from recently."""
@@ -385,13 +410,14 @@ class Bridge:
             timeout = self.config.typing_stop_after_silence_seconds
             now = time.monotonic()
             for session_id in list(self.typing.running_sessions()):
-                last = self.last_status_ts.get(session_id)
-                if last is not None and now - last > timeout:
+                last = self.last_activity_ts.get(session_id)
+                if last is None or now - last > timeout:
                     logger.debug(
-                        "No session_status for %s in %.0fs, stopping typing",
+                        "No agent-harness activity for %s in %.0fs, stopping typing",
                         session_id[:8], timeout,
                     )
                     await self.typing.stop(session_id)
+                    self.last_activity_ts.pop(session_id, None)
 
     # ─────────────────────── Mattermost WS handlers ───────────────────────
 
@@ -429,11 +455,11 @@ class Bridge:
 
         session_id = self.mapping.get_session(Anchor(channel_id))
         if not session_id:
-            # v1's "create on first message" path is gone (§1.3). If a pending
+            # v1's "create on first message" path is gone (§1.3). If a warming
             # session for this channel is still warming up, queue the message.
-            pending = self.pending_mm_sessions.get(channel_id)
-            if pending:
-                pending.queued_messages.append(message)
+            warming = self.warming_up_sessions.get(channel_id)
+            if warming:
+                warming.queued_messages.append(message)
                 return
             # Auto-joined channel: session starts on first engagement.
             if self.config.auto_join_public_channels:
@@ -494,7 +520,7 @@ class Bridge:
         if self.mapping.get_session(Anchor(channel_id)):
             logger.info("Bot already mapped for channel %s — skipping", channel_id)
             return
-        if channel_id in self.pending_mm_sessions:
+        if channel_id in self.warming_up_sessions:
             return
         await self._start_invited_session(channel_id)
 
@@ -617,13 +643,13 @@ class Bridge:
             return
         session_id = self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
-        self.pending_mm_sessions.pop(channel_id, None)
+        self.warming_up_sessions.pop(channel_id, None)
         self._forget_channel_silent_drops(channel_id)
         if session_id:
             self._end_tool_use_run(session_id)
             self.posters.forget(session_id)
             self._session_triggerer.pop(session_id, None)
-            self._recent_vd_sends.pop(session_id, None)
+            self._recent_harness_sends.pop(session_id, None)
             if self.typing:
                 await self.typing.stop(session_id)
         logger.info("Bot removed from channel %s (session %s unlinked)",
@@ -643,21 +669,6 @@ class Bridge:
         session_id = self.mapping.get_session(Anchor(channel_id))
         if not session_id:
             return
-
-        # display_name change → sync to VibeDeck
-        if prev.get("display_name") != new_display and new_display:
-            if self.name_sync.should_sync("mm", channel_id):
-                try:
-                    await self.vd.set_session_title(
-                        session_id, new_display[:VD_TITLE_MAX],
-                    )
-                    self.name_sync.note_remote_update("vd", session_id)
-                    logger.info("MM rename → VD title for %s", session_id[:8])
-                except Exception:
-                    logger.warning(
-                        "Failed to sync MM rename → VD title for %s",
-                        session_id[:8], exc_info=True,
-                    )
 
         # Purpose change (only emit notice if actually changed AND we didn't
         # write it ourselves).
@@ -699,7 +710,7 @@ class Bridge:
         models_by_backend: dict[str, list[str]] = {}
         for b in purpose.KNOWN_BACKENDS:
             try:
-                models_by_backend[b] = await self.vd.list_models(b)
+                models_by_backend[b] = await self.harness.list_backend_models(b)
             except Exception:
                 models_by_backend[b] = []
 
@@ -719,99 +730,59 @@ class Bridge:
             except Exception:
                 logger.debug("posting purpose warning failed", exc_info=True)
 
-        # Force-refresh the chosen backend's model list so the GET also
-        # warms VD's _cached_models for that backend — POST /sessions/new
-        # validates model_index against that VD-side cache and returns 400
-        # if it's empty (e.g. nothing has fetched the list since VD restart).
-        model_index = None
-        if cfg.model:
-            try:
-                fresh_models = await self.vd.list_models(
-                    cfg.backend, force_refresh=True,
-                )
-            except Exception:
-                logger.warning(
-                    "Force-refresh of models for %s failed; falling back to cached list",
-                    cfg.backend, exc_info=True,
-                )
-                fresh_models = models_by_backend.get(cfg.backend, [])
-            for i, m in enumerate(fresh_models):
-                if m.lower() == cfg.model.lower():
-                    model_index = i
-                    break
-
         # Prepend the last N messages as catch-up context so the session
         # doesn't start cold. Only applies to brand-new sessions (not restarts).
         effective_initial = self._prepend_catch_up(
             channel_id, initial_message, exclude_post_id=exclude_post_id,
         )
 
-        # Register pending BEFORE create_session: VD emits `session_added`
-        # over SSE before the HTTP response lands, so if we registered after
-        # the await, _on_vd_session_added would find no pending invite and
-        # orphan the session into a new auto-created channel.
-        self.pending_mm_sessions[channel_id] = PendingMattermostSession(
-            channel_id=channel_id,
-            cwd=effective_cwd,
-            backend=cfg.backend,
-            initial_message=effective_initial,
-            requested_at=time.monotonic(),
-            purpose_cfg=cfg,
-            allow_first_message_config=allow_first_message_config,
-            channel_display_name=display_name,
-        )
+        self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
         self.purpose_by_channel[channel_id] = cfg
+        session_id: str | None = None
+        queued: WarmingUpChannel | None = None
 
         try:
-            resp = await self.vd.create_session(
-                message=effective_initial,
-                cwd=effective_cwd,
+            session = await self.harness.create_session(
                 backend=cfg.backend,
-                model_index=model_index,
+                model=cfg.model,
+                cwd=effective_cwd,
+                title=display_name,
+            )
+            session_id = session.get("id")
+            if not session_id:
+                raise RuntimeError("agent-harness create_session response missing id")
+            self.mapping.link(Anchor(channel_id), session_id)
+            self._known_sessions.add(session_id)
+            if allow_first_message_config:
+                self.awaiting_first_message.add(channel_id)
+            run = await self.harness.create_run(session_id, effective_initial)
+            self._track_run_response(session_id, run)
+            self._record_harness_send(session_id, effective_initial)
+            await self._update_resume_purpose(
+                channel_id, session_id, cfg.backend, effective_cwd,
             )
         except Exception:
-            logger.exception("Failed to create VD session for channel %s", channel_id)
-            self.pending_mm_sessions.pop(channel_id, None)
+            logger.exception("Failed to create agent-harness session for channel %s", channel_id)
             self.purpose_by_channel.pop(channel_id, None)
             try:
                 self.mm.post_message(
-                    channel_id, ":warning: Failed to start a VibeDeck session.",
+                    channel_id, ":warning: Failed to start an agent-harness session.",
                 )
             except Exception:
                 pass
             return
-
-        status = resp.get("status")
-        if status == "permission_denied":
-            self.pending_mm_sessions.pop(channel_id, None)
-            self.purpose_by_channel.pop(channel_id, None)
-            self.mm.post_message(
-                channel_id,
-                ":warning: VibeDeck could not start the session — needs additional permissions.",
-            )
-            return
-        if status != "started":
-            self.pending_mm_sessions.pop(channel_id, None)
-            self.purpose_by_channel.pop(channel_id, None)
-            self.mm.post_message(
-                channel_id,
-                f":warning: VibeDeck returned unexpected status `{status}` while starting the session.",
-            )
-            return
-
-        # VD may have normalised the cwd — keep pending in sync so the claim
-        # path matches projectPath from the SSE event.
-        cwd = resp.get("cwd") or effective_cwd
-        pending = self.pending_mm_sessions.get(channel_id)
-        if pending is not None:
-            pending.cwd = cwd
+        finally:
+            queued = self.warming_up_sessions.pop(channel_id, None)
 
         if post_welcome:
-            welcome = self._format_welcome(cfg, cwd)
+            welcome = self._format_welcome(cfg, effective_cwd)
             try:
                 self.mm.post_message(channel_id, welcome)
             except Exception:
                 logger.warning("Failed to post welcome message", exc_info=True)
+
+        if session_id and queued and queued.queued_messages:
+            await self._flush_queued(channel_id, session_id, queued.queued_messages)
 
     def _resolve_purpose_cwd(self, cfg: purpose.PurposeConfig) -> str:
         """Apply `cwd=` from the Channel Purpose, falling back to the default.
@@ -863,7 +834,7 @@ class Bridge:
         models_by_backend: dict[str, list[str]] = {}
         for b in purpose.KNOWN_BACKENDS:
             try:
-                models_by_backend[b] = await self.vd.list_models(b)
+                models_by_backend[b] = await self.harness.list_backend_models(b)
             except Exception:
                 models_by_backend[b] = []
 
@@ -929,73 +900,63 @@ class Bridge:
     ) -> None:
         """Tear down the current session for `channel_id` and start a new one.
 
-        We keep the MM channel and mapping slot; only the VD session is
-        replaced. The old session is abandoned (no explicit VD-side delete).
+        We keep the MM channel and mapping slot; only the harness session is
+        replaced. The old session is abandoned (no explicit backend delete).
         """
         self.mapping.unlink(Anchor(channel_id))
         self._end_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
         self._forget_channel_silent_drops(channel_id)
         self._session_triggerer.pop(old_session_id, None)
-        self._recent_vd_sends.pop(old_session_id, None)
+        self._recent_harness_sends.pop(old_session_id, None)
         if self.typing:
             await self.typing.stop(old_session_id)
         effective_cwd = self._resolve_purpose_cwd(cfg)
 
-        models_by_backend = await self._models_for_known_backends()
-        model_index = self._resolve_model_index(cfg, models_by_backend)
-
-        self.pending_mm_sessions[channel_id] = PendingMattermostSession(
-            channel_id=channel_id,
-            cwd=effective_cwd,
-            backend=cfg.backend,
-            initial_message=INVITE_PLACEHOLDER,
-            requested_at=time.monotonic(),
-            purpose_cfg=cfg,
-        )
+        self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
         self.purpose_by_channel[channel_id] = cfg
+        session_id: str | None = None
 
         try:
-            resp = await self.vd.create_session(
-                message=INVITE_PLACEHOLDER,
-                cwd=effective_cwd,
+            session = await self.harness.create_session(
                 backend=cfg.backend,
-                model_index=model_index,
+                model=cfg.model,
+                cwd=effective_cwd,
+            )
+            session_id = session.get("id")
+            if not session_id:
+                raise RuntimeError("agent-harness create_session response missing id")
+            self.mapping.link(Anchor(channel_id), session_id)
+            self._known_sessions.add(session_id)
+            run = await self.harness.create_run(session_id, INVITE_PLACEHOLDER)
+            self._track_run_response(session_id, run)
+            self._record_harness_send(session_id, INVITE_PLACEHOLDER)
+            await self._update_resume_purpose(
+                channel_id, session_id, cfg.backend, effective_cwd,
             )
         except Exception:
-            logger.exception("Failed to restart VD session for %s", channel_id)
-            self.pending_mm_sessions.pop(channel_id, None)
+            logger.exception("Failed to restart agent-harness session for %s", channel_id)
             try:
                 self.mm.post_message(
                     channel_id,
-                    ":warning: Failed to restart the VibeDeck session.",
+                    ":warning: Failed to restart the agent-harness session.",
                 )
             except Exception:
                 pass
             return
-
-        pending = self.pending_mm_sessions.get(channel_id)
-        if pending is not None:
-            pending.cwd = resp.get("cwd") or effective_cwd
+        finally:
+            queued = self.warming_up_sessions.pop(channel_id, None)
+        if session_id and queued and queued.queued_messages:
+            await self._flush_queued(channel_id, session_id, queued.queued_messages)
 
     async def _models_for_known_backends(self) -> dict[str, list[str]]:
         models: dict[str, list[str]] = {}
         for b in purpose.KNOWN_BACKENDS:
             try:
-                models[b] = await self.vd.list_models(b)
+                models[b] = await self.harness.list_backend_models(b)
             except Exception:
                 models[b] = []
         return models
-
-    def _resolve_model_index(
-        self, cfg: purpose.PurposeConfig, models_by_backend: dict[str, list[str]],
-    ) -> int | None:
-        if not cfg.model:
-            return None
-        for i, m in enumerate(models_by_backend.get(cfg.backend, [])):
-            if m.lower() == cfg.model.lower():
-                return i
-        return None
 
     async def _run_runtime_toggle(self, channel_id: str, message: str) -> None:
         """Handle a literal `autorespond` / `noautorespond` message.
@@ -1167,12 +1128,24 @@ class Bridge:
             if preamble:
                 body = f"{preamble}\n\n{body}" if body else preamble
 
-        logger.info("MM → VD [%s]: %s", session_id[:8], body[:80])
-        self._record_vd_send(session_id, body)
+        logger.info("MM → agent-harness [%s]: %s", session_id[:8], body[:80])
+        self._record_harness_send(session_id, body)
         try:
-            await self.vd.send_message(session_id, body)
+            run = await self.harness.create_run(session_id, body)
+            self._track_run_response(session_id, run)
+        except HarnessResumeUnsupported:
+            logger.warning("agent-harness resume unsupported for %s", session_id[:8])
+            try:
+                self.mm.post(
+                    channel_id,
+                    ":warning: Can't resume this external session from Mattermost.",
+                    root_id=thread_root,
+                )
+            except Exception:
+                pass
+            self._enqueue_silent_drop(channel_id, thread_root, post)
         except Exception:
-            logger.exception("Failed to send to VD session %s", session_id[:8])
+            logger.exception("Failed to create run for harness session %s", session_id[:8])
             try:
                 self.mm.post(
                     channel_id,
@@ -1287,8 +1260,8 @@ class Bridge:
         if not parent_session:
             return  # thread in an unmapped channel
 
-        parent_meta = await self.vd.get_session_meta(parent_session)
-        cwd = parent_meta.get("projectPath") or self.config.default_cwd
+        parent_meta = await self.harness.get_session(parent_session) or {}
+        cwd = (parent_meta.get("project") or {}).get("path") or self.config.default_cwd
 
         # Download attachments into the parent's cwd (the fork inherits it).
         attachment_notes: list[str] = []
@@ -1303,31 +1276,42 @@ class Bridge:
         fork_message = self._wrap_thread_fork_message(channel_id, root_id, message_for_llm)
 
         try:
-            resp = await self.vd.fork_session(parent_session, fork_message)
+            resp = await self.harness.fork_session(parent_session, message=fork_message)
+        except HarnessForkUnsupported as exc:
+            self._mark_dead_thread(
+                channel_id, root_id,
+                f"Couldn't fork ({exc or 'unsupported'}).",
+            )
+            return
         except Exception:
             logger.exception("fork_session error for session %s", parent_session[:8])
             self._mark_dead_thread(channel_id, root_id,
                                    "Couldn't fork this conversation.")
             return
 
-        if resp.get("status") == "fork_unavailable":
-            self._mark_dead_thread(channel_id, root_id,
-                                   f"Couldn't fork ({resp.get('reason', 'unsupported')}).")
+        session = resp.get("session") or {}
+        session_id = session.get("id")
+        if not session_id:
+            logger.warning("fork_session response missing session id: %r", resp)
+            self._mark_dead_thread(channel_id, root_id, "Couldn't fork this conversation.")
             return
 
-        self.pending_forks.append(PendingMattermostSession(
-            channel_id=channel_id,
-            cwd=cwd,
-            backend=parent_meta.get("backend") or None,
-            initial_message=fork_message,
-            requested_at=time.monotonic(),
-            is_fork=True,
-            fork_parent_session=parent_session,
-            fork_thread_channel=channel_id,
-            fork_thread_root=root_id,
-        ))
-        logger.info("Thread fork requested for %s:%s from parent %s",
-                    channel_id, root_id[:8], parent_session[:8])
+        self.mapping.link(Anchor(channel_id, root_id), session_id)
+        self._known_sessions.add(session_id)
+        self._record_harness_send(session_id, fork_message)
+        self._track_run_response(session_id, resp.get("run"))
+        logger.info("Thread fork linked for %s:%s from parent %s → %s",
+                    channel_id, root_id[:8], parent_session[:8], session_id[:8])
+        try:
+            self.mm.post(
+                channel_id,
+                ":information_source: _Forked conversation. The full history of the "
+                "parent session up to its current state is included — not only up to "
+                "the message you replied on._",
+                root_id=root_id,
+            )
+        except Exception:
+            logger.debug("Failed to post fork disclaimer", exc_info=True)
 
     def _wrap_thread_fork_message(
         self, channel_id: str, root_id: str, message: str,
@@ -1401,8 +1385,8 @@ class Bridge:
         carries the file the user uploaded before mentioning the bot.
         Returns ``(block_text, clear_key)``; callers should only pass
         ``clear_key`` to :meth:`_clear_silent_drops` after the forwarded
-        message has been successfully delivered to VD, so a transient
-        VD send failure doesn't discard queued conversation.
+        message has been successfully delivered to agent-harness, so a transient
+        send failure doesn't discard queued conversation.
         """
         key = (channel_id, thread_root)
         dropped = self._silent_drops.get(key)
@@ -1579,9 +1563,10 @@ class Bridge:
         lines, included_ids = self._collect_catch_up_lines(channel_id, n)
         block = self._format_catch_up_block(lines)
 
-        self._record_vd_send(session_id, block)
+        self._record_harness_send(session_id, block)
         try:
-            await self.vd.send_message(session_id, block)
+            run = await self.harness.create_run(session_id, block)
+            self._track_run_response(session_id, run)
         except Exception:
             logger.exception("Failed to send catch-up block")
             return
@@ -1620,7 +1605,7 @@ class Bridge:
                 self._end_tool_use_run(removed)
                 self.posters.forget(removed)
                 self._session_triggerer.pop(removed, None)
-                self._recent_vd_sends.pop(removed, None)
+                self._recent_harness_sends.pop(removed, None)
                 if self.typing:
                     await self.typing.stop(removed)
             farewell = (
@@ -1648,14 +1633,37 @@ class Bridge:
         session_id: str,
         thread_root: str | None,
     ) -> None:
-        try:
-            await self.vd.interrupt_session(session_id)
-        except Exception:
-            logger.exception("Failed to interrupt VD session %s", session_id[:8])
+        run_id = self.current_run_id_by_session.get(session_id)
+        if not run_id:
             try:
                 self.mm.post(
                     channel_id,
-                    ":warning: Couldn't interrupt the session.",
+                    ":octagonal_sign: Nothing to stop.",
+                    root_id=thread_root,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            await self.harness.interrupt_run(session_id, run_id)
+        except HarnessInterruptUnsupported:
+            try:
+                self.mm.post(
+                    channel_id,
+                    ":warning: Can't interrupt this run — external session, not owned by the harness.",
+                    root_id=thread_root,
+                )
+            except Exception:
+                pass
+            return
+        except HarnessRunNotFound:
+            pass
+        except Exception:
+            logger.exception("Failed to interrupt harness run %s/%s", session_id[:8], run_id[:8])
+            try:
+                self.mm.post(
+                    channel_id,
+                    ":warning: Couldn't interrupt the run.",
                     root_id=thread_root,
                 )
             except Exception:
@@ -1664,7 +1672,7 @@ class Bridge:
         self._end_tool_use_run(session_id)
         if self.typing:
             await self.typing.stop(session_id)
-        logger.info("MM → VD [%s]: stop (interrupt)", session_id[:8])
+        logger.info("MM → agent-harness [%s]: stop (interrupt)", session_id[:8])
         try:
             self.mm.post(channel_id, ":octagonal_sign: Stopped.", root_id=thread_root)
         except Exception:
@@ -1698,52 +1706,60 @@ class Bridge:
         self._end_tool_use_run(session_id)
         self.posters.forget(session_id)
         self._session_triggerer.pop(session_id, None)
-        self._recent_vd_sends.pop(session_id, None)
+        self._recent_harness_sends.pop(session_id, None)
         if self.typing:
             await self.typing.stop(session_id)
 
-    # ─────────────────────── VibeDeck SSE handlers ─────────────────────────
+    # ─────────────────────── agent-harness SSE handlers ───────────────────
 
-    async def _on_vd_event(self, event_type: str, data: dict) -> None:
-        if event_type == "session_added":
-            await self._on_vd_session_added(data)
+    async def _on_harness_event(self, event_type: str, data: dict) -> None:
+        inner = data.get("data", data) or {}
+        session_id = (
+            inner.get("session_id")
+            or (inner.get("session") or {}).get("id")
+            or data.get("session_id")
+        )
+        if session_id and event_type in HARNESS_ACTIVITY_EVENTS:
+            self.last_activity_ts[session_id] = time.monotonic()
+            await self._start_typing_for_activity(session_id)
+
+        if event_type == "session.updated":
+            await self._on_harness_session_seen(inner)
         elif event_type == "message":
-            await self._on_vd_message(data)
-        elif event_type == "session_summary_updated":
-            await self._on_vd_summary_updated(data)
-        elif event_type == "session_status":
-            await self._on_vd_session_status(data)
+            await self._on_harness_message(inner)
+        elif event_type in {
+            "message.delta",
+            "tool.call",
+            "tool.result",
+            "permission.denied",
+            "ping",
+        }:
+            return
+        elif event_type in HARNESS_RUN_TERMINAL_EVENTS or event_type == "run.started":
+            await self._on_harness_run_lifecycle(event_type, inner)
+        else:
+            logger.debug("Unhandled agent-harness event %s", event_type)
 
-    async def _on_vd_session_added(self, data: dict) -> None:
-        session_id = data.get("id") or data.get("session_id") or ""
+    async def _start_typing_for_activity(self, session_id: str) -> None:
+        if not self.typing:
+            return
+        anchor = self.mapping.get_anchor(session_id)
+        if not anchor:
+            return
+        await self.typing.start(session_id, anchor.channel_id, anchor.root_id)
+
+    async def _on_harness_session_seen(self, data: dict) -> None:
+        session = data.get("session") or data
+        session_id = session.get("id") or data.get("session_id") or ""
         if not session_id:
             return
         if self.mapping.get_anchor(session_id):
+            self._known_sessions.add(session_id)
             return  # already mapped
-
-        # First try fork-pending (thread invites).
-        if await self._claim_pending_fork(session_id, data):
+        if session_id in self._known_sessions:
             return
-        # Then try invite-pending (channel invites).
-        if await self._claim_pending_invite(session_id, data):
-            return
-        # Otherwise — CLI-originated session: create a fresh channel.
-        await self._create_channel_for_session(data)
-
-    def _expire_pending(self) -> None:
-        now = time.monotonic()
-        window = self.config.pending_session_merge_window_seconds
-        expired = [
-            cid for cid, p in self.pending_mm_sessions.items()
-            if now - p.requested_at >= window
-        ]
-        for cid in expired:
-            logger.warning("Pending invite expired for channel %s", cid)
-            self.pending_mm_sessions.pop(cid, None)
-        self.pending_forks = [
-            p for p in self.pending_forks
-            if now - p.requested_at < window
-        ]
+        self._known_sessions.add(session_id)
+        await self._create_channel_for_session(session)
 
     async def _update_resume_purpose(
         self,
@@ -1809,11 +1825,11 @@ class Bridge:
     async def _reconcile_resume_purposes(self) -> None:
         """Refresh the Resume block on every channel-level mapping.
 
-        Runs once at startup. Pulls each session's metadata from VibeDeck
+        Runs once at startup. Pulls each session's metadata from agent-harness
         so the resume command points at the right backend AND cwd even
         after a daemon restart (when ``purpose_by_channel`` is empty and
         the persisted MM Purpose may not name a backend either). Falls
-        back to the MM Purpose for backend resolution when VD doesn't
+        back to the MM Purpose for backend resolution when the harness doesn't
         know the session. Thread-fork anchors are skipped — a fork
         session lives inside a thread; writing its resume command into
         the parent channel's Purpose would clobber the channel session's
@@ -1838,9 +1854,9 @@ class Bridge:
     ) -> tuple[str | None, str | None]:
         """Resolve (backend, cwd) for a reconcile-time resume write.
 
-        Prefers VibeDeck's session metadata (the source of truth for cwd).
-        Falls back to the MM-side backend resolution when VD doesn't know
-        the session (stale mapping, VD restart since the mapping was
+        Prefers agent-harness session metadata (the source of truth for cwd).
+        Falls back to the MM-side backend resolution when the harness doesn't know
+        the session (stale mapping, harness restart since the mapping was
         persisted). Cwd is left None in the fallback path because we don't
         have a trustworthy source — the resume command stays runnable but
         omits the `cd` prefix.
@@ -1848,16 +1864,16 @@ class Bridge:
         backend: str | None = None
         cwd: str | None = None
         try:
-            meta = await self.vd.get_session_meta(session_id)
+            meta = await self.harness.get_session(session_id) or {}
         except Exception:
             meta = {}
             logger.debug(
-                "resume-purpose: VD meta lookup failed for %s",
+                "resume-purpose: agent-harness meta lookup failed for %s",
                 session_id[:8], exc_info=True,
             )
         if meta:
             backend = meta.get("backend") or meta.get("backendName") or None
-            cwd = meta.get("projectPath") or meta.get("cwd") or None
+            cwd = (meta.get("project") or {}).get("path") or meta.get("cwd") or None
         if not backend:
             backend = self._backend_for_channel(channel_id)
         return backend, cwd
@@ -1896,136 +1912,17 @@ class Bridge:
         )
         return parsed.backend or self.config.default_backend or None
 
-    async def _claim_pending_invite(self, session_id: str, data: dict) -> bool:
-        self._expire_pending()
-        incoming_cwd = _normalize_path(data.get("projectPath"))
-        incoming_backend_canon = vd_client.canon_backend(data.get("backend"))
-        first_msg = (data.get("firstMessage") or "").strip()
-
-        if not incoming_cwd:
-            return False
-
-        candidates: list[tuple[str, PendingMattermostSession]] = []
-        for channel_id, pending in self.pending_mm_sessions.items():
-            if _normalize_path(pending.cwd) != incoming_cwd:
-                continue
-            pending_backend_canon = vd_client.canon_backend(pending.backend)
-            if (pending_backend_canon and incoming_backend_canon
-                    and pending_backend_canon != incoming_backend_canon):
-                continue
-            if first_msg:
-                pending_msg = pending.initial_message.strip()
-                if not (
-                    pending_msg.startswith(first_msg)
-                    or first_msg.startswith(pending_msg)
-                ):
-                    continue
-            candidates.append((channel_id, pending))
-
-        if len(candidates) != 1:
-            return False
-
-        channel_id, pending = candidates[0]
-        self.mapping.link(Anchor(channel_id), session_id)
-        self.pending_mm_sessions.pop(channel_id, None)
-        if pending.allow_first_message_config:
-            self.awaiting_first_message.add(channel_id)
-        # The role=user echo VD will broadcast for this session's first
-        # turn carries the *full* body we shipped via `create_session`.
-        # `data["firstMessage"]` is the SSE-side preview field, which
-        # every backend's `get_first_user_message` truncates to 200 chars
-        # (see VD `backends/*/discovery.py`, `backends/claude_code/tailer.py`)
-        # — so dedup against `first_msg` misses on any session whose
-        # `effective_initial` exceeds 200 chars (almost always true once
-        # `initial_catch_up_n` prepends a catch-up block). Record the
-        # full `pending.initial_message` instead.
-        if pending.initial_message:
-            self._record_vd_send(session_id, pending.initial_message)
-        logger.info("Claimed pending invite: channel %s → session %s",
-                    channel_id, session_id[:8])
-        if pending.channel_display_name:
-            try:
-                await self.vd.set_session_title(
-                    session_id, pending.channel_display_name,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to seed VD session title for %s", session_id[:8],
-                    exc_info=True,
-                )
-        await self._update_resume_purpose(
-            channel_id, session_id, pending.backend, pending.cwd,
-        )
-        await self._flush_queued(channel_id, session_id, pending)
-        return True
-
-    async def _claim_pending_fork(self, session_id: str, data: dict) -> bool:
-        self._expire_pending()
-        incoming_cwd = _normalize_path(data.get("projectPath"))
-
-        # Fork claims can't use firstMessage: on Claude Code, a forked
-        # session's firstMessage is the parent's context-continuation summary,
-        # not the thread message. Match purely on cwd; if multiple forks are
-        # pending for the same cwd, take the oldest one (FIFO).
-        candidates: list[PendingMattermostSession] = [
-            p for p in self.pending_forks
-            if not incoming_cwd or _normalize_path(p.cwd) == incoming_cwd
-        ]
-
-        if not candidates:
-            return False
-        candidates.sort(key=lambda p: p.requested_at)
-        pending = candidates[0]
-        self.pending_forks.remove(pending)
-        ch_id = pending.fork_thread_channel or ""
-        root_id = pending.fork_thread_root or ""
-        if not ch_id or not root_id:
-            return False
-        self.mapping.link(Anchor(ch_id, root_id), session_id)
-        # On Claude Code, the fork's transcript receives TWO user-role
-        # entries we must keep out of the mirror:
-        #   1. Claude's synthetic continuation summary, surfaced as
-        #      `data["firstMessage"]` (truncated to 200 chars by VD's
-        #      `get_first_user_message`). Recording the truncated form
-        #      suffices in practice — observed continuation summaries
-        #      are well under the limit.
-        #   2. The wrapped `fork_message` we shipped via
-        #      `vd.fork_session(parent, fork_message)`, which Claude's
-        #      `build_fork_command` pipes over stdin and is written
-        #      into the new session's transcript verbatim. Record
-        #      `pending.initial_message` (the full body shipped) so
-        #      that echo is suppressed regardless of length —
-        #      otherwise the thread-context preamble + user reply
-        #      gets re-posted back into the same thread.
-        synth_first = (data.get("firstMessage") or "").strip()
-        if synth_first:
-            self._record_vd_send(session_id, synth_first)
-        if pending.initial_message:
-            self._record_vd_send(session_id, pending.initial_message)
-        logger.info("Claimed pending fork: thread %s:%s → session %s",
-                    ch_id, root_id[:8], session_id[:8])
-        try:
-            self.mm.post(
-                ch_id,
-                ":information_source: _Forked conversation. The full history of the "
-                "parent session up to its current state is included — not only up to "
-                "the message you replied on._",
-                root_id=root_id,
-            )
-        except Exception:
-            logger.debug("Failed to post fork disclaimer", exc_info=True)
-        return True
-
     async def _flush_queued(
         self,
         channel_id: str,
         session_id: str,
-        pending: PendingMattermostSession,
+        queued_messages: list[str],
     ) -> None:
-        for msg in pending.queued_messages:
-            self._record_vd_send(session_id, msg)
+        for msg in queued_messages:
+            self._record_harness_send(session_id, msg)
             try:
-                await self.vd.send_message(session_id, msg)
+                run = await self.harness.create_run(session_id, msg)
+                self._track_run_response(session_id, run)
             except Exception:
                 logger.exception("Failed to flush queued message")
                 try:
@@ -2042,10 +1939,10 @@ class Bridge:
         if not session_id:
             return None
         channel_name = _session_to_channel_name(session_id)
+        project = data.get("project") or {}
         display_name = (
-            data.get("summaryTitle")
-            or data.get("projectName")
-            or data.get("project", "")
+            data.get("title")
+            or project.get("name")
             or session_id[:12]
         )
         display_name = str(display_name)[:MM_DISPLAY_NAME_MAX]
@@ -2053,31 +1950,26 @@ class Bridge:
             ch = self.mm.create_channel(
                 name=channel_name,
                 display_name=display_name,
-                purpose=f"VibeDeck session {session_id}",
+                purpose=f"agent-harness session {session_id}",
             )
             channel_id = ch["id"]
             self.mapping.link(Anchor(channel_id), session_id)
             logger.info(
-                "Created channel %s (%s) for VD session %s",
+                "Created channel %s (%s) for agent-harness session %s",
                 display_name, channel_name, session_id[:12],
             )
         except Exception:
             logger.exception("Failed to create channel for session %s", session_id[:12])
             return None
-        # CLI-originated sessions get bound here rather than through
-        # `_claim_pending_invite`, so the Resume block has to be set
-        # explicitly. The SSE event carries the backend as a display name
-        # (`Claude Code`, `Codex`) and the cwd as `projectPath`;
-        # `_update_resume_purpose` normalises the backend internally.
         await self._update_resume_purpose(
             channel_id, session_id,
-            data.get("backend"), data.get("projectPath"),
+            data.get("backend"), project.get("path"),
         )
         return channel_id
 
-    # ----- VibeDeck message → Mattermost post -----
+    # ----- agent-harness message → Mattermost post -----
 
-    async def _on_vd_message(self, data: dict) -> None:
+    async def _on_harness_message(self, data: dict) -> None:
         session_id = data.get("session_id", "")
         msg = data.get("message", {}) or {}
         role = msg.get("role")
@@ -2124,22 +2016,22 @@ class Bridge:
 
     # ----- direct user-message mirroring -----
 
-    _RECENT_VD_SEND_MAX = 32
+    _RECENT_HARNESS_SEND_MAX = 32
 
-    def _record_vd_send(self, session_id: str, body: str) -> None:
+    def _record_harness_send(self, session_id: str, body: str) -> None:
         """Remember that we just shipped ``body`` to ``session_id`` so the
         SSE echo can be suppressed by ``_consume_dedup_match``."""
         if not session_id or not body:
             return
-        q = self._recent_vd_sends.setdefault(
-            session_id, deque(maxlen=self._RECENT_VD_SEND_MAX),
+        q = self._recent_harness_sends.setdefault(
+            session_id, deque(maxlen=self._RECENT_HARNESS_SEND_MAX),
         )
         q.append((time.monotonic(), body))
 
     def _consume_dedup_match(self, session_id: str, body: str) -> bool:
         """Return True (and pop the matching entry) if ``body`` matches a
-        recent VD send for ``session_id`` within the configured window."""
-        q = self._recent_vd_sends.get(session_id)
+        recent backend send for ``session_id`` within the configured window."""
+        q = self._recent_harness_sends.get(session_id)
         if not q:
             return False
         window = self.config.direct_user_message_dedup_window_seconds
@@ -2219,7 +2111,7 @@ class Bridge:
                 self._forget_thread_silent_drops(channel_id, thread_root)
                 self.posters.forget(session_id)
                 self._session_triggerer.pop(session_id, None)
-                self._recent_vd_sends.pop(session_id, None)
+                self._recent_harness_sends.pop(session_id, None)
                 if self.typing:
                     await self.typing.stop(session_id)
             else:
@@ -2335,8 +2227,8 @@ class Bridge:
         self.tool_use_runs.pop(session_id, None)
 
     async def _project_path_for(self, session_id: str) -> str | None:
-        meta = await self.vd.get_session_meta(session_id)
-        return meta.get("projectPath") or None
+        meta = await self.harness.get_session(session_id) or {}
+        return (meta.get("project") or {}).get("path") or None
 
     async def _save_mm_attachments(self, post: dict, cwd: str) -> list[str]:
         """Download MM file attachments into <cwd>/.mattermost-inbox/.
@@ -2395,53 +2287,38 @@ class Bridge:
             self._max_file_size = self.mm.get_max_file_size()
         return self._max_file_size
 
-    # ----- VibeDeck session_summary_updated → rename channel -----
+    # ----- agent-harness run lifecycle → typing indicator -----
 
-    async def _on_vd_summary_updated(self, data: dict) -> None:
+    async def _on_harness_run_lifecycle(self, event_type: str, data: dict) -> None:
         session_id = data.get("session_id", "")
-        title = data.get("summaryTitle", "") or ""
-        if not session_id or not title:
-            return
-        anchor = self.mapping.get_anchor(session_id)
-        # Only rename the MM channel for top-level channel sessions — for
-        # thread forks there's no channel rename to perform.
-        if not anchor or anchor.is_thread:
-            return
-        channel_id = anchor.channel_id
-        if not self.name_sync.should_sync("vd", session_id):
-            return
-        try:
-            self.mm.rename_channel(channel_id, title[:MM_DISPLAY_NAME_MAX])
-            self.name_sync.note_remote_update("mm", channel_id)
-            logger.info("VD summary → MM rename for %s", session_id[:8])
-        except Exception:
-            logger.warning("Failed to rename channel for %s", session_id[:8],
-                           exc_info=True)
-
-    # ----- VibeDeck session_status → typing indicator -----
-
-    async def _on_vd_session_status(self, data: dict) -> None:
-        session_id = data.get("session_id", "")
-        running = bool(data.get("running"))
         if not session_id:
             return
-        self.last_status_ts[session_id] = time.monotonic()
 
-        if not running:
-            # Safety net: clear any lingering tool-use placeholder when the
-            # turn ends without a final assistant text (interrupt, crash).
-            self._end_tool_use_run(session_id)
-            if self.typing:
-                await self.typing.stop(session_id)
-            self._mention_triggerer_on_done(session_id)
+        if event_type == "run.started":
+            await self._start_typing_for_activity(session_id)
             return
 
-        if not self.typing:
+        run_id = data.get("run_id") or data.get("id")
+        current = self.current_run_id_by_session.get(session_id)
+        if run_id and current == run_id:
+            self.current_run_id_by_session.pop(session_id, None)
+        self.last_activity_ts.pop(session_id, None)
+        self._end_tool_use_run(session_id)
+        if self.typing:
+            await self.typing.stop(session_id)
+        self._mention_triggerer_on_done(session_id)
+
+    async def _on_vd_session_status(self, data: dict) -> None:
+        """Compatibility wrapper for old tests during the backend port."""
+        session_id = data.get("session_id", "")
+        if data.get("running"):
+            await self._on_harness_run_lifecycle(
+                "run.started", {"session_id": session_id, "run_id": data.get("run_id")},
+            )
             return
-        anchor = self.mapping.get_anchor(session_id)
-        if not anchor:
-            return
-        await self.typing.start(session_id, anchor.channel_id, anchor.root_id)
+        await self._on_harness_run_lifecycle(
+            "run.completed", {"session_id": session_id, "run_id": data.get("run_id")},
+        )
 
     def _mention_triggerer_on_done(self, session_id: str) -> None:
         """Post ``@<username>`` in the session's channel/thread so the user

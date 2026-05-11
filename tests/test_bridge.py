@@ -6,7 +6,9 @@ import asyncio
 import tempfile
 import unittest
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from mm_bridge.agent_harness_client import HarnessForkUnsupported
 from mm_bridge.bridge import Bridge
 from mm_bridge.config import Anchor, Config
 
@@ -166,13 +168,14 @@ class FakeMattermostClient:
 
 
 @dataclass
-class FakeVibeDeckClient:
+class FakeAgentHarnessClient:
     created: list[dict] = field(default_factory=list)
     sent: list[tuple[str, str]] = field(default_factory=list)
     forks: list[tuple[str, str]] = field(default_factory=list)
     titles: list[tuple[str, str | None]] = field(default_factory=list)
     interrupted: list[str] = field(default_factory=list)
     next_session_id: str = "session-next"
+    session_create_count: int = 0
     fork_response: dict | None = None
     sessions_meta: list[dict] = field(default_factory=list)
     models_by_backend: dict = field(default_factory=lambda: {
@@ -188,42 +191,79 @@ class FakeVibeDeckClient:
     async def health(self) -> dict:
         return {"ok": True}
 
-    async def create_session(self, message, cwd, backend=None, model_index=None,
-                             source_session_id=None) -> dict:
+    async def create_session(
+        self,
+        *,
+        backend,
+        model=None,
+        cwd,
+        title=None,
+    ) -> dict:
         self.created.append({
-            "message": message, "cwd": cwd, "backend": backend,
-            "model_index": model_index, "source_session_id": source_session_id,
+            "cwd": cwd, "backend": backend, "model": model, "title": title,
         })
-        return {"status": "started", "cwd": cwd}
+        self.session_create_count += 1
+        session_id = self.next_session_id
+        if self.session_create_count > 1:
+            session_id = f"{self.next_session_id}-{self.session_create_count}"
+        return {
+            "id": session_id,
+            "backend": backend,
+            "model": model,
+            "project": {"path": cwd, "name": Path(cwd).name},
+            "title": title,
+            "origin": "harness",
+        }
+
+    async def create_run(self, session_id, message) -> dict:
+        self.sent.append((session_id, message))
+        return {"session_id": session_id, "run_id": f"run-{len(self.sent)}"}
 
     async def send_message(self, session_id, message) -> dict:
-        self.sent.append((session_id, message))
-        return {"status": "sent"}
+        return await self.create_run(session_id, message)
 
-    async def fork_session(self, session_id, message) -> dict:
+    async def fork_session(self, session_id, *, message=None, title=None) -> dict:
+        message = message or ""
         self.forks.append((session_id, message))
         if self.fork_response is not None:
+            if self.fork_response.get("status") == "fork_unavailable":
+                raise HarnessForkUnsupported(self.fork_response.get("reason", "unsupported"))
             return self.fork_response
-        return {"status": "forking", "session_id": session_id}
+        return {
+            "session": {"id": f"fork-{len(self.forks)}"},
+            "run": {"id": f"fork-run-{len(self.forks)}"},
+        }
 
     async def list_sessions(self) -> list[dict]:
         return self.sessions_meta
 
-    async def get_session_meta(self, session_id):
+    async def get_session(self, session_id):
         for s in self.sessions_meta:
             if s.get("id") == session_id:
+                if "project" not in s and s.get("projectPath"):
+                    return {**s, "project": {"path": s.get("projectPath")}}
                 return s
-        return {}
+        return None
+
+    async def get_session_meta(self, session_id):
+        return await self.get_session(session_id) or {}
 
     async def set_session_title(self, session_id, title) -> None:
         self.titles.append((session_id, title))
 
+    async def interrupt_run(self, session_id, run_id) -> dict:
+        self.interrupted.append((session_id, run_id))
+        return {"status": "interrupted", "session_id": session_id, "run_id": run_id}
+
     async def interrupt_session(self, session_id) -> dict:
-        self.interrupted.append(session_id)
+        await self.interrupt_run(session_id, "legacy-run")
         return {"status": "interrupted", "session_id": session_id}
 
-    async def list_models(self, backend, *, force_refresh: bool = False) -> list[str]:
+    async def list_backend_models(self, backend) -> list[str]:
         return self.models_by_backend.get(backend, [])
+
+    async def list_models(self, backend, *, force_refresh: bool = False) -> list[str]:
+        return await self.list_backend_models(backend)
 
     async def stream_events(self, on_event) -> None:
         return
@@ -245,7 +285,38 @@ class _BridgeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.bridge = Bridge(self.config)
         self.bridge.mm = FakeMattermostClient()
-        self.bridge.vd = FakeVibeDeckClient()
+        self.bridge.harness = FakeAgentHarnessClient()
+        self.bridge.vd = self.bridge.harness
+        self.bridge.warming_up_sessions = self.bridge.warming_up_sessions
+
+        async def _legacy_event(event_type: str, data: dict) -> None:
+            if event_type == "session_added":
+                session = {
+                    "id": data.get("id") or data.get("session_id"),
+                    "backend": data.get("backend"),
+                    "project": {
+                        "path": data.get("projectPath"),
+                        "name": data.get("projectName") or data.get("project") or "",
+                    },
+                    "title": data.get("summaryTitle"),
+                }
+                await self.bridge._on_harness_event(
+                    "session.updated",
+                    {"data": {"session_id": session["id"], "session": session}},
+                )
+                return
+            if event_type == "message":
+                await self.bridge._on_harness_event("message", {"data": data})
+                return
+            if event_type == "session_status":
+                lifecycle = "run.started" if data.get("running") else "run.completed"
+                await self.bridge._on_harness_event(lifecycle, {"data": data})
+
+        async def _legacy_session_added(data: dict) -> None:
+            await _legacy_event("session_added", data)
+
+        self.bridge._on_vd_event = _legacy_event
+        self.bridge._on_vd_session_added = _legacy_session_added
         from mm_bridge.typing_indicator import TypingIndicator
         self.bridge.typing = TypingIndicator(self.bridge.mm, refresh_s=0.01)
 
@@ -254,6 +325,56 @@ class _BridgeTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 # ───────────────────── Tests ──────────────────────────────────────────────
+
+
+class AgentHarnessBridgeTests(_BridgeTestCase):
+    async def test_forwarded_post_creates_run_and_tracks_run_id(self):
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        await self.bridge._on_mm_posted({
+            "id": "p1",
+            "channel_id": "c1",
+            "user_id": "u1",
+            "message": "hello harness",
+        })
+
+        self.assertEqual(self.bridge.harness.sent, [("codex_s1", "hello harness")])
+        self.assertEqual(
+            self.bridge.current_run_id_by_session["codex_s1"],
+            "run-1",
+        )
+
+    async def test_run_completed_clears_current_run_id(self):
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+        self.bridge.current_run_id_by_session["codex_s1"] = "run-1"
+
+        await self.bridge._on_harness_event(
+            "run.completed",
+            {"data": {"session_id": "codex_s1", "run_id": "run-1"}},
+        )
+
+        self.assertNotIn("codex_s1", self.bridge.current_run_id_by_session)
+
+    async def test_session_updated_unknown_session_creates_channel_once(self):
+        session = {
+            "id": "codex_new",
+            "backend": "codex",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "title": "External project",
+        }
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "codex_new", "session": session}},
+        )
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "codex_new", "session": session}},
+        )
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(len(created), 1)
+        self.assertIsNotNone(self.bridge.mapping.get_anchor("codex_new"))
 
 
 class InviteFlowTests(_BridgeTestCase):
@@ -265,128 +386,13 @@ class InviteFlowTests(_BridgeTestCase):
         self.assertEqual(len(self.bridge.vd.created), 1)
         self.assertEqual(self.bridge.vd.created[0]["cwd"], "/tmp/proj")
         self.assertEqual(self.bridge.vd.created[0]["backend"], "claude")
-        self.assertIn("c1", self.bridge.pending_mm_sessions)
+        self.assertEqual(
+            self.bridge.mapping.get_session(Anchor("c1")),
+            self.bridge.vd.next_session_id,
+        )
+        self.assertNotIn("c1", self.bridge.warming_up_sessions)
         # A welcome post (plus no warnings since purpose was empty).
         self.assertTrue(any("Session started" in p.message for p in self.bridge.mm.posted))
-
-    async def test_invite_claim_normalises_backend_name_variants(self):
-        """VD echoes the display name ('Claude Code', 'Codex') in session_added
-        while pending stores the purpose token ('claude', 'codex'). The claim
-        must still recognise them as the same backend."""
-        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "codex"}
-
-        orig_create = self.bridge.vd.create_session
-
-        async def create_that_renames_backend(**kwargs):
-            await self.bridge._on_vd_session_added({
-                "id": "s-new",
-                "projectPath": kwargs["cwd"],
-                "backend": "Codex",  # VD's SSE-side display form
-                "firstMessage": "Hello! I've just been added",
-            })
-            return await orig_create(**kwargs)
-
-        self.bridge.vd.create_session = create_that_renames_backend
-
-        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
-
-        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-new")
-
-    async def test_invite_claim_normalises_claude_to_claude_code(self):
-        """Purpose token 'claude' and VD's 'Claude Code' must be treated as the
-        same backend by the claim path."""
-        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude"}
-
-        orig_create = self.bridge.vd.create_session
-
-        async def create_that_renames_backend(**kwargs):
-            await self.bridge._on_vd_session_added({
-                "id": "s-claude",
-                "projectPath": kwargs["cwd"],
-                "backend": "Claude Code",
-                "firstMessage": "Hello! I've just been added",
-            })
-            return await orig_create(**kwargs)
-
-        self.bridge.vd.create_session = create_that_renames_backend
-
-        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
-
-        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-claude")
-
-    async def test_invite_claimed_when_session_added_fires_during_create(self):
-        """Regression: VD emits session_added SSE before create_session HTTP
-        returns, so the pending entry must be registered BEFORE the await."""
-        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
-
-        orig_create = self.bridge.vd.create_session
-
-        async def racing_create(**kwargs):
-            # SSE arrives mid-await, before create_session returns
-            await self.bridge._on_vd_session_added({
-                "id": "s-new",
-                "projectPath": kwargs["cwd"],
-                "backend": kwargs.get("backend") or "claude",
-                "firstMessage": "Hello! I've just been added",
-            })
-            return await orig_create(**kwargs)
-
-        self.bridge.vd.create_session = racing_create
-
-        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
-
-        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-new")
-        # No orphan auto-channel created by _create_channel_for_session
-        # (the claim does write a Resume: line into c1's header — that's
-        # the resume-header feature, asserted separately; here we only
-        # care that no second channel was conjured up).
-        self.assertEqual(set(self.bridge.mm.channels), {"c1"})
-
-    async def test_invite_sets_vd_session_title_from_mm_display_name(self):
-        """On claim, the VD session title mirrors the MM channel's display_name."""
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1", "purpose": "", "display_name": "My Project Discussion",
-        }
-
-        orig_create = self.bridge.vd.create_session
-
-        async def racing_create(**kwargs):
-            await self.bridge._on_vd_session_added({
-                "id": "s-new",
-                "projectPath": kwargs["cwd"],
-                "backend": kwargs.get("backend") or "claude",
-                "firstMessage": "Hello! I've just been added",
-            })
-            return await orig_create(**kwargs)
-
-        self.bridge.vd.create_session = racing_create
-
-        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
-
-        self.assertIn(("s-new", "My Project Discussion"), self.bridge.vd.titles)
-
-    async def test_invite_claim_skips_title_when_display_name_empty(self):
-        """Blank display_name → no title set (leave VD's default)."""
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1", "purpose": "", "display_name": "",
-        }
-
-        orig_create = self.bridge.vd.create_session
-
-        async def racing_create(**kwargs):
-            await self.bridge._on_vd_session_added({
-                "id": "s-new",
-                "projectPath": kwargs["cwd"],
-                "backend": kwargs.get("backend") or "claude",
-                "firstMessage": "Hello! I've just been added",
-            })
-            return await orig_create(**kwargs)
-
-        self.bridge.vd.create_session = racing_create
-
-        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
-
-        self.assertEqual(self.bridge.vd.titles, [])
 
     async def test_bot_invited_to_mapped_channel_is_noop(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
@@ -396,13 +402,13 @@ class InviteFlowTests(_BridgeTestCase):
 
         self.assertEqual(len(self.bridge.vd.created), 0)
 
-    async def test_purpose_with_model_resolves_model_index(self):
+    async def test_purpose_with_model_passes_model_verbatim(self):
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, sonnet"}
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
         self.assertEqual(self.bridge.vd.created[0]["backend"], "claude")
-        self.assertEqual(self.bridge.vd.created[0]["model_index"], 1)
+        self.assertEqual(self.bridge.vd.created[0]["model"], "sonnet")
 
     async def test_unknown_purpose_token_posts_warning_and_uses_defaults(self):
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "opusz"}
@@ -549,21 +555,15 @@ class ForwardingTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent, [("s1", "human msg")])
 
     async def test_posted_queues_while_session_pending(self):
-        self.bridge.pending_mm_sessions["c1"] = type(self.bridge.pending_mm_sessions.get("c1") or self.bridge)  # placeholder
-        # Use the real dataclass:
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message="placeholder", requested_at=_time.monotonic(),
-        )
+        from mm_bridge.bridge import WarmingUpChannel
+        self.bridge.warming_up_sessions["c1"] = WarmingUpChannel(channel_id="c1")
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "waiting msg", "user_id": "u1", "type": "",
         })
 
         self.assertIn("waiting msg",
-                      self.bridge.pending_mm_sessions["c1"].queued_messages)
+                      self.bridge.warming_up_sessions["c1"].queued_messages)
         self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_attribution_kicks_in_on_second_user(self):
@@ -801,7 +801,7 @@ class ForwardingTests(_BridgeTestCase):
         async def failing_send(session_id, message):
             raise RuntimeError("simulated VD outage")
 
-        self.bridge.vd.send_message = failing_send  # type: ignore[assignment]
+        self.bridge.vd.create_run = failing_send  # type: ignore[assignment]
         await self.bridge._on_mm_posted({
             "id": "trigger-1", "channel_id": "c1", "message": "@claude first try",
             "user_id": "u1", "type": "",
@@ -822,7 +822,7 @@ class ForwardingTests(_BridgeTestCase):
             captured.append((session_id, message))
             return {"status": "sent"}
 
-        self.bridge.vd.send_message = ok_send  # type: ignore[assignment]
+        self.bridge.vd.create_run = ok_send  # type: ignore[assignment]
         await self.bridge._on_mm_posted({
             "id": "trigger-2", "channel_id": "c1", "message": "@claude second try",
             "user_id": "u1", "type": "",
@@ -1141,7 +1141,7 @@ class InitialCatchUpTests(_BridgeTestCase):
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
         self.assertEqual(len(self.bridge.vd.created), 1)
-        first_msg = self.bridge.vd.created[0]["message"]
+        first_msg = self.bridge.vd.sent[0][1]
         self.assertIn("Catch-up context", first_msg)
         self.assertIn("earlier chat", first_msg)
         self.assertIn("more chat", first_msg)
@@ -1163,7 +1163,7 @@ class InitialCatchUpTests(_BridgeTestCase):
         })
 
         self.assertEqual(len(self.bridge.vd.created), 1)
-        first_msg = self.bridge.vd.created[0]["message"]
+        first_msg = self.bridge.vd.sent[0][1]
         self.assertIn("old message", first_msg)
         self.assertNotIn("@claude hi\n[End of catch-up]", first_msg)
         # The engagement msg itself is still the post-catch-up payload.
@@ -1178,7 +1178,7 @@ class InitialCatchUpTests(_BridgeTestCase):
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
-        first_msg = self.bridge.vd.created[0]["message"]
+        first_msg = self.bridge.vd.sent[0][1]
         self.assertNotIn("Catch-up context", first_msg)
 
     async def test_empty_channel_skips_block(self):
@@ -1188,7 +1188,7 @@ class InitialCatchUpTests(_BridgeTestCase):
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
-        first_msg = self.bridge.vd.created[0]["message"]
+        first_msg = self.bridge.vd.sent[0][1]
         self.assertNotIn("Catch-up context", first_msg)
 
 
@@ -1215,35 +1215,38 @@ class LeaveTests(_BridgeTestCase):
 class StopCommandTests(_BridgeTestCase):
     async def test_stop_command_in_channel_interrupts_session(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@claude stop",
             "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.interrupted, ["s1"])
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
         self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_stop_command_case_insensitive(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@Claude STOP",
             "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.interrupted, ["s1"])
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
 
     async def test_stop_command_in_thread_interrupts_thread_session(self):
         self.bridge.mapping.link(Anchor("c1"), "parent-s")
         self.bridge.mapping.link(Anchor("c1", "r1"), "fork-s")
+        self.bridge.current_run_id_by_session["fork-s"] = "run-fork"
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "@claude stop",
             "user_id": "u1", "type": "", "root_id": "r1",
         })
 
-        self.assertEqual(self.bridge.vd.interrupted, ["fork-s"])
+        self.assertEqual(self.bridge.vd.interrupted, [("fork-s", "run-fork")])
 
     async def test_stop_with_trailing_text_is_regular_message(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
@@ -1270,13 +1273,14 @@ class StopCommandTests(_BridgeTestCase):
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model=None, mention_only=False,
         )
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "stop",
             "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.interrupted, ["s1"])
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
 
     async def test_bare_stop_in_mention_only_mode_is_not_interrupt(self):
         from mm_bridge.purpose import PurposeConfig
@@ -1299,13 +1303,14 @@ class StopCommandTests(_BridgeTestCase):
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model=None, mention_only=False,
         )
+        self.bridge.current_run_id_by_session["fork-s"] = "run-fork"
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "stop",
             "user_id": "u1", "type": "", "root_id": "r1",
         })
 
-        self.assertEqual(self.bridge.vd.interrupted, ["fork-s"])
+        self.assertEqual(self.bridge.vd.interrupted, [("fork-s", "run-fork")])
 
 
 class FirstMessageConfigTests(_BridgeTestCase):
@@ -1320,12 +1325,10 @@ class FirstMessageConfigTests(_BridgeTestCase):
         """Simulate a successful invite: session mapped, awaiting first message."""
         self.bridge.mm.channels[channel_id] = {"id": channel_id, "purpose": purpose}
         await self.bridge._on_mm_user_added(channel_id, self.bridge.mm.bot_user_id)
-        # Pretend the SSE claim succeeded with the session we pretend-created.
-        pending = self.bridge.pending_mm_sessions.pop(channel_id, None)
-        assert pending is not None
-        session_id = "s-primed"
-        self.bridge.mapping.link(Anchor(channel_id), session_id)
+        session_id = self.bridge.mapping.get_session(Anchor(channel_id))
+        assert session_id is not None
         self.bridge.awaiting_first_message.add(channel_id)
+        self.bridge.vd.sent.clear()
         return session_id
 
     async def test_non_config_first_message_forwards_normally(self):
@@ -1379,7 +1382,7 @@ class FirstMessageConfigTests(_BridgeTestCase):
 
         # Old session unmapped, a new session created.
         self.assertEqual(len(self.bridge.vd.created), 1)
-        self.assertEqual(self.bridge.vd.created[0]["model_index"], 1)  # sonnet=1
+        self.assertEqual(self.bridge.vd.created[0]["model"], "sonnet")
         # Original session no longer linked.
         self.assertNotEqual(self.bridge.mapping.get_session(Anchor("c1")), session_id)
         # Persisted.
@@ -1513,150 +1516,6 @@ class PurposeUpdateNoticeTests(_BridgeTestCase):
 
 
 class SessionAddedClaimTests(_BridgeTestCase):
-    async def test_session_added_claims_pending_invite(self):
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message="placeholder", requested_at=_time.monotonic(),
-        )
-
-        await self.bridge._on_vd_event("session_added", {
-            "id": "sess-new", "projectPath": "/tmp/proj",
-            "firstMessage": "placeholder", "backend": "claude",
-        })
-
-        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "sess-new")
-        self.assertNotIn("c1", self.bridge.pending_mm_sessions)
-
-    async def test_invite_claim_writes_claude_resume_block_to_purpose(self):
-        """Default `dangerous_permissions=True` → include the elevated flag.
-        Block lives in Purpose under the section separator; Header is left
-        alone (operator content like `Parent: ~root~` stays untouched)."""
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1", "purpose": "claude", "header": "Parent: ~root~",
-        }
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message="placeholder", requested_at=_time.monotonic(),
-        )
-
-        await self.bridge._on_vd_event("session_added", {
-            "id": "sess-new", "projectPath": "/tmp/proj",
-            "firstMessage": "placeholder", "backend": "Claude Code",
-        })
-
-        self.assertEqual(
-            self.bridge.mm.channels["c1"]["purpose"],
-            "claude\n"
-            "\n"
-            "---\n"
-            "\n"
-            "Resume:\n"
-            "```\n"
-            "cd /tmp/proj && claude --resume sess-new "
-            "--dangerously-skip-permissions\n"
-            "```",
-        )
-        # Header is NOT touched.
-        self.assertEqual(self.bridge.mm.channels["c1"]["header"], "Parent: ~root~")
-        self.assertEqual(self.bridge.mm.headers, [])
-
-    async def test_invite_claim_without_dangerous_permissions_omits_flag(self):
-        """Operator opted out via `dangerous_permissions=False` → no flag."""
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
-        self.bridge.config.dangerous_permissions = False
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1", "purpose": "codex", "header": "",
-        }
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="codex",
-            initial_message="placeholder", requested_at=_time.monotonic(),
-        )
-
-        await self.bridge._on_vd_event("session_added", {
-            "id": "sess-codex", "projectPath": "/tmp/proj",
-            "firstMessage": "placeholder", "backend": "Codex",
-        })
-
-        self.assertEqual(
-            self.bridge.mm.channels["c1"]["purpose"],
-            "codex\n"
-            "\n"
-            "---\n"
-            "\n"
-            "Resume:\n"
-            "```\n"
-            "cd /tmp/proj && codex resume sess-codex\n"
-            "```",
-        )
-
-    async def test_invite_claim_unsupported_backend_leaves_purpose_unchanged(self):
-        """`pi` is a known purpose token but has no resume command — the
-        bridge must not write to Purpose at all (no spurious clobber of
-        the operator-set config section). Only asserts behaviour when
-        there is no prior resume block to clean up; the stale-block case
-        is covered by `test_invite_claim_unsupported_backend_strips_stale_resume_block`."""
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1", "purpose": "pi", "header": "Operator note",
-        }
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="pi",
-            initial_message="placeholder", requested_at=_time.monotonic(),
-        )
-
-        await self.bridge._on_vd_event("session_added", {
-            "id": "sess-pi", "projectPath": "/tmp/proj",
-            "firstMessage": "placeholder", "backend": "pi",
-        })
-
-        self.assertEqual(self.bridge.mm.channels["c1"]["purpose"], "pi")
-        self.assertEqual(self.bridge.mm.purposes, [])
-
-    async def test_invite_claim_unsupported_backend_strips_stale_resume_block(self):
-        """A channel that switched from claude/codex to pi/opencode must
-        not keep advertising a copy-paste command for the abandoned
-        previous session. When the bridge claims a session for an
-        unsupported backend AND a stale resume block exists in Purpose,
-        the stale block is removed."""
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1",
-            "purpose": (
-                "pi\n"
-                "\n"
-                "---\n"
-                "\n"
-                "Resume:\n```\ncd /old && claude --resume old-sess\n```"
-            ),
-        }
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="pi",
-            initial_message="placeholder", requested_at=_time.monotonic(),
-        )
-
-        await self.bridge._on_vd_event("session_added", {
-            "id": "sess-pi", "projectPath": "/tmp/proj",
-            "firstMessage": "placeholder", "backend": "pi",
-        })
-
-        # Stale resume block stripped; config section preserved.
-        self.assertEqual(self.bridge.mm.channels["c1"]["purpose"], "pi")
-        self.assertEqual(
-            self.bridge.mm.purposes[-1],
-            ("c1", "pi"),
-        )
-
     async def test_reconcile_resume_purposes_uses_vd_meta_for_cwd_and_backend(self):
         """Reconcile is the only path that runs after a daemon restart, so
         backend + cwd both come from VibeDeck's session metadata. The
@@ -1762,7 +1621,7 @@ class SessionAddedClaimTests(_BridgeTestCase):
         new_channel = self.bridge.mm.channels[anchor.channel_id]
         self.assertEqual(
             new_channel.get("purpose"),
-            "VibeDeck session sess-cli\n"
+            "agent-harness session sess-cli\n"
             "\n"
             "---\n"
             "\n"
@@ -1826,7 +1685,7 @@ class ThreadForkTests(_BridgeTestCase):
         self.assertIn("Mattermost thread context", fork_msg)
         self.assertIn("> root post body", fork_msg)
         self.assertTrue(fork_msg.endswith("thread starter"))
-        self.assertEqual(len(self.bridge.pending_forks), 1)
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1", "r1")), "fork-1")
 
     async def test_thread_fork_unavailable_marks_dead(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
@@ -1840,34 +1699,6 @@ class ThreadForkTests(_BridgeTestCase):
         })
 
         self.assertIn(("c1", "r1"), self.bridge.dead_threads)
-        self.assertEqual(len(self.bridge.pending_forks), 0)
-
-    async def test_session_added_claims_fork_then_posts_disclaimer(self):
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-        self.bridge.mapping.link(Anchor("c1"), "s1")
-        self.bridge.pending_forks.append(PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message="thread starter", requested_at=_time.monotonic(),
-            is_fork=True, fork_parent_session="s1",
-            fork_thread_channel="c1", fork_thread_root="r1",
-        ))
-
-        # On Claude Code, a fork's firstMessage is the parent's
-        # context-continuation summary — NOT the user's thread message.
-        # The claim must succeed anyway (matched by cwd).
-        await self.bridge._on_vd_event("session_added", {
-            "id": "sess-fork", "projectPath": "/tmp/proj",
-            "firstMessage": "This session is being continued from a previous conversation...",
-            "backend": "claude",
-        })
-
-        self.assertEqual(
-            self.bridge.mapping.get_session(Anchor("c1", "r1")), "sess-fork",
-        )
-        disclaimer = [p for p in self.bridge.mm.posted if "Forked conversation" in p.message]
-        self.assertEqual(len(disclaimer), 1)
-        self.assertEqual(disclaimer[0].root_id, "r1")
 
 
 class AssistantMessageTests(_BridgeTestCase):
@@ -1976,17 +1807,8 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
     async def test_first_message_after_invite_claim_is_swallowed(self):
         """The first user-role event after an invite-claim is the
         firstMessage we shipped via create_session — not direct input."""
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message="kick-off prompt", requested_at=_time.monotonic(),
-        )
-        await self.bridge._on_vd_event("session_added", {
-            "id": "s-inv", "projectPath": "/tmp/proj", "backend": "claude",
-            "firstMessage": "kick-off prompt",
-        })
+        self.bridge.mapping.link(Anchor("c1"), "s-inv")
+        self.bridge._record_harness_send("s-inv", "kick-off prompt")
 
         before = len(self.bridge.mm.posted)
         await self._direct_user_text("s-inv", "kick-off prompt")
@@ -2002,9 +1824,6 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
         and the catch-up block leaks into MM as `_via coding agent: …`.
         Fix: record `pending.initial_message` (the full body actually
         shipped) instead of `firstMessage`."""
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
         full_body = (
             "[catch-up: last 50 messages]\n"
             + ("\n".join(f"- u{i}: line {i} of context" for i in range(50)))
@@ -2014,14 +1833,8 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
         self.assertGreater(len(full_body), 200)
         truncated = full_body[:200]
 
-        self.bridge.pending_mm_sessions["c1"] = PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message=full_body, requested_at=_time.monotonic(),
-        )
-        await self.bridge._on_vd_event("session_added", {
-            "id": "s-inv", "projectPath": "/tmp/proj", "backend": "claude",
-            "firstMessage": truncated,
-        })
+        self.bridge.mapping.link(Anchor("c1"), "s-inv")
+        self.bridge._record_harness_send("s-inv", full_body)
 
         before = len(self.bridge.mm.posted)
         await self._direct_user_text("s-inv", full_body)
@@ -2041,9 +1854,6 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
         plus the user's MM thread reply gets re-posted back into the
         same thread as `_via coding agent: …`.
         """
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
         self.bridge.mapping.link(Anchor("c1"), "s1")
         fork_message = (
             "[Mattermost thread context] You are continuing the parent "
@@ -2052,16 +1862,8 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
             "Their reply follows:\n\n"
             "thread starter"
         )
-        self.bridge.pending_forks.append(PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message=fork_message, requested_at=_time.monotonic(),
-            is_fork=True, fork_parent_session="s1",
-            fork_thread_channel="c1", fork_thread_root="r1",
-        ))
-        await self.bridge._on_vd_event("session_added", {
-            "id": "s-fork", "projectPath": "/tmp/proj", "backend": "claude",
-            "firstMessage": "This session is being continued from a previous conversation...",
-        })
+        self.bridge.mapping.link(Anchor("c1", "r1"), "s-fork")
+        self.bridge._record_harness_send("s-fork", fork_message)
 
         before = len(self.bridge.mm.posted)
         await self._direct_user_text("s-fork", fork_message)
@@ -2074,21 +1876,10 @@ class DirectUserMessageMirrorTests(_BridgeTestCase):
     async def test_fork_continuation_preamble_is_swallowed(self):
         """Claude Code forks emit a synthetic continuation summary as
         firstMessage. It is NOT user-typed input — must be suppressed."""
-        from mm_bridge.bridge import PendingMattermostSession
-        import time as _time
-
         self.bridge.mapping.link(Anchor("c1"), "s1")
-        self.bridge.pending_forks.append(PendingMattermostSession(
-            channel_id="c1", cwd="/tmp/proj", backend="claude",
-            initial_message="thread starter", requested_at=_time.monotonic(),
-            is_fork=True, fork_parent_session="s1",
-            fork_thread_channel="c1", fork_thread_root="r1",
-        ))
         synth = "This session is being continued from a previous conversation..."
-        await self.bridge._on_vd_event("session_added", {
-            "id": "s-fork", "projectPath": "/tmp/proj", "backend": "claude",
-            "firstMessage": synth,
-        })
+        self.bridge.mapping.link(Anchor("c1", "r1"), "s-fork")
+        self.bridge._record_harness_send("s-fork", synth)
 
         before = len(self.bridge.mm.posted)
         await self._direct_user_text("s-fork", synth)
@@ -2337,27 +2128,6 @@ class ToolUseCoalescingTests(_BridgeTestCase):
 
 
 class NameSyncTests(_BridgeTestCase):
-    async def test_channel_renamed_syncs_title_to_vibedeck(self):
-        self.bridge.mapping.link(Anchor("c1"), "s1")
-        self.bridge.last_channel_state["c1"] = {
-            "display_name": "old", "purpose": "",
-        }
-
-        await self.bridge._on_mm_channel_updated({
-            "id": "c1", "display_name": "new-name", "purpose": "",
-        })
-
-        self.assertEqual(self.bridge.vd.titles, [("s1", "new-name")])
-
-    async def test_summary_updated_renames_channel(self):
-        self.bridge.mapping.link(Anchor("c1"), "s1")
-
-        await self.bridge._on_vd_event("session_summary_updated", {
-            "session_id": "s1", "summaryTitle": "Great Session",
-        })
-
-        self.assertEqual(self.bridge.mm.renames, [("c1", "Great Session")])
-
     async def test_name_sync_prevents_ping_pong(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.name_sync.note_remote_update("mm", "c1")
@@ -2409,12 +2179,16 @@ class AutoJoinTests(_BridgeTestCase):
 
         # VD session created with the engagement message (mention stripped).
         self.assertEqual(len(self.bridge.vd.created), 1)
-        self.assertEqual(self.bridge.vd.created[0]["message"], "hello there")
-        # Pending registered, not yet mapped (awaits SSE claim).
-        self.assertIn("c1", self.bridge.pending_mm_sessions)
-        pending = self.bridge.pending_mm_sessions["c1"]
-        self.assertFalse(
-            pending.allow_first_message_config,
+        self.assertEqual(self.bridge.vd.sent[0][1], "hello there")
+        # Synchronous harness create links immediately; no SSE claim remains.
+        self.assertEqual(
+            self.bridge.mapping.get_session(Anchor("c1")),
+            self.bridge.vd.next_session_id,
+        )
+        self.assertNotIn("c1", self.bridge.warming_up_sessions)
+        self.assertNotIn(
+            "c1",
+            self.bridge.awaiting_first_message,
             "engagement sessions must not re-enter the first-message config gate",
         )
         # No welcome message for engagement — the response is the welcome.
@@ -2429,7 +2203,7 @@ class AutoJoinTests(_BridgeTestCase):
         })
 
         self.assertEqual(self.bridge.vd.created, [])
-        self.assertNotIn("c1", self.bridge.pending_mm_sessions)
+        self.assertNotIn("c1", self.bridge.warming_up_sessions)
 
     async def test_autorespond_purpose_engages_on_any_message(self):
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
@@ -2441,7 +2215,7 @@ class AutoJoinTests(_BridgeTestCase):
 
         self.assertEqual(len(self.bridge.vd.created), 1)
         self.assertEqual(
-            self.bridge.vd.created[0]["message"], "no mention at all",
+            self.bridge.vd.sent[0][1], "no mention at all",
         )
 
     async def test_mention_with_pure_config_applies_without_session(self):
@@ -2455,7 +2229,7 @@ class AutoJoinTests(_BridgeTestCase):
 
         # No VD session created — message was pure config.
         self.assertEqual(self.bridge.vd.created, [])
-        self.assertNotIn("c1", self.bridge.pending_mm_sessions)
+        self.assertNotIn("c1", self.bridge.warming_up_sessions)
         # Purpose cached + persisted.
         self.assertIn("c1", self.bridge.purpose_by_channel)
         self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
@@ -2486,7 +2260,7 @@ class AutoJoinTests(_BridgeTestCase):
         })
 
         self.assertEqual(len(self.bridge.vd.created), 1)
-        self.assertEqual(self.bridge.vd.created[0]["message"], "hello there")
+        self.assertEqual(self.bridge.vd.sent[0][1], "hello there")
 
     async def test_engagement_disabled_when_auto_join_disabled(self):
         self.config.auto_join_public_channels = False
