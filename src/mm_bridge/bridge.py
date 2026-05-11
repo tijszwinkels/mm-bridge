@@ -327,8 +327,18 @@ class Bridge:
                 exc_info=True,
             )
             sessions = []
-        self._known_sessions = {s["id"] for s in sessions if s.get("id")}
-        self._known_sessions.update(self.mapping.session_to_anchor.keys())
+        self._known_sessions = set(self.mapping.session_to_anchor.keys())
+        for session in sessions:
+            session_id = session.get("id")
+            if not session_id:
+                continue
+            if self.mapping.get_anchor(session_id):
+                self._known_sessions.add(session_id)
+                continue
+            if session.get("origin") != "external":
+                continue
+            if await self._create_channel_for_session(session):
+                self._known_sessions.add(session_id)
 
     def _track_run_response(self, session_id: str, run: dict | None) -> None:
         if not run:

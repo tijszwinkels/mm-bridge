@@ -1,7 +1,7 @@
 [project]
 name = "mm-bridge"
 version = "0.1.0"
-description = "Mattermost ↔ VibeDeck bridge — one channel per Claude session"
+description = "Mattermost ↔ agent-harness bridge — one channel per coding-agent session"
 requires-python = ">=3.11"
 dependencies = [
     "mattermostautodriver>=2.0.0",

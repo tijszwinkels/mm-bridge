@@ -1,10 +1,10 @@
 # mm-bridge
 
-Mattermost ↔ [VibeDeck](https://github.com/tijszwinkels/VibeDeck) bridge — one channel (or thread) per Claude / Codex session.
+Mattermost ↔ agent-harness bridge — one channel (or thread) per Claude Code / Codex session.
 
-A daemon connects a Mattermost bot account (conventionally `@claude`) to a local VibeDeck instance and maps conversations to sessions:
+A daemon connects a Mattermost bot account (conventionally `@claude`) to an agent-harness instance and maps conversations to sessions:
 
-- **A channel** the bot is invited to → one VibeDeck session. Messages in the channel become user turns; assistant replies stream back as posts.
+- **A channel** the bot is invited to → one agent-harness session. Messages in the channel become user turns; assistant replies stream back as posts.
 - **A thread** inside a channel → its own *forked* session, so side-quests don't pollute the main conversation.
 - **`mm-bridge spawn "<prompt>"`** from inside a session → a fresh sibling channel with its own session, with the parent announced via a post that links the child's `~channel~` header back upstream.
 
@@ -13,7 +13,7 @@ Each session gets a small **sidecar file** (`~/.mm-bridge/sessions/<session_id>`
 The CLI discovers the current session id from one of four sources, in order:
 
 1. **`CLAUDE_SESSION_ID`** — populated by Claude Code's SessionStart hook (`~/.claude/hooks/export-session-id.sh`).
-2. **`MM_BRIDGE_SESSION_ID`** — backend-agnostic env var. VibeDeck pins this into the codex tool-shell environment via `-c shell_environment_policy.set` on `codex exec resume` and `codex fork`.
+2. **`MM_BRIDGE_SESSION_ID`** — backend-agnostic env var. agent-harness pins this into backend tool-shell environments when available.
 3. **Live-codex parent (`/proc` tie-breaker)** — Linux-only. When env vars miss, walk the parent-pid chain (depth ≤ 8) for a process whose `/proc/<pid>/comm` is `codex` and read the rollout filename out of its open fds. The UUID embedded in that filename is adopted directly. This is what disambiguates the "multiple codex sessions in the same cwd" case: only the codex actually in our ancestor chain is the one we belong to. Returns nothing on macOS (no `/proc`), background tasks where the codex parent already exited, or when the codex ancestor has no rollout fd held open — those cases fall through to step 4.
 4. **Cwd-matched codex rollout** — final fallback that scans `~/.codex/sessions/.../rollout-*.jsonl` in most-recently-active order and walks candidates whose `payload.cwd` matches the (canonicalised) caller cwd, adopting the first one whose sidecar reads back as a valid channel anchor. Helps tool shells whose codex launcher couldn't pre-pin the env var (typically the very first turn of a fresh session) and tool shells that outlive their codex parent. Note: there's a brief startup race between codex starting and the daemon writing the sidecar — if mm-bridge is invoked in that window the fallback fails cleanly with a "not in MM channel" error, which is the same behaviour the Claude Code path has had.
 
@@ -123,7 +123,7 @@ catch_up_max_n     = 500
 
 ### `mm-bridge serve`
 
-Runs the daemon. Connects to Mattermost (WebSocket + REST), subscribes to VibeDeck SSE, and relays messages in both directions.
+Runs the daemon. Connects to Mattermost (WebSocket + REST), subscribes to agent-harness SSE, and relays messages in both directions.
 
 ```bash
 mm-bridge serve
@@ -143,7 +143,7 @@ Prints the current session's `channel_id` (debug / scripting).
 
 ### `mm-bridge spawn [opts] "<prompt>"`
 
-Creates a fresh sibling channel with its own VibeDeck session and kicks off `<prompt>`. Options:
+Creates a fresh sibling channel with its own agent-harness session and kicks off `<prompt>`. Options:
 
 - `--title "<name>"` — display name for the new channel (default: derived from the prompt).
 - `--cwd <path>` — working directory for the new session.

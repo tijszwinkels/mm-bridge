@@ -276,14 +276,18 @@ def cmd_invite(args: argparse.Namespace) -> int:
 
 
 async def _harness_create_session(
-    harness_url: str, message: str, cwd: str, backend: str | None,
+    harness_url: str,
+    message: str,
+    cwd: str,
+    backend: str | None,
+    model: str | None,
 ) -> dict:
     """Async wrapper: one-shot harness client for the spawn CLI path."""
     harness = AgentHarnessClient(harness_url)
     try:
         session = await harness.create_session(
             backend=backend or "claude",
-            model=None,
+            model=model,
             cwd=cwd,
         )
         session_id = session.get("id")
@@ -866,7 +870,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     try:
         resp = asyncio.run(
-            _harness_create_session(cfg.agent_harness_url, args.prompt, cwd, backend),
+            _harness_create_session(
+                cfg.agent_harness_url,
+                args.prompt,
+                cwd,
+                backend,
+                cfg.default_model,
+            ),
         )
     except Exception as exc:
         print(f"Error: agent-harness create_session failed: {exc}", file=sys.stderr)
@@ -1003,7 +1013,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mm-bridge",
-        description="Mattermost ↔ VibeDeck bridge.",
+        description="Mattermost ↔ agent-harness bridge.",
     )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -1101,7 +1111,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_spawn = sub.add_parser(
         "spawn",
-        help="Start a VibeDeck sub-session in a new sibling MM channel.",
+        help="Start an agent-harness sub-session in a new sibling MM channel.",
     )
     p_spawn.add_argument(
         "prompt",
