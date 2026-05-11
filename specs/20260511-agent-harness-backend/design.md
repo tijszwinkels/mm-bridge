@@ -85,6 +85,12 @@ class AgentHarnessClient:
         Not used by the bridge today; included so tests have a probe.
         """
 
+    async def health(self) -> dict:
+        """GET /v1/health → {"status": "ok"} on a healthy harness.
+        Raises on 4xx/5xx so callers can fall back to list_sessions as a
+        legacy-build compatibility probe (see US-5.5).
+        """
+
     # ── SSE ─────────────────────────────────────────────────────────────────
 
     async def stream_events(
@@ -506,8 +512,11 @@ Belt-and-braces list so the implementor can grep and verify nothing dangling:
 2. `from .vd_client import VibeDeckClient` import and the `vd_client` package
    re-import at `bridge.py:13` and `:17`.
 3. `bridge.py:234` — `self.vd = VibeDeckClient(config.vd_url)` → replace.
-4. `bridge.py:286` — `self.vd.health()` call → optional; replace with
-   `await self.harness.list_sessions()` log probe.
+4. `bridge.py:286` — `self.vd.health()` call → replace with
+   `await self.harness.health()` (a thin `GET /v1/health` wrapper —
+   live since 2026-05-11; returns `{"status": "ok"}`). On 404 (legacy
+   harness build), fall back to `await self.harness.list_sessions()` as
+   a connectivity probe. Both forms are best-effort and log-only per US-5.5.
 5. `bridge.py:651` and `bridge.py:1948` — both `self.vd.set_session_title`
    calls **DELETE**.
 6. `bridge.py:702`, `:729`, `:866`, `:985` — every `self.vd.list_models(...)`
