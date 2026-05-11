@@ -71,6 +71,25 @@ def test_format_resume_command_empty_session_returns_none() -> None:
     ) is None
 
 
+@pytest.mark.parametrize(
+    ("backend", "session_id", "expected"),
+    [
+        ("codex", "codex_019e18ae-1445-7911-83bc-d28b0a13d705",
+         "codex resume 019e18ae-1445-7911-83bc-d28b0a13d705"),
+        ("claude", "claude_019e18ae-1445-7911-83bc-d28b0a13d705",
+         "claude --resume 019e18ae-1445-7911-83bc-d28b0a13d705"),
+    ],
+)
+def test_format_resume_command_strips_harness_external_prefix(
+    backend: str,
+    session_id: str,
+    expected: str,
+) -> None:
+    assert format_resume_command(
+        backend, session_id, None, dangerous=False,
+    ) == expected
+
+
 # ---------------------------------------------------------------------------
 # format_resume_block — fenced multi-line block ready for Channel Purpose
 # ---------------------------------------------------------------------------

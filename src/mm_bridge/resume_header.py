@@ -80,12 +80,20 @@ def format_resume_command(
     template = _RESUME_CMD_BY_BACKEND.get(backend)
     if template is None:
         return None
+    session_id = _strip_external_prefix(backend, session_id)
     cmd = template.format(sid=session_id)
     if dangerous:
         cmd = f"{cmd} {_DANGEROUS_FLAG_BY_BACKEND[backend]}"
     if cwd:
         cmd = f"cd {shlex.quote(cwd)} && {cmd}"
     return cmd
+
+
+def _strip_external_prefix(backend: str, session_id: str) -> str:
+    prefix = f"{backend}_"
+    if session_id.startswith(prefix):
+        return session_id[len(prefix):]
+    return session_id
 
 
 def format_resume_block(
