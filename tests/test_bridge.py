@@ -1587,6 +1587,62 @@ class SessionAddedClaimTests(_BridgeTestCase):
         self.assertTrue(self.bridge.mapping.get_anchor("sess-cli"))
         self.assertTrue(self.bridge.mm.channels)
 
+    async def test_reconcile_uses_mm_purpose_when_cache_empty(self):
+        """After a daemon restart `purpose_by_channel` is empty, so reconcile
+        must re-parse the channel's persisted MM Purpose — otherwise it would
+        write a default-backend Resume line for codex/pi channels."""
+        self.bridge.mapping.link(Anchor("c1"), "sess-codex")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1",
+            "purpose": "codex, gpt-5.4",
+            "header": "",
+        }
+        # purpose_by_channel is intentionally NOT populated.
+
+        await self.bridge._reconcile_resume_headers()
+
+        self.assertEqual(
+            self.bridge.mm.channels["c1"]["header"],
+            "Resume: codex resume sess-codex",
+        )
+
+    async def test_reconcile_unsupported_mm_purpose_skips_header(self):
+        """A channel whose persisted MM Purpose names an unsupported backend
+        (e.g. `pi`) must NOT receive a default-backend Resume line during
+        reconcile."""
+        self.bridge.mapping.link(Anchor("c2"), "sess-pi")
+        self.bridge.mm.channels["c2"] = {
+            "id": "c2",
+            "purpose": "pi",
+            "header": "Operator note",
+        }
+
+        await self.bridge._reconcile_resume_headers()
+
+        self.assertEqual(self.bridge.mm.channels["c2"]["header"], "Operator note")
+        self.assertEqual(self.bridge.mm.headers, [])
+
+    async def test_auto_created_channel_for_cli_session_gets_resume_header(self):
+        """CLI-originated sessions are bound by creating a fresh MM channel
+        in `_create_channel_for_session`. That path must also set the
+        Resume line — otherwise the new feature is missing on this
+        binding path until a daemon restart."""
+        await self.bridge._on_vd_event("session_added", {
+            "id": "sess-cli",
+            "projectPath": "/tmp/proj",
+            "projectName": "my-project",
+            "firstMessage": "hi from CLI",
+            "backend": "Codex",
+        })
+
+        anchor = self.bridge.mapping.get_anchor("sess-cli")
+        self.assertIsNotNone(anchor)
+        new_channel = self.bridge.mm.channels[anchor.channel_id]
+        self.assertEqual(
+            new_channel.get("header"),
+            "Resume: codex resume sess-cli",
+        )
+
 
 class ThreadForkTests(_BridgeTestCase):
     async def test_thread_post_in_mapped_channel_calls_fork(self):

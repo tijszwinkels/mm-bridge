@@ -1703,7 +1703,7 @@ class Bridge:
         if await self._claim_pending_invite(session_id, data):
             return
         # Otherwise — CLI-originated session: create a fresh channel.
-        self._create_channel_for_session(data)
+        await self._create_channel_for_session(data)
 
     def _expire_pending(self) -> None:
         now = time.monotonic()
@@ -1729,14 +1729,22 @@ class Bridge:
         when the channel can't be fetched, or when the merge produces no
         change. All errors are logged and swallowed — header writes must
         never break the calling claim/reconcile path.
+
+        Accepts either a lowercase purpose token (`claude` / `codex`), the
+        ``vd_client.canon_backend`` output (`claudecode`), or a raw SSE
+        display string (`Claude Code`, `Codex`); normalised internally so
+        callers don't have to canonicalise at every entrypoint.
         """
-        if not backend or not session_id:
+        if not session_id:
             return
+        canonical = resume_header.normalize_backend(backend)
+        if canonical is None:
+            return  # unsupported backend → leave header alone (US-2.5)
         resume_line = resume_header.format_resume_line(
-            backend, session_id, dangerous=self.config.dangerous_permissions,
+            canonical, session_id, dangerous=self.config.dangerous_permissions,
         )
         if resume_line is None:
-            return  # unsupported backend → leave header alone (US-2.5)
+            return  # defensive — already covered by the canonical guard above
         try:
             channel = self.mm.get_channel(channel_id)
         except Exception:
@@ -1783,15 +1791,36 @@ class Bridge:
     def _backend_for_channel(self, channel_id: str) -> str | None:
         """Backend used to resume a session in `channel_id`.
 
-        Prefer the parsed Channel Purpose (set when the session was
-        created); fall back to the daemon's configured default backend
-        so reconciliation still emits a Resume line for channels whose
-        purpose wasn't cached (e.g. mappings persisted across restarts).
+        Resolution order:
+
+        1. The cached ``PurposeConfig`` (populated when the bridge
+           handled an invite/fork/spawn in this daemon's lifetime).
+        2. Re-parse the channel's persisted Mattermost Purpose. The
+           cache is empty after a daemon restart, and falling straight
+           to ``default_backend`` here would write the wrong Resume
+           command for codex/pi channels whose Purpose was set during
+           a previous run.
+        3. ``config.default_backend`` as a last resort (channels with
+           no Purpose at all).
         """
-        cfg = self.purpose_by_channel.get(channel_id)
-        if cfg and cfg.backend:
-            return cfg.backend
-        return self.config.default_backend or None
+        cached = self.purpose_by_channel.get(channel_id)
+        if cached and cached.backend:
+            return cached.backend
+        try:
+            ch = self.mm.get_channel(channel_id)
+        except Exception:
+            return self.config.default_backend or None
+        raw = (ch.get("purpose") or "").strip()
+        if not raw:
+            return self.config.default_backend or None
+        parsed = purpose.parse(
+            raw,
+            default_backend=self.config.default_backend,
+            default_model=self.config.default_model,
+            available_models_for=lambda _b: [],
+            default_autorespond=self.config.default_autorespond,
+        )
+        return parsed.backend or self.config.default_backend or None
 
     async def _claim_pending_invite(self, session_id: str, data: dict) -> bool:
         self._expire_pending()
@@ -1934,7 +1963,7 @@ class Bridge:
                     pass
                 break
 
-    def _create_channel_for_session(self, data: dict) -> str | None:
+    async def _create_channel_for_session(self, data: dict) -> str | None:
         session_id = data.get("id") or data.get("session_id") or ""
         if not session_id:
             return None
@@ -1958,10 +1987,15 @@ class Bridge:
                 "Created channel %s (%s) for VD session %s",
                 display_name, channel_name, session_id[:12],
             )
-            return channel_id
         except Exception:
             logger.exception("Failed to create channel for session %s", session_id[:12])
             return None
+        # CLI-originated sessions get bound here rather than through
+        # `_claim_pending_invite`, so the Resume header has to be set
+        # explicitly. The SSE event carries the backend as a display name
+        # (`Claude Code`, `Codex`); `_update_resume_header` normalises it.
+        await self._update_resume_header(channel_id, session_id, data.get("backend"))
+        return channel_id
 
     # ----- VibeDeck message → Mattermost post -----
 
