@@ -34,14 +34,15 @@ def merge_into_header(existing: str, resume_line: str | None) -> str:
     - existing == "" and resume_line is not None → resume_line
     - existing has `Parent:` line → keep it, replace/append resume line
     - existing has unrelated lines → keep them all, replace/append resume line
-    - resume_line is None → strip any prior Resume: line, return rest
+    - resume_line is None → return existing unchanged
     """
 ```
 
-The merge is line-based: split `existing` on `\n`, drop lines that
-`startswith(RESUME_PREFIX)`, append the new resume_line if non-None,
-join with `\n`. Trailing/leading whitespace per line is stripped after
-the split to be tolerant of operator edits.
+The merge is line-based when `resume_line` is non-None: split `existing` on
+`\n`, drop lines that `startswith(RESUME_PREFIX)`, append the new resume_line,
+join with `\n`. Trailing/leading whitespace per line is stripped after the
+split to be tolerant of operator edits. When `resume_line` is None, return the
+existing header unchanged so unsupported backends satisfy US-2.5.
 
 ## Wiring
 
@@ -130,8 +131,16 @@ into `_update_resume_header`.
 
 ### Findings (filled in by implementor)
 
-> _Implementor: replace this with one paragraph stating which path was
-> taken and the file references that justified the choice._
+Path B (operator config) is the implementation path. On 2026-05-08 I
+checked VibeDeck's server surface and found `_skip_permissions` is internal
+state in `~/projects/VibeDeck/src/vibedeck/server.py` (`set_skip_permissions`
+/ `is_skip_permissions`) and is only injected into command builders and
+terminal commands. The public `/health` response, `/events` / `/events/json`
+session payloads, `/sessions` / `/sessions/{id}/status` routes, and
+`SessionInfo.to_dict()` do not expose that value; `routes/sessions.py` reads
+`is_skip_permissions()` only while creating/sending/forking sessions. Because
+the spec forbids adding a new VibeDeck endpoint for this feature, mm-bridge
+uses a bridge-owned `dangerous_permissions` config/env knob instead.
 
 ## Failure modes
 
@@ -139,7 +148,7 @@ into `_update_resume_header`.
 | ------------------------------------ | --------------------------------------------- |
 | `mm.get_channel` raises              | Skip header update, log warning               |
 | `mm.set_channel_header` raises       | Log warning, claim still succeeds             |
-| Backend unknown to formatter         | `format_resume_line` returns None; merge strips any prior `Resume:` line |
+| Backend unknown to formatter         | `format_resume_line` returns None; header update is skipped |
 | Reconcile pass partially fails       | Per-channel try/except, continue              |
 | Empty `session_id` (defensive)       | Formatter returns None                        |
 
