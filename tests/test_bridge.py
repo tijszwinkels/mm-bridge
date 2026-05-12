@@ -295,6 +295,10 @@ class _BridgeTestCase(unittest.IsolatedAsyncioTestCase):
 
         async def _legacy_event(event_type: str, data: dict) -> None:
             if event_type == "session_added":
+                # VD's session_added semantically meant "a CLI-launched
+                # session became visible" — always external in the harness
+                # model. Synthesize origin so the new channel-spawn filter
+                # accepts the translated event.
                 session = {
                     "id": data.get("id") or data.get("session_id"),
                     "backend": data.get("backend"),
@@ -303,6 +307,7 @@ class _BridgeTestCase(unittest.IsolatedAsyncioTestCase):
                         "name": data.get("projectName") or data.get("project") or "",
                     },
                     "title": data.get("summaryTitle"),
+                    "origin": "external",
                 }
                 await self.bridge._on_harness_event(
                     "session.updated",
@@ -365,6 +370,7 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
             "backend": "codex",
             "project": {"path": "/tmp/project", "name": "project"},
             "title": "External project",
+            "origin": "external",
         }
 
         await self.bridge._on_harness_event(
@@ -405,6 +411,7 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
             "id": "codex_retry",
             "backend": "codex",
             "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "external",
         }
         self.bridge.mm.fail_create_channel = True
 
@@ -440,6 +447,34 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
         self.assertEqual(created, [])
         self.assertIn("codex_existing", self.bridge._known_sessions)
+
+    async def test_harness_origin_session_does_not_spawn_channel(self):
+        """``session.updated`` for a harness-origin session (created via the
+        API, e.g. by ``mm-bridge spawn``, by the bridge itself, or by tests)
+        must NOT auto-spawn an MM channel. Only externally-launched CLI
+        sessions get the auto-spawn treatment — mirrors the origin filter in
+        ``_bootstrap_known_sessions``. Regression for the bootstrap-window
+        channel-spam incident on 2026-05-12 where 7 leftover integration-test
+        ``ses_*`` sessions each triggered a fresh MM channel-create."""
+        session = {
+            "id": "ses_harness_origin",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "harness",
+        }
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_harness_origin", "session": session}},
+        )
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [])
+        self.assertIsNone(self.bridge.mapping.get_anchor("ses_harness_origin"))
+        # Cache the decision so subsequent ``session.updated`` for the same
+        # id don't re-enter the check (or, worse, race past it on a later
+        # event that happens to have origin missing).
+        self.assertIn("ses_harness_origin", self.bridge._known_sessions)
 
 
 class InviteFlowTests(_BridgeTestCase):
