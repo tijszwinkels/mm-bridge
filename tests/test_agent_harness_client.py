@@ -356,3 +356,70 @@ async def test_stream_events_preserves_cursor_across_reconnects():
     assert events_seen == [101, 102, 103]
     assert requests[0].endswith("after=100")
     assert "after=102" in requests[1]
+
+
+async def test_stream_events_resets_cursor_on_detected_harness_restart(monkeypatch):
+    """Mid-session harness restart: in-memory event bus rolls back to a low
+    sequence. The bridge's cursor is now ahead of harness max — without
+    detection, the bridge would silently skip every event the new harness
+    emits until it catches back up. We detect on reconnect by probing the
+    harness max, and if cursor > max, reset to 0 + fire on_reset."""
+    requests: list[tuple[str, str | None]] = []
+    events_seen: list[int] = []
+    reset_called = 0
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        requests.append((str(req.url), req.url.params.get("after")))
+        attempt = len(requests)
+        # 1: emit two events then drop the connection mid-stream
+        if attempt == 1:
+            return httpx.Response(
+                200,
+                content=(
+                    f"event: message\ndata: {json.dumps({'sequence': 8001, 'event': 'message'})}\n\n"
+                    f"event: message\ndata: {json.dumps({'sequence': 8002, 'event': 'message'})}\n\n"
+                ).encode(),
+            )
+        if attempt == 2:
+            raise httpx.ReadError("simulated harness disconnect")
+        # 3: reconnect after probe — must use after=0 (cursor reset).
+        return httpx.Response(
+            200,
+            content=(
+                f"event: message\ndata: {json.dumps({'sequence': 13, 'event': 'message'})}\n\n"
+            ).encode(),
+        )
+
+    client = _client(handler)
+
+    # Stub probe_current_sequence to return a low value, simulating
+    # a freshly-restarted harness whose bus is below our cursor.
+    async def fake_probe(**_kwargs):
+        return 12
+
+    monkeypatch.setattr(client, "probe_current_sequence", fake_probe)
+    # No-op sleep so the test doesn't pause 2s on the disconnect retry.
+    monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+
+    async def on_event(_name: str, data: dict) -> None:
+        events_seen.append(data.get("sequence"))
+        if len(events_seen) >= 3:
+            raise asyncio.CancelledError
+
+    async def on_reset() -> None:
+        nonlocal reset_called
+        reset_called += 1
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.stream_events(
+            on_event, after_sequence=8000, on_reset=on_reset,
+        )
+
+    assert events_seen == [8001, 8002, 13]
+    assert reset_called == 1
+    # Third connect (after probe + reset) must request from 0.
+    assert requests[2][1] == "0", f"expected after=0 on reset, got {requests[2][1]!r}"
+
+
+async def _noop_sleep(_seconds):  # pragma: no cover — helper
+    return None
