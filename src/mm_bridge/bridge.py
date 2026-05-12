@@ -1786,6 +1786,15 @@ class Bridge:
             return  # already mapped
         if session_id in self._known_sessions:
             return
+        # Only externally-launched sessions (CLI processes the operator
+        # started outside the harness) auto-spawn an MM channel. Harness-
+        # origin sessions are created via the API — by the bridge itself,
+        # by ``mm-bridge spawn``, or by tests — and the creator is
+        # responsible for linking the channel. Mirrors the filter in
+        # ``_bootstrap_known_sessions``.
+        if session.get("origin") != "external":
+            self._known_sessions.add(session_id)
+            return
         # Only mark known after the channel actually exists; otherwise a
         # transient MM error means we'd silently skip future
         # ``session.updated`` events for this session and never spawn its
