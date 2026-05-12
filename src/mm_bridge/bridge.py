@@ -422,29 +422,61 @@ class Bridge:
     async def _bootstrap_event_cursor(self) -> int | None:
         """Return the SSE cursor to resume from on this boot.
 
-        Warm restart: use the persisted ``last_event_seq`` from state.json.
+        Warm restart: use the persisted ``last_event_seq`` from state.json,
+        but verify the harness's current max sequence first. The harness
+        event bus is in-memory — if the harness was restarted, its sequence
+        rolls back to 0 and the persisted cursor becomes a "future" value
+        that would mask every event the new harness emits. Detected reset
+        ⇒ reset cursor to 0 and replay whatever's currently in the new
+        harness's bus.
+
         Cold start (no persisted seq): probe the harness for its current
         max sequence so the bridge only sees *new* events. Without this,
         agent-harness replays its full history on connect, which the bridge
         used to mirror back into Mattermost as a 1000+ post flood.
         """
-        if self.mapping.last_event_seq is not None:
-            logger.info(
-                "Resuming SSE stream from persisted seq=%d",
-                self.mapping.last_event_seq,
-            )
-            return self.mapping.last_event_seq
+        persisted = self.mapping.last_event_seq
         try:
-            seq = await self.harness.probe_current_sequence()
+            harness_max = await self.harness.probe_current_sequence()
         except Exception:
+            if persisted is not None:
+                logger.warning(
+                    "Cursor probe failed — falling back to persisted seq=%d "
+                    "(may skip recent events if harness was restarted)",
+                    persisted,
+                )
+                return persisted
             logger.exception(
                 "Cold-start cursor probe failed — starting from current end "
                 "(SSE will resync once new events arrive)",
             )
             return None
-        self.mapping.set_event_seq(seq)
-        logger.info("Cold-start SSE cursor probed: starting from seq=%d", seq)
-        return seq
+
+        if persisted is None:
+            self.mapping.set_event_seq(harness_max)
+            logger.info(
+                "Cold-start SSE cursor probed: starting from seq=%d", harness_max,
+            )
+            return harness_max
+
+        if persisted > harness_max:
+            logger.warning(
+                "Detected harness sequence reset (persisted=%d > harness_max=%d). "
+                "Resetting cursor to 0 to replay current in-memory events; "
+                "already-mapped sessions are filtered by anchor lookup but a "
+                "few duplicate posts are possible during recovery.",
+                persisted,
+                harness_max,
+            )
+            self.mapping.reset_event_seq(0)
+            return 0
+
+        logger.info(
+            "Resuming SSE stream from persisted seq=%d (harness_max=%d)",
+            persisted,
+            harness_max,
+        )
+        return persisted
 
     async def _persist_event_seq(self, sequence: int) -> None:
         """Throttled write of the SSE cursor. Always updates in-memory."""
