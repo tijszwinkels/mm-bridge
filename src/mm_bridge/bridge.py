@@ -44,6 +44,24 @@ HARNESS_ACTIVITY_EVENTS = {
 }
 HARNESS_RUN_TERMINAL_EVENTS = {"run.completed", "run.failed", "run.interrupted"}
 
+# How often to flush the SSE cursor (`mapping.last_event_seq`) to disk.
+# Each event triggers an in-memory update; the disk write is throttled to
+# avoid burning IO on busy streams. A crash loses at most this many seconds
+# of cursor progress — the bridge replays from the last flushed seq.
+EVENT_SEQ_FLUSH_INTERVAL_SECONDS = 2.0
+
+# Hard cap on channel-create retries per session. Some session ids cannot
+# produce a valid MM channel name (collisions, invalid slug). Without a
+# cap, every subsequent ``session.updated`` event re-tries creation in a
+# tight loop. Adding to ``_known_sessions`` after the cap stops retrying.
+MAX_CHANNEL_CREATE_ATTEMPTS = 3
+
+# Session-id prefixes that should never get an MM channel. These are
+# claude-code subagent transcripts (``agent-<hex>.jsonl``), surfaced by the
+# harness observer alongside user-facing sessions. They're internal to the
+# parent run and would just spam channels.
+SUPPRESSED_SESSION_PREFIXES = ("claude_agent-",)
+
 _CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _LEAVE_CMD_RE = re.compile(r"^@claude\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
 _STOP_CMD_RE = re.compile(r"^(?P<mention>@claude\s+)?stop\s*$", re.IGNORECASE)
@@ -109,8 +127,31 @@ def _truncate_for_mm(text: str, max_len: int = MM_POST_MAX_LEN) -> str:
     return text[: max_len - 50] + "\n\n_(truncated)_"
 
 
+def _is_suppressed_session(session_id: str) -> bool:
+    """Return True for ids the bridge should never attach a channel to.
+
+    Currently: claude-code subagent transcripts (``claude_agent-<hex>``),
+    which are internal to a parent run.
+    """
+    return any(session_id.startswith(p) for p in SUPPRESSED_SESSION_PREFIXES)
+
+
 def _session_to_channel_name(session_id: str) -> str:
-    short = session_id[:12].replace("-", "").lower()
+    """Derive a stable, collision-resistant MM channel slug.
+
+    Backend-prefixed ids (``claude_<uuid>``, ``codex_<uuid>``, ``ses_<uuid>``)
+    have most of their entropy *after* the underscore. Naively taking
+    ``session_id[:12]`` truncates that entropy, causing same-prefix ids to
+    collide on the same slug. Strip the known backend prefix first so the
+    12-char window samples the unique part.
+    """
+    BACKEND_PREFIXES = ("claude_agent-", "claude_", "codex_", "ses_")
+    tail = session_id
+    for prefix in BACKEND_PREFIXES:
+        if session_id.startswith(prefix):
+            tail = session_id[len(prefix):]
+            break
+    short = tail[:12].replace("-", "").lower()
     return f"s-{short}"
 
 
@@ -243,6 +284,19 @@ class Bridge:
         self.last_activity_ts: dict[str, float] = {}
         self.current_run_id_by_session: dict[str, str] = {}
         self._known_sessions: set[str] = set()
+        # How many times we tried (and failed) to create an MM channel for a
+        # given session_id. After ``MAX_CHANNEL_CREATE_ATTEMPTS`` the session
+        # is added to ``_known_sessions`` to stop retrying.
+        self._channel_create_attempts: dict[str, int] = {}
+        # Monotonic timestamp of the last cursor flush to disk. Throttled by
+        # ``EVENT_SEQ_FLUSH_INTERVAL_SECONDS`` so a busy stream doesn't beat
+        # up the filesystem. The latest seq is kept in
+        # ``self.mapping.last_event_seq``; only the flush is throttled.
+        self._last_seq_flush_ts: float = 0.0
+        self._pending_seq: int | None = None
+        # SSE start cursor, resolved in ``start()`` from the persisted
+        # ``mapping.last_event_seq`` or a cold-start probe of the harness.
+        self._event_cursor: int | None = None
         # Channels waiting on their first user message; those messages are
         # parsed as config tokens when possible.
         self.awaiting_first_message: set[str] = set()
@@ -293,6 +347,7 @@ class Bridge:
                 logger.exception("agent-harness health check failed — continuing anyway")
 
         await self._bootstrap_known_sessions()
+        self._event_cursor = await self._bootstrap_event_cursor()
 
         logger.info(
             "Connected — Mattermost (team=%s, bot=%s) + agent-harness (%s)",
@@ -335,10 +390,52 @@ class Bridge:
             if self.mapping.get_anchor(session_id):
                 self._known_sessions.add(session_id)
                 continue
+            if _is_suppressed_session(session_id):
+                self._known_sessions.add(session_id)
+                continue
             if session.get("origin") != "external":
                 continue
             if await self._create_channel_for_session(session):
                 self._known_sessions.add(session_id)
+
+    async def _bootstrap_event_cursor(self) -> int | None:
+        """Return the SSE cursor to resume from on this boot.
+
+        Warm restart: use the persisted ``last_event_seq`` from state.json.
+        Cold start (no persisted seq): probe the harness for its current
+        max sequence so the bridge only sees *new* events. Without this,
+        agent-harness replays its full history on connect, which the bridge
+        used to mirror back into Mattermost as a 1000+ post flood.
+        """
+        if self.mapping.last_event_seq is not None:
+            logger.info(
+                "Resuming SSE stream from persisted seq=%d",
+                self.mapping.last_event_seq,
+            )
+            return self.mapping.last_event_seq
+        try:
+            seq = await self.harness.probe_current_sequence()
+        except Exception:
+            logger.exception(
+                "Cold-start cursor probe failed — starting from current end "
+                "(SSE will resync once new events arrive)",
+            )
+            return None
+        self.mapping.set_event_seq(seq)
+        logger.info("Cold-start SSE cursor probed: starting from seq=%d", seq)
+        return seq
+
+    async def _persist_event_seq(self, sequence: int) -> None:
+        """Throttled write of the SSE cursor. Always updates in-memory."""
+        if not isinstance(sequence, int) or sequence <= 0:
+            return
+        self._pending_seq = sequence
+        now = time.monotonic()
+        if now - self._last_seq_flush_ts < EVENT_SEQ_FLUSH_INTERVAL_SECONDS:
+            return
+        self._last_seq_flush_ts = now
+        self.mapping.set_event_seq(sequence)
+        self._pending_seq = None
 
     def _track_run_response(self, session_id: str, run: dict | None) -> None:
         if not run:
@@ -409,7 +506,11 @@ class Bridge:
 
     async def _run_harness_listener(self) -> None:
         logger.info("Starting agent-harness SSE listener...")
-        await self.harness.stream_events(self._on_harness_event)
+        await self.harness.stream_events(
+            self._on_harness_event,
+            after_sequence=getattr(self, "_event_cursor", None),
+            on_progress=self._persist_event_seq,
+        )
 
     async def _run_typing_watchdog(self) -> None:
         """Stop a typing loop if session_status hasn't been heard from recently."""
@@ -1786,6 +1887,11 @@ class Bridge:
             return  # already mapped
         if session_id in self._known_sessions:
             return
+        # Suppress claude-code subagent transcripts — internal to a parent
+        # run, would just churn channels.
+        if _is_suppressed_session(session_id):
+            self._known_sessions.add(session_id)
+            return
         # Only externally-launched sessions (CLI processes the operator
         # started outside the harness) auto-spawn an MM channel. Harness-
         # origin sessions are created via the API — by the bridge itself,
@@ -1799,9 +1905,22 @@ class Bridge:
         # transient MM error means we'd silently skip future
         # ``session.updated`` events for this session and never spawn its
         # channel. ``_create_channel_for_session`` returns None on failure
-        # and logs at error level.
+        # and logs at error level. Bound retries so a permanently-failing
+        # slug (collision, invalid name) doesn't loop forever on every SSE
+        # event for the session.
         if await self._create_channel_for_session(session):
             self._known_sessions.add(session_id)
+            self._channel_create_attempts.pop(session_id, None)
+            return
+        attempts = self._channel_create_attempts.get(session_id, 0) + 1
+        self._channel_create_attempts[session_id] = attempts
+        if attempts >= MAX_CHANNEL_CREATE_ATTEMPTS:
+            logger.error(
+                "Giving up on channel creation for session %s after %d attempts",
+                session_id[:24], attempts,
+            )
+            self._known_sessions.add(session_id)
+            self._channel_create_attempts.pop(session_id, None)
 
     async def _update_resume_purpose(
         self,

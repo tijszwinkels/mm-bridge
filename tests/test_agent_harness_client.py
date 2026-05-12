@@ -237,3 +237,78 @@ async def test_stream_events_dispatches_parsed_events_and_reconnects_after_seque
     assert [name for name, _ in events] == ["session.updated", "message"]
     assert requests[0] == "http://harness.test/v1/events"
     assert requests[1] == "http://harness.test/v1/events?after=41"
+
+
+async def test_stream_events_starts_from_after_sequence_when_provided():
+    seen_params: list[str | None] = []
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen_params.append(req.url.params.get("after"))
+        payload = {"sequence": 101, "event": "ping", "data": {}}
+        body = (f"event: ping\ndata: {json.dumps(payload)}\n\n").encode()
+        return httpx.Response(200, content=body)
+
+    client = _client(handler)
+    stopped = asyncio.Event()
+
+    async def on_event(_name: str, _data: dict) -> None:
+        stopped.set()
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.stream_events(on_event, after_sequence=100)
+
+    assert seen_params[0] == "100", "cold-start cursor must be forwarded to harness"
+
+
+async def test_stream_events_fires_on_progress_per_event():
+    """on_progress is the bridge's hook to persist last_event_seq."""
+    progress: list[int] = []
+    events_seen = 0
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal events_seen
+        events_seen += 1
+        seq = 50 + events_seen
+        payload = {"sequence": seq, "event": "message", "data": {}}
+        body = (f"event: message\ndata: {json.dumps(payload)}\n\n").encode()
+        return httpx.Response(200, content=body)
+
+    client = _client(handler)
+
+    async def on_event(_name: str, _data: dict) -> None:
+        if len(progress) >= 2:
+            raise asyncio.CancelledError
+
+    async def on_progress(seq: int) -> None:
+        progress.append(seq)
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.stream_events(on_event, on_progress=on_progress)
+
+    assert progress == [51, 52]
+
+
+async def test_probe_current_sequence_returns_highest_seq_and_stops_idle():
+    """Probe drains the SSE replay quickly and returns the highest seq."""
+    async def handler(req: httpx.Request) -> httpx.Response:
+        body = (
+            "event: session.updated\n"
+            "data: " + json.dumps({"sequence": 7, "event": "session.updated"}) + "\n\n"
+            "event: message\n"
+            "data: " + json.dumps({"sequence": 12, "event": "message"}) + "\n\n"
+        ).encode()
+        return httpx.Response(200, content=body)
+
+    client = _client(handler)
+    seq = await client.probe_current_sequence(idle_window=0.05, hard_timeout=1.0)
+    assert seq == 12
+
+
+async def test_probe_current_sequence_returns_zero_on_empty_stream():
+    async def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"")
+
+    client = _client(handler)
+    seq = await client.probe_current_sequence(idle_window=0.05, hard_timeout=0.5)
+    assert seq == 0

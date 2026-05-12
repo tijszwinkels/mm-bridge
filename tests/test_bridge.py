@@ -476,6 +476,124 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         # event that happens to have origin missing).
         self.assertIn("ses_harness_origin", self.bridge._known_sessions)
 
+    async def test_claude_agent_subagent_session_is_suppressed(self):
+        """Claude-code subagent transcripts (``claude_agent-<hex>``) are internal
+        to a parent run and must never spawn an MM channel. Regression for the
+        retry-loop bug observed on 2026-05-12 where ~50 subagent transcripts
+        each caused failed channel-create retries every SSE event."""
+        session = {
+            "id": "claude_agent-a08d0dc68b3b89d9a",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "external",
+        }
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": session["id"], "session": session}},
+        )
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [])
+        self.assertIsNone(self.bridge.mapping.get_anchor(session["id"]))
+        self.assertIn(session["id"], self.bridge._known_sessions)
+
+    async def test_repeated_create_failures_eventually_give_up(self):
+        """A session whose channel-create permanently fails (collision, bad
+        slug) must NOT loop forever on every SSE event. After
+        ``MAX_CHANNEL_CREATE_ATTEMPTS`` the session is treated as known so
+        retries stop. Regression for the W2 retry-loop flood."""
+        from mm_bridge.bridge import MAX_CHANNEL_CREATE_ATTEMPTS
+        session = {
+            "id": "codex_perma_fail",
+            "backend": "codex",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "external",
+        }
+        self.bridge.mm.fail_create_channel = True
+
+        for _ in range(MAX_CHANNEL_CREATE_ATTEMPTS):
+            await self.bridge._on_harness_event(
+                "session.updated",
+                {"data": {"session": session}, "session_id": session["id"]},
+            )
+
+        self.assertIn(session["id"], self.bridge._known_sessions)
+        # Once given up on, the per-session attempt counter is dropped — and
+        # future events short-circuit on the ``_known_sessions`` membership
+        # check before ever calling create_channel.
+        self.assertNotIn(session["id"], self.bridge._channel_create_attempts)
+        channels_before = len(self.bridge.mm.channels)
+        self.bridge.mm.fail_create_channel = False  # would succeed if reached
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session": session}, "session_id": session["id"]},
+        )
+        # No new channel created — short-circuited by ``_known_sessions``.
+        self.assertEqual(len(self.bridge.mm.channels), channels_before)
+
+    async def test_session_to_channel_name_strips_backend_prefix(self):
+        """Channel slugs must include entropy from the actual session UUID,
+        not just the backend prefix — otherwise all ``claude_agent-*`` (or
+        any same-prefix sessions) collide on the same slug."""
+        from mm_bridge.bridge import _session_to_channel_name
+        a = _session_to_channel_name("claude_agent-a08d0dc68b3b89d9a")
+        b = _session_to_channel_name("claude_agent-deadbeef12345678")
+        self.assertNotEqual(a, b)
+
+        a = _session_to_channel_name("claude_aa4bf742-4d79-45a6-a470")
+        b = _session_to_channel_name("claude_bb5c6800-1234-1234-1234")
+        self.assertNotEqual(a, b)
+
+    async def test_bootstrap_suppresses_claude_agent_sessions(self):
+        """``GET /v1/sessions`` may surface subagent transcripts on cold
+        start; bootstrap must filter them just like the SSE path does."""
+        self.bridge.harness.sessions_meta = [{
+            "id": "claude_agent-deadbeef12345678",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "external",
+        }]
+
+        await self.bridge._bootstrap_known_sessions()
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [])
+        self.assertIn("claude_agent-deadbeef12345678", self.bridge._known_sessions)
+
+    async def test_bootstrap_event_cursor_uses_persisted_seq(self):
+        """Warm restart: bridge resumes SSE from the persisted cursor."""
+        self.bridge.mapping.set_event_seq(4242)
+        cursor = await self.bridge._bootstrap_event_cursor()
+        self.assertEqual(cursor, 4242)
+
+    async def test_bootstrap_event_cursor_probes_on_cold_start(self):
+        """Cold start: bridge probes the harness for current max seq so
+        only NEW events are streamed (no full-history replay)."""
+        self.assertIsNone(self.bridge.mapping.last_event_seq)
+
+        async def fake_probe(**_kwargs):
+            return 7259
+
+        self.bridge.harness.probe_current_sequence = fake_probe  # type: ignore[assignment]
+        cursor = await self.bridge._bootstrap_event_cursor()
+        self.assertEqual(cursor, 7259)
+        # Probed value must be persisted so subsequent restarts also resume.
+        self.assertEqual(self.bridge.mapping.last_event_seq, 7259)
+
+    async def test_persist_event_seq_throttles_writes(self):
+        """on_progress fires per SSE event; disk write is throttled."""
+        import time as _t
+        self.bridge._last_seq_flush_ts = _t.monotonic()
+        await self.bridge._persist_event_seq(100)
+        # Throttled → in-memory unchanged (cursor lives in mapping, only
+        # written on flush).
+        self.assertIsNone(self.bridge.mapping.last_event_seq)
+        # Reset throttle window to force a flush.
+        self.bridge._last_seq_flush_ts = 0.0
+        await self.bridge._persist_event_seq(101)
+        self.assertEqual(self.bridge.mapping.last_event_seq, 101)
+
 
 class InviteFlowTests(_BridgeTestCase):
     async def test_bot_invited_to_unmapped_channel_creates_session(self):

@@ -287,9 +287,10 @@ class Anchor:
         return self.root_id is not None
 
 
-# JSON state-file schema version. Bumped from v2 when the asymmetric
-# channel_to_session / thread_mapping pair was collapsed into `entries`.
-STATE_SCHEMA_VERSION = 3
+# JSON state-file schema version. v2→v3 collapsed channel_to_session +
+# thread_mapping into `entries`. v3→v4 added `last_event_seq` for resuming
+# the agent-harness SSE stream from a known cursor across bridge restarts.
+STATE_SCHEMA_VERSION = 4
 
 
 @dataclass
@@ -304,12 +305,15 @@ class ChannelMapping:
     On-disk schema:
 
     * v2 (legacy): ``{"channel_to_session": {...}, "thread_mapping": {...}}``
-      — read transparently on load and re-emitted as v3 on the next save.
+      — read transparently on load and re-emitted as the current version
+      on the next save.
     * v3: ``{"version": 3, "entries": [{"channel_id", "root_id", "session_id"}]}``.
+    * v4: adds ``"last_event_seq": <int|null>`` for SSE-cursor resume.
     """
 
     anchor_to_session: dict[Anchor, str] = field(default_factory=dict)
     session_to_anchor: dict[str, Anchor] = field(default_factory=dict)
+    last_event_seq: int | None = None
     _path: str = ""
     _sidecar_dir: Path | None = None
 
@@ -339,9 +343,9 @@ class ChannelMapping:
         return m
 
     def _ingest(self, data: dict) -> None:
-        """Populate in-memory maps from either a v2 or v3 JSON payload."""
+        """Populate in-memory maps from any supported on-disk schema."""
         version = data.get("version")
-        if version == STATE_SCHEMA_VERSION and isinstance(data.get("entries"), list):
+        if version in (3, 4) and isinstance(data.get("entries"), list):
             for entry in data["entries"]:
                 sid = entry.get("session_id")
                 cid = entry.get("channel_id")
@@ -349,6 +353,9 @@ class ChannelMapping:
                     continue
                 rid = entry.get("root_id") or None
                 self._add(Anchor(cid, rid), sid)
+            if version >= 4:
+                seq = data.get("last_event_seq")
+                self.last_event_seq = seq if isinstance(seq, int) else None
             return
         # Legacy v2 (or the even older v1 that lacked thread_mapping).
         for cid, sid in (data.get("channel_to_session") or {}).items():
@@ -380,10 +387,26 @@ class ChannelMapping:
         ]
         Path(self._path).write_text(
             json.dumps(
-                {"version": STATE_SCHEMA_VERSION, "entries": entries},
+                {
+                    "version": STATE_SCHEMA_VERSION,
+                    "entries": entries,
+                    "last_event_seq": self.last_event_seq,
+                },
                 indent=2,
             )
         )
+
+    def set_event_seq(self, seq: int) -> None:
+        """Update the persisted SSE cursor and flush to disk.
+
+        Monotonic: callers that observe events out of order — or replay an
+        event with a stale sequence on reconnect — won't accidentally
+        rewind the cursor.
+        """
+        if self.last_event_seq is not None and seq <= self.last_event_seq:
+            return
+        self.last_event_seq = seq
+        self.save()
 
     # ----- anchor API -----
 
