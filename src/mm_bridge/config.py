@@ -290,7 +290,9 @@ class Anchor:
 # JSON state-file schema version. v2→v3 collapsed channel_to_session +
 # thread_mapping into `entries`. v3→v4 added `last_event_seq` for resuming
 # the agent-harness SSE stream from a known cursor across bridge restarts.
-STATE_SCHEMA_VERSION = 4
+# v4→v5 adds `adopted_session_ids` so the bootstrap auto-spawn-channel
+# path doesn't re-surface external sessions the bridge already replaced.
+STATE_SCHEMA_VERSION = 5
 
 
 @dataclass
@@ -309,11 +311,17 @@ class ChannelMapping:
       on the next save.
     * v3: ``{"version": 3, "entries": [{"channel_id", "root_id", "session_id"}]}``.
     * v4: adds ``"last_event_seq": <int|null>`` for SSE-cursor resume.
+    * v5: adds ``"adopted_session_ids": [...]`` listing harness session ids
+      whose channel mapping was replaced by ``_replace_external_session``.
+      Bootstrap consults this set before auto-spawning a recovery channel
+      for an unmapped external session — otherwise every restart resurrects
+      adopted sessions as fresh orphan channels.
     """
 
     anchor_to_session: dict[Anchor, str] = field(default_factory=dict)
     session_to_anchor: dict[str, Anchor] = field(default_factory=dict)
     last_event_seq: int | None = None
+    adopted_session_ids: set[str] = field(default_factory=set)
     _path: str = ""
     _sidecar_dir: Path | None = None
 
@@ -345,7 +353,7 @@ class ChannelMapping:
     def _ingest(self, data: dict) -> None:
         """Populate in-memory maps from any supported on-disk schema."""
         version = data.get("version")
-        if version in (3, 4) and isinstance(data.get("entries"), list):
+        if version in (3, 4, 5) and isinstance(data.get("entries"), list):
             for entry in data["entries"]:
                 sid = entry.get("session_id")
                 cid = entry.get("channel_id")
@@ -356,6 +364,12 @@ class ChannelMapping:
             if version >= 4:
                 seq = data.get("last_event_seq")
                 self.last_event_seq = seq if isinstance(seq, int) else None
+            if version >= 5:
+                adopted = data.get("adopted_session_ids") or []
+                if isinstance(adopted, list):
+                    self.adopted_session_ids = {
+                        s for s in adopted if isinstance(s, str)
+                    }
             return
         # Legacy v2 (or the even older v1 that lacked thread_mapping).
         for cid, sid in (data.get("channel_to_session") or {}).items():
@@ -391,6 +405,7 @@ class ChannelMapping:
                     "version": STATE_SCHEMA_VERSION,
                     "entries": entries,
                     "last_event_seq": self.last_event_seq,
+                    "adopted_session_ids": sorted(self.adopted_session_ids),
                 },
                 indent=2,
             )
@@ -406,6 +421,18 @@ class ChannelMapping:
         if self.last_event_seq is not None and seq <= self.last_event_seq:
             return
         self.last_event_seq = seq
+        self.save()
+
+    def mark_adopted(self, session_id: str) -> None:
+        """Record that ``session_id`` was replaced by a fresh harness session.
+
+        Persisted so a subsequent bootstrap (after a bridge restart) doesn't
+        treat the still-present external session as a candidate for
+        auto-channel-spawn recovery. Idempotent: a repeat call is a no-op.
+        """
+        if session_id in self.adopted_session_ids:
+            return
+        self.adopted_session_ids.add(session_id)
         self.save()
 
     # ----- anchor API -----

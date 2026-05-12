@@ -226,5 +226,64 @@ class LastEventSeqTests(unittest.TestCase):
         self.assertEqual(m.last_event_seq, 7259)
 
 
+class AdoptedSessionIdsTests(unittest.TestCase):
+    """``adopted_session_ids`` is the persisted set of external session
+    ids whose channel mapping was replaced by ``_replace_external_session``.
+    The bootstrap must consult it before auto-spawning recovery channels."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = f"{self.tmp.name}/state.json"
+        self.sdir = Path(self.tmp.name) / "sidecar"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_default_is_empty_on_fresh_load(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertEqual(m.adopted_session_ids, set())
+
+    def test_mark_adopted_persists(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        m.mark_adopted("claude_aa4bf742")
+        data = json.loads(Path(self.state).read_text())
+        self.assertEqual(
+            data.get("adopted_session_ids"), ["claude_aa4bf742"],
+        )
+
+    def test_mark_adopted_is_idempotent(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        m.mark_adopted("claude_abc")
+        m.mark_adopted("claude_abc")
+        self.assertEqual(m.adopted_session_ids, {"claude_abc"})
+
+    def test_v4_state_loads_with_empty_adopted_set(self) -> None:
+        Path(self.state).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.state).write_text(json.dumps({
+            "version": 4,
+            "entries": [],
+            "last_event_seq": 100,
+        }))
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertEqual(m.adopted_session_ids, set())
+
+    def test_v5_state_roundtrips_adopted_set(self) -> None:
+        Path(self.state).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.state).write_text(json.dumps({
+            "version": 5,
+            "entries": [],
+            "last_event_seq": None,
+            "adopted_session_ids": ["claude_x", "claude_y"],
+        }))
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertEqual(m.adopted_session_ids, {"claude_x", "claude_y"})
+        # Round-trip back to disk.
+        m.save()
+        data = json.loads(Path(self.state).read_text())
+        self.assertEqual(
+            sorted(data["adopted_session_ids"]), ["claude_x", "claude_y"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

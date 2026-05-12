@@ -407,6 +407,13 @@ class Bridge:
             if _is_suppressed_session(session_id):
                 self._known_sessions.add(session_id)
                 continue
+            if session_id in self.mapping.adopted_session_ids:
+                # Previously replaced by ``_replace_external_session``.
+                # The harness still lists it (sessions aren't deleted),
+                # but a fresh harness session has taken over its channel.
+                # Don't auto-spawn a recovery channel.
+                self._known_sessions.add(session_id)
+                continue
             if not is_external:
                 continue
             if await self._create_channel_for_session(session):
@@ -1075,12 +1082,16 @@ class Bridge:
             channel_id, old_session_id[:12],
         )
         self.mapping.unlink(Anchor(channel_id))
+        self.mapping.mark_adopted(old_session_id)
         self._end_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
         self._forget_channel_silent_drops(channel_id)
         self._session_triggerer.pop(old_session_id, None)
         self._recent_harness_sends.pop(old_session_id, None)
         self._external_sessions.discard(old_session_id)
+        # Stop the bootstrap recovery path from re-spawning a fresh
+        # channel for this session id on the next restart.
+        self._known_sessions.add(old_session_id)
         if self.typing:
             await self.typing.stop(old_session_id)
         try:
