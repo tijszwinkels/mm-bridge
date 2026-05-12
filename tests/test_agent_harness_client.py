@@ -312,3 +312,47 @@ async def test_probe_current_sequence_returns_zero_on_empty_stream():
     client = _client(handler)
     seq = await client.probe_current_sequence(idle_window=0.05, hard_timeout=0.5)
     assert seq == 0
+
+
+async def test_stream_events_preserves_cursor_across_reconnects():
+    """Reconnect after a mid-stream error must continue from the latest seq
+    observed — NOT from the original ``after_sequence``. Regression for the
+    2026-05-12 cutover #3 bug where every 30s SSE ReadTimeout caused a
+    reconnect with the stale cold-start cursor, re-streaming every event
+    in between and re-mirroring user messages."""
+    requests: list[str] = []
+    events_seen: list[int] = []
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        requests.append(str(req.url))
+        if len(requests) == 1:
+            # First connection: emit two events, then close.
+            payload_a = {"sequence": 101, "event": "message", "data": {}}
+            payload_b = {"sequence": 102, "event": "message", "data": {}}
+            body = (
+                f"event: message\ndata: {json.dumps(payload_a)}\n\n"
+                f"event: message\ndata: {json.dumps(payload_b)}\n\n"
+            ).encode()
+            return httpx.Response(200, content=body)
+        # Second connection: must come with after=102, not the original 100.
+        assert req.url.params.get("after") == "102", (
+            f"expected after=102 on reconnect, got after="
+            f"{req.url.params.get('after')!r}"
+        )
+        payload = {"sequence": 103, "event": "message", "data": {}}
+        body = (f"event: message\ndata: {json.dumps(payload)}\n\n").encode()
+        return httpx.Response(200, content=body)
+
+    client = _client(handler)
+
+    async def on_event(_name: str, data: dict) -> None:
+        events_seen.append(data.get("sequence"))
+        if len(events_seen) >= 3:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.stream_events(on_event, after_sequence=100)
+
+    assert events_seen == [101, 102, 103]
+    assert requests[0].endswith("after=100")
+    assert "after=102" in requests[1]
