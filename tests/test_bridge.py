@@ -2545,6 +2545,36 @@ class AutoJoinTests(_BridgeTestCase):
         self.assertEqual(len(self.bridge.vd.created), 1)
         self.assertEqual(self.bridge.vd.sent[0][1], "hello there")
 
+    async def test_engagement_chat_engages_with_empty_model_catalog(self):
+        """Production harness returns ``data: []`` for the model catalog.
+        Without ``strict_catalog`` the engagement pre-session config
+        parser would silently consume "Hi Claude!" as ``model=hi claude!``
+        and never start a session. Regression for the 2026-05-12 new-channel
+        bug where every user message just rewrote the channel purpose."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
+        # Mirror live agent-harness behaviour: empty model lists.
+        self.bridge.harness.models_by_backend = {
+            "claude": [], "codex": [], "pi": [], "opencode": [],
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "Hi Claude!",
+            "user_id": "u1", "type": "",
+        })
+
+        # The message must start a session, not be swallowed as config.
+        self.assertEqual(
+            len(self.bridge.vd.created), 1,
+            "expected an engagement session, but the message was eaten as config",
+        )
+        self.assertEqual(self.bridge.vd.sent[0][1], "Hi Claude!")
+        # And no config-applied notice should have gone to MM.
+        applied_posts = [
+            p for p in self.bridge.mm.posted
+            if "Config applied" in (p.message or "")
+        ]
+        self.assertEqual(applied_posts, [])
+
     async def test_engagement_disabled_when_auto_join_disabled(self):
         self.config.auto_join_public_channels = False
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
