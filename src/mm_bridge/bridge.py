@@ -739,6 +739,12 @@ class Bridge:
             self.config.default_model,
             lambda b: models_by_backend.get(b, []),
             default_autorespond=self.config.default_autorespond,
+            # Same reasoning as ``_try_apply_first_message_config``: the
+            # harness returns an empty model catalog, and without strict
+            # mode any first word ("Hi Claude!") would silently become
+            # ``model=hi claude!`` and the message would be swallowed
+            # before a session is even started.
+            strict_catalog=True,
         )
         if parsed.warnings:
             return False
