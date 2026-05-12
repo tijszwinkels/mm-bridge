@@ -423,6 +423,13 @@ class ChannelMapping:
         self.last_event_seq = seq
         self.save()
 
+    def reset_event_seq(self, seq: int) -> None:
+        """Non-monotonic reset of the cursor — for explicit recovery flows
+        (e.g. detected harness restart where the in-memory event bus
+        rolled back to 0). Bypasses ``set_event_seq``'s monotonic guard."""
+        self.last_event_seq = seq
+        self.save()
+
     def mark_adopted(self, session_id: str) -> None:
         """Record that ``session_id`` was replaced by a fresh harness session.
 
