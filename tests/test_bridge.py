@@ -618,6 +618,29 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         self.assertIn("claude_legacy", self.bridge._external_sessions)
         self.assertNotIn("ses_managed", self.bridge._external_sessions)
 
+    async def test_bootstrap_skips_adopted_external_sessions(self):
+        """Once an external session has been replaced via adoption, the
+        harness still lists it (sessions aren't deleted) — bootstrap
+        must NOT auto-spawn a fresh recovery channel for it on restart.
+        Regression for 2026-05-12 where a restart after adoption created
+        an extra orphan channel for the replaced session id."""
+        self.bridge.mapping.mark_adopted("claude_already_adopted")
+        self.bridge.harness.sessions_meta = [{
+            "id": "claude_already_adopted",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "external",
+        }]
+
+        await self.bridge._bootstrap_known_sessions()
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [], "no recovery channel for adopted session")
+        self.assertIsNone(
+            self.bridge.mapping.get_anchor("claude_already_adopted"),
+        )
+        self.assertIn("claude_already_adopted", self.bridge._known_sessions)
+
     async def test_external_session_replaced_on_user_post(self):
         """When a channel is mapped to a pre-cutover external session,
         an inbound MM message must NOT silently fail via ``create_run``.
@@ -657,6 +680,11 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         self.assertFalse(
             any(sid == "claude_dead" for sid, _ in forwarded),
             "no forwards to the dead external session",
+        )
+        # Persisted so a future bootstrap (after restart) won't try to
+        # re-spawn a recovery channel for the dead session id.
+        self.assertIn(
+            "claude_dead", self.bridge.mapping.adopted_session_ids,
         )
 
 
