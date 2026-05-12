@@ -165,16 +165,69 @@ class AgentHarnessClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    async def probe_current_sequence(
+        self,
+        *,
+        idle_window: float = 0.5,
+        hard_timeout: float = 5.0,
+    ) -> int:
+        """Briefly tail ``/v1/events`` to find the highest sequence so far.
+
+        The harness stream emits its full history on connect — there is no
+        documented cursor endpoint (``?from=now`` is presently ignored;
+        verified 2026-05-12). We open a stream, read until ``idle_window``
+        seconds pass with no fresh event, and return the highest sequence
+        observed. The caller uses that as ``after_sequence`` so new
+        connections only see events that arrived after this point.
+
+        ``hard_timeout`` is a safety ceiling for the probe overall. Returns
+        ``0`` when no events were observed (e.g. empty harness).
+        """
+        max_seq = 0
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        last_recv = start
+        try:
+            async with self._http.stream(
+                "GET", "/v1/events", timeout=hard_timeout,
+            ) as resp:
+                resp.raise_for_status()
+                data_buf = ""
+                async for line in resp.aiter_lines():
+                    now = loop.time()
+                    if line.startswith("data:"):
+                        data_buf += line[5:].strip()
+                    elif line == "" and data_buf:
+                        try:
+                            payload = json.loads(data_buf)
+                            seq = payload.get("sequence")
+                            if isinstance(seq, int) and seq > max_seq:
+                                max_seq = seq
+                                last_recv = now
+                        except json.JSONDecodeError:
+                            pass
+                        data_buf = ""
+                    if now - last_recv > idle_window or now - start > hard_timeout:
+                        break
+        except (httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+            logger.debug("probe_current_sequence: %s (max_seq=%d)", exc, max_seq)
+        except httpx.HTTPError as exc:
+            logger.warning("probe_current_sequence failed: %s", exc)
+        return max_seq
+
     async def stream_events(
         self,
         on_event: Callable[[str, dict], Awaitable[None]],
         *,
         after_sequence: int | None = None,
+        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
         last_sequence = after_sequence
         while True:
             try:
-                last_sequence = await self._stream_once(on_event, last_sequence)
+                last_sequence = await self._stream_once(
+                    on_event, last_sequence, on_progress,
+                )
             except (
                 httpx.ReadError,
                 httpx.RemoteProtocolError,
@@ -190,6 +243,7 @@ class AgentHarnessClient:
         self,
         on_event: Callable[[str, dict], Awaitable[None]],
         after_sequence: int | None,
+        on_progress: Callable[[int], Awaitable[None]] | None,
     ) -> int | None:
         params = {"after": str(after_sequence)} if after_sequence is not None else None
         async with self._http.stream("GET", "/v1/events", params=params) as resp:
@@ -205,6 +259,7 @@ class AgentHarnessClient:
                     if data_buf:
                         after_sequence = await self._dispatch_sse_event(
                             event_type, data_buf, on_event, after_sequence,
+                            on_progress,
                         )
                     event_type = ""
                     data_buf = ""
@@ -216,6 +271,7 @@ class AgentHarnessClient:
         data_buf: str,
         on_event: Callable[[str, dict], Awaitable[None]],
         after_sequence: int | None,
+        on_progress: Callable[[int], Awaitable[None]] | None,
     ) -> int | None:
         try:
             data = json.loads(data_buf)
@@ -228,6 +284,11 @@ class AgentHarnessClient:
             after_sequence = max(after_sequence or sequence, sequence)
 
         await on_event(data.get("event") or event_type, data)
+        if on_progress is not None and isinstance(sequence, int):
+            try:
+                await on_progress(sequence)
+            except Exception:
+                logger.exception("on_progress callback failed for seq=%s", sequence)
         return after_sequence
 
     @staticmethod
