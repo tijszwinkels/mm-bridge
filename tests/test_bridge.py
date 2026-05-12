@@ -263,6 +263,11 @@ class FakeAgentHarnessClient:
         await self.interrupt_run(session_id, "legacy-run")
         return {"status": "interrupted", "session_id": session_id}
 
+    async def probe_current_sequence(self, **_kwargs) -> int:
+        # High default keeps warm-restart tests free of a no-op reset.
+        # Reset-detection tests override this attribute on the instance.
+        return 10**9
+
     async def list_backend_models(self, backend) -> list[str]:
         return self.models_by_backend.get(backend, [])
 
@@ -564,6 +569,49 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
     async def test_bootstrap_event_cursor_uses_persisted_seq(self):
         """Warm restart: bridge resumes SSE from the persisted cursor."""
         self.bridge.mapping.set_event_seq(4242)
+        cursor = await self.bridge._bootstrap_event_cursor()
+        self.assertEqual(cursor, 4242)
+
+    async def test_bootstrap_event_cursor_resets_when_harness_sequence_reset(self):
+        """Detected harness restart: persisted cursor is above the harness's
+        current max sequence (the harness's in-memory event bus rolled back to
+        0 on restart). The bridge must reset to 0 — otherwise it would skip
+        every event the new harness emits until its sequence catches back up,
+        silently dropping run events for active channels."""
+        self.bridge.mapping.set_event_seq(8439)
+
+        async def fake_probe(**_kwargs):
+            return 2911  # well below persisted 8439 → harness was reset
+
+        self.bridge.harness.probe_current_sequence = fake_probe  # type: ignore[assignment]
+        cursor = await self.bridge._bootstrap_event_cursor()
+        self.assertEqual(cursor, 0)
+        # The reset must also persist so the next restart doesn't see the
+        # stale value again.
+        self.assertEqual(self.bridge.mapping.last_event_seq, 0)
+
+    async def test_bootstrap_event_cursor_keeps_persisted_when_harness_seq_higher(self):
+        """Normal warm restart: persisted cursor still <= harness max, resume
+        from the persisted position."""
+        self.bridge.mapping.set_event_seq(2900)
+
+        async def fake_probe(**_kwargs):
+            return 2911
+
+        self.bridge.harness.probe_current_sequence = fake_probe  # type: ignore[assignment]
+        cursor = await self.bridge._bootstrap_event_cursor()
+        self.assertEqual(cursor, 2900)
+
+    async def test_bootstrap_event_cursor_keeps_persisted_if_probe_fails(self):
+        """If the probe blows up (harness down, network blip), fall back to
+        the persisted value rather than guessing — better to risk skipping a
+        few events than blast-replay everything every restart."""
+        self.bridge.mapping.set_event_seq(4242)
+
+        async def fake_probe(**_kwargs):
+            raise RuntimeError("connection refused")
+
+        self.bridge.harness.probe_current_sequence = fake_probe  # type: ignore[assignment]
         cursor = await self.bridge._bootstrap_event_cursor()
         self.assertEqual(cursor, 4242)
 
