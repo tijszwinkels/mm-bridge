@@ -145,6 +145,7 @@ def parse(
     available_models_for: Callable[[str], list[str]],
     *,
     default_autorespond: bool = True,
+    strict_catalog: bool = False,
 ) -> PurposeConfig:
     """Parse a channel purpose string into a PurposeConfig.
 
@@ -158,6 +159,12 @@ def parse(
             mention-only / noautorespond / autorespond token default to
             responding to every message. When False, they default to
             mention-only (explicit `autorespond` needed to turn it off).
+        strict_catalog: when True, disable the "empty model catalog →
+            accept any token as a model name" fallback. Callers parsing
+            *chat messages* (vs. an operator-set Channel Purpose) use this
+            to keep ordinary words like "Hi!" from being interpreted as
+            unknown-but-acceptable model names just because the harness
+            doesn't enumerate models.
 
     Never raises. Unknown tokens are collected into PurposeConfig.warnings.
     """
@@ -239,7 +246,8 @@ def parse(
         # as a model so operators can use models the harness hasn't
         # enumerated.
         default_models = _models_for(default_backend, available_models_for)
-        if first_lc in default_models or not default_models:
+        accept_unknown = not default_models and not strict_catalog
+        if first_lc in default_models or accept_unknown:
             backend = default_backend
             model = first_lc
         else:
@@ -255,8 +263,9 @@ def parse(
     # Step 4: walk remaining tokens (mention-only / autorespond / cwd were
     # already extracted in Step 2a). With an empty catalog (US-5.3) any
     # otherwise-unrecognised token is taken as a model name verbatim so the
-    # bridge can pass it to ``POST /v1/sessions`` unchanged.
-    catalog_empty = not backend_models
+    # bridge can pass it to ``POST /v1/sessions`` unchanged — unless the
+    # caller asked for strict_catalog (e.g. first-message-config parsing).
+    catalog_empty = not backend_models and not strict_catalog
     for token in rest:
         token_lc = token.lower()
         if token_lc in backend_models or (catalog_empty and model is None):
