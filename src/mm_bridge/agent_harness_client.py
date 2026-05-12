@@ -221,11 +221,18 @@ class AgentHarnessClient:
         *,
         after_sequence: int | None = None,
         on_progress: Callable[[int], Awaitable[None]] | None = None,
+        on_reset: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         # ``last_sequence`` is updated by ``_stream_once`` via an inline mutable
         # cell so transient errors mid-stream don't erase the cursor —
         # otherwise a 30s idle ReadTimeout would replay every event since
         # ``after_sequence`` on each reconnect, re-mirroring user messages.
+        #
+        # ``on_reset`` fires when we detect the harness restarted mid-session
+        # (cursor > harness's current max sequence). Caller uses it to
+        # update its persisted cursor; this client also resets the in-memory
+        # cursor to 0 so events that landed in the new harness's in-memory
+        # bus are picked up.
         cursor: list[int | None] = [after_sequence]
         while True:
             try:
@@ -240,12 +247,42 @@ class AgentHarnessClient:
                     "SSE connection lost at seq=%s (%s), reconnecting in 2s...",
                     cursor[0], exc,
                 )
+                await self._maybe_reset_cursor_on_harness_restart(cursor, on_reset)
                 await asyncio.sleep(2)
             except Exception:
                 logger.exception(
                     "SSE stream error at seq=%s, reconnecting in 5s...", cursor[0],
                 )
+                await self._maybe_reset_cursor_on_harness_restart(cursor, on_reset)
                 await asyncio.sleep(5)
+
+    async def _maybe_reset_cursor_on_harness_restart(
+        self,
+        cursor: list[int | None],
+        on_reset: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        current = cursor[0]
+        if not isinstance(current, int) or current <= 0:
+            return
+        try:
+            harness_max = await self.probe_current_sequence()
+        except Exception:
+            logger.debug("Reset probe failed during SSE reconnect", exc_info=True)
+            return
+        if current <= harness_max:
+            return
+        logger.warning(
+            "Detected harness sequence reset during SSE reconnect "
+            "(cursor=%d > harness_max=%d). Resetting cursor to 0 to pick "
+            "up events from the new harness's in-memory bus.",
+            current, harness_max,
+        )
+        cursor[0] = 0
+        if on_reset is not None:
+            try:
+                await on_reset()
+            except Exception:
+                logger.exception("on_reset callback failed")
 
     async def _stream_once(
         self,
