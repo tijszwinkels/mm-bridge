@@ -563,7 +563,19 @@ class Bridge:
             self._on_harness_event,
             after_sequence=getattr(self, "_event_cursor", None),
             on_progress=self._persist_event_seq,
+            on_reset=self._on_harness_sequence_reset,
         )
+
+    async def _on_harness_sequence_reset(self) -> None:
+        """Called when the SSE client detects the harness restarted mid-session
+        (its in-memory sequence rolled back below our cursor). Reset the
+        persisted cursor too so a subsequent bridge restart picks the same
+        recovery path on bootstrap."""
+        logger.warning(
+            "Harness restart detected mid-session — resetting persisted "
+            "event cursor to 0",
+        )
+        self.mapping.reset_event_seq(0)
 
     async def _run_typing_watchdog(self) -> None:
         """Stop a typing loop if session_status hasn't been heard from recently."""
