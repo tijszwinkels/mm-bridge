@@ -594,6 +594,71 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         await self.bridge._persist_event_seq(101)
         self.assertEqual(self.bridge.mapping.last_event_seq, 101)
 
+    async def test_bootstrap_tracks_mapped_external_sessions(self):
+        """Bootstrap populates ``_external_sessions`` with mapped session
+        ids whose harness ``origin`` is ``external``. Such sessions can't
+        receive injected user turns, so ``_on_mm_posted`` must route
+        around them rather than calling ``create_run``."""
+        self.bridge.mapping.link(Anchor("c1"), "claude_legacy")
+        self.bridge.harness.sessions_meta = [{
+            "id": "claude_legacy",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "external",
+        }, {
+            "id": "ses_managed",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "harness",
+        }]
+        self.bridge.mapping.link(Anchor("c2"), "ses_managed")
+
+        await self.bridge._bootstrap_known_sessions()
+
+        self.assertIn("claude_legacy", self.bridge._external_sessions)
+        self.assertNotIn("ses_managed", self.bridge._external_sessions)
+
+    async def test_external_session_replaced_on_user_post(self):
+        """When a channel is mapped to a pre-cutover external session,
+        an inbound MM message must NOT silently fail via ``create_run``.
+        The bridge unmaps the dead session, creates a fresh harness
+        session for the same channel, and the user's current message
+        becomes the new session's first turn. Regression for the
+        cutover-day silent-drop where 3 of 4 MM posts never reached the
+        running Claude Code process."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mapping.link(Anchor("c1"), "claude_dead")
+        self.bridge._external_sessions.add("claude_dead")
+        self.bridge._known_sessions.add("claude_dead")
+        self.bridge.harness.next_session_id = "ses_fresh"
+
+        await self.bridge._on_mm_posted({
+            "id": "p1",
+            "channel_id": "c1",
+            "user_id": "u1",
+            "message": "still here?",
+            "type": "",
+        })
+
+        # Old mapping is gone.
+        self.assertNotIn("claude_dead", self.bridge._external_sessions)
+        # Fresh harness session created and mapped to the channel.
+        self.assertEqual(len(self.bridge.harness.created), 1)
+        new_session_id = self.bridge.mapping.get_session(Anchor("c1"))
+        self.assertEqual(new_session_id, "ses_fresh")
+        # User's message routed to the NEW session, not the dead one.
+        forwarded = [(sid, body) for sid, body in self.bridge.harness.sent]
+        self.assertTrue(
+            any(sid == "ses_fresh" and "still here?" in body
+                for sid, body in forwarded),
+            f"expected user message to land on the new session; got {forwarded}",
+        )
+        # Nothing was forwarded to the dead session.
+        self.assertFalse(
+            any(sid == "claude_dead" for sid, _ in forwarded),
+            "no forwards to the dead external session",
+        )
+
 
 class InviteFlowTests(_BridgeTestCase):
     async def test_bot_invited_to_unmapped_channel_creates_session(self):

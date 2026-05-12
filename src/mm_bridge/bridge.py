@@ -284,6 +284,13 @@ class Bridge:
         self.last_activity_ts: dict[str, float] = {}
         self.current_run_id_by_session: dict[str, str] = {}
         self._known_sessions: set[str] = set()
+        # Sessions the harness reports as ``origin: external`` — i.e. NOT
+        # launched by the harness itself, so it has no stdin / IPC channel
+        # to inject new user turns into. The bridge forwards messages for
+        # such sessions to a fresh harness-origin replacement instead;
+        # see ``_replace_external_session``. Populated at bootstrap and
+        # pruned as sessions are replaced.
+        self._external_sessions: set[str] = set()
         # How many times we tried (and failed) to create an MM channel for a
         # given session_id. After ``MAX_CHANNEL_CREATE_ATTEMPTS`` the session
         # is added to ``_known_sessions`` to stop retrying.
@@ -387,13 +394,20 @@ class Bridge:
             session_id = session.get("id")
             if not session_id:
                 continue
+            is_external = session.get("origin") == "external"
+            if is_external and self.mapping.get_anchor(session_id):
+                # Inbound MM posts to this mapping can't be delivered:
+                # the harness has no stdin for an externally-launched
+                # session. ``_on_mm_posted`` will swap in a fresh
+                # harness-origin session on the next user post.
+                self._external_sessions.add(session_id)
             if self.mapping.get_anchor(session_id):
                 self._known_sessions.add(session_id)
                 continue
             if _is_suppressed_session(session_id):
                 self._known_sessions.add(session_id)
                 continue
-            if session.get("origin") != "external":
+            if not is_external:
                 continue
             if await self._create_channel_for_session(session):
                 self._known_sessions.add(session_id)
@@ -577,6 +591,16 @@ class Bridge:
                 await self._maybe_start_engagement_session(
                     channel_id, post, message,
                 )
+            return
+
+        # Channels still mapped to a pre-cutover external session can't
+        # receive injected user turns (harness has no stdin for them).
+        # Replace with a fresh harness-origin session and let the new
+        # session pick up the user's current message as its first turn.
+        if session_id in self._external_sessions:
+            await self._replace_external_session(
+                channel_id, session_id, post, message,
+            )
             return
 
         # First-message-after-invite: optionally reconfigure via plain tokens.
@@ -965,6 +989,11 @@ class Bridge:
             self.config.default_model,
             lambda b: models_by_backend.get(b, []),
             default_autorespond=self.config.default_autorespond,
+            # The harness's claude-code backend currently returns an empty
+            # model catalog. Without strict mode any first word in a chat
+            # message ("Hi!") would be silently accepted as a model name
+            # and the message swallowed instead of forwarded as a turn.
+            strict_catalog=True,
         )
         # Unknown tokens → parser attaches warnings. Unless ALL tokens were
         # known, bail out and treat the message as text.
@@ -1011,6 +1040,57 @@ class Bridge:
             mention_only=new.mention_only,
             cwd=new.cwd if new.cwd is not None else current.cwd,
             warnings=[],
+        )
+
+    async def _replace_external_session(
+        self,
+        channel_id: str,
+        old_session_id: str,
+        post: dict,
+        message: str,
+    ) -> None:
+        """Adopt a channel currently mapped to an ``origin: external``
+        harness session.
+
+        Externally-launched sessions (e.g. ones created by VibeDeck before
+        the harness cutover) appear in ``GET /v1/sessions`` but the harness
+        has no stdin / IPC channel into them — ``POST /v1/sessions/<id>/runs``
+        returns 200 but the message goes nowhere. The user's current MM
+        post would silently vanish.
+
+        Recovery: drop the stale mapping, post a brief adoption notice in
+        the channel, and start a fresh harness-origin session whose first
+        turn is the user's actual message. Channel scrollback stays
+        visible as context for the human; the new session gets the bridge's
+        existing catch-up preamble via ``_start_invited_session``.
+        """
+        logger.info(
+            "Adopting channel %s — replacing external session %s with a fresh harness session",
+            channel_id, old_session_id[:12],
+        )
+        self.mapping.unlink(Anchor(channel_id))
+        self._end_tool_use_run(old_session_id)
+        self.posters.forget(old_session_id)
+        self._forget_channel_silent_drops(channel_id)
+        self._session_triggerer.pop(old_session_id, None)
+        self._recent_harness_sends.pop(old_session_id, None)
+        self._external_sessions.discard(old_session_id)
+        if self.typing:
+            await self.typing.stop(old_session_id)
+        try:
+            self.mm.post_message(
+                channel_id,
+                ":arrows_counterclockwise: Previous session is no longer reachable from "
+                "Mattermost. Starting a fresh session for this channel.",
+            )
+        except Exception:
+            logger.debug("Failed to post adoption notice", exc_info=True)
+        await self._start_invited_session(
+            channel_id,
+            initial_message=message,
+            allow_first_message_config=False,
+            post_welcome=False,
+            exclude_post_id=post.get("id"),
         )
 
     async def _restart_session_with_config(

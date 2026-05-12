@@ -528,5 +528,58 @@ def test_parse_accepts_claude_code_backend_alias():
     assert cfg.warnings == []
 
 
+# ---------------------------------------------------------------------------
+# strict_catalog: chat-message parsing must not silently consume plain words
+# ---------------------------------------------------------------------------
+
+
+def test_strict_catalog_rejects_unknown_first_token_when_catalog_empty():
+    """The first-message-config code path parses a chat message that might
+    or might not be config. The harness's empty-catalog response means a
+    word like ``Hi!`` would otherwise be silently accepted as a model
+    name. ``strict_catalog`` disables that fallback so the message bubbles
+    out with a warning and the caller treats it as plain chat."""
+    cfg = parse(
+        "Hi!", "claude", "opus", lambda _b: [], strict_catalog=True,
+    )
+    assert cfg.warnings, "expected an unknown-token warning under strict mode"
+    # Model stays at the caller's default — no silent overwrite.
+    assert cfg.model == "opus"
+
+
+def test_strict_catalog_still_accepts_explicit_backend_alias():
+    """Strict mode only tightens the catalog-empty fallback. Explicit
+    backend keywords like ``claude`` still parse cleanly so a chat
+    message that genuinely *is* config (``claude, autorespond``) is
+    still recognised."""
+    cfg = parse(
+        "claude", "claude", "opus", lambda _b: [], strict_catalog=True,
+    )
+    assert cfg.backend == "claude"
+    assert cfg.warnings == []
+
+
+def test_strict_catalog_rejects_unknown_later_token_too():
+    """A known backend followed by an unknown token should warn under
+    strict mode even when the catalog is empty (no silent model
+    assignment from chat words)."""
+    cfg = parse(
+        "claude, banana", "claude", "opus", lambda _b: [],
+        strict_catalog=True,
+    )
+    assert any("banana" in w for w in cfg.warnings)
+
+
+def test_strict_catalog_off_keeps_permissive_purpose_parsing():
+    """Default (``strict_catalog=False``) keeps US-5.3 behavior so
+    operators can set unenumerated models via the Channel Purpose
+    field."""
+    cfg = parse(
+        "claude, claude-opus-4-7", "claude", "opus", lambda _b: [],
+    )
+    assert cfg.model == "claude-opus-4-7"
+    assert cfg.warnings == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
