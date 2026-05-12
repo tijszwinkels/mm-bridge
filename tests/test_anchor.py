@@ -142,13 +142,14 @@ class ChannelMappingMigrationTests(unittest.TestCase):
         self.assertEqual(m.get_session(Anchor("c2", "r2")), "s-fork-2")
         self.assertEqual(m.get_anchor("s-fork"), Anchor("c1", "r1"))
 
-    def test_save_emits_v3_schema(self) -> None:
+    def test_save_emits_current_schema(self) -> None:
+        from mm_bridge.config import STATE_SCHEMA_VERSION
         m = ChannelMapping.load(self.state, self.sdir)
         m.link(Anchor("c1"), "s1")
         m.link(Anchor("c1", "r1"), "s-fork")
 
         data = json.loads(Path(self.state).read_text())
-        self.assertEqual(data.get("version"), 3)
+        self.assertEqual(data.get("version"), STATE_SCHEMA_VERSION)
         self.assertIn("entries", data)
         entries = data["entries"]
         self.assertIsInstance(entries, list)
@@ -159,7 +160,8 @@ class ChannelMappingMigrationTests(unittest.TestCase):
         self.assertEqual(by_session["s-fork"]["channel_id"], "c1")
         self.assertEqual(by_session["s-fork"]["root_id"], "r1")
 
-    def test_legacy_v2_file_is_rewritten_as_v3_on_first_save(self) -> None:
+    def test_legacy_v2_file_is_rewritten_as_current_schema_on_first_save(self) -> None:
+        from mm_bridge.config import STATE_SCHEMA_VERSION
         self._write_v2({
             "channel_to_session": {"c1": "s1"},
             "thread_mapping": {"c1:r1": "s-fork"},
@@ -169,9 +171,59 @@ class ChannelMappingMigrationTests(unittest.TestCase):
         # re-link the same pair — save() is called unconditionally).
         m.link(Anchor("c1"), "s1")
         data = json.loads(Path(self.state).read_text())
-        self.assertEqual(data.get("version"), 3)
+        self.assertEqual(data.get("version"), STATE_SCHEMA_VERSION)
         self.assertNotIn("channel_to_session", data)
         self.assertNotIn("thread_mapping", data)
+
+
+class LastEventSeqTests(unittest.TestCase):
+    """``last_event_seq`` is the SSE cursor checkpoint for restart safety."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = f"{self.tmp.name}/state.json"
+        self.sdir = Path(self.tmp.name) / "sidecar"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_default_is_none_for_fresh_file(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertIsNone(m.last_event_seq)
+
+    def test_save_emits_last_event_seq_field(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        m.set_event_seq(42)
+        data = json.loads(Path(self.state).read_text())
+        self.assertEqual(data.get("last_event_seq"), 42)
+
+    def test_set_event_seq_is_monotonic(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        m.set_event_seq(100)
+        m.set_event_seq(50)  # stale event on reconnect — must not rewind
+        self.assertEqual(m.last_event_seq, 100)
+
+    def test_v3_state_loads_with_seq_none(self) -> None:
+        Path(self.state).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.state).write_text(json.dumps({
+            "version": 3,
+            "entries": [
+                {"channel_id": "c1", "root_id": None, "session_id": "s1"},
+            ],
+        }))
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertIsNone(m.last_event_seq)
+        self.assertEqual(m.get_session(Anchor("c1")), "s1")
+
+    def test_v4_state_roundtrips_seq(self) -> None:
+        Path(self.state).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.state).write_text(json.dumps({
+            "version": 4,
+            "entries": [],
+            "last_event_seq": 7259,
+        }))
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertEqual(m.last_event_seq, 7259)
 
 
 if __name__ == "__main__":
