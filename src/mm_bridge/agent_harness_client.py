@@ -222,31 +222,48 @@ class AgentHarnessClient:
         after_sequence: int | None = None,
         on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
-        last_sequence = after_sequence
+        # ``last_sequence`` is updated by ``_stream_once`` via an inline mutable
+        # cell so transient errors mid-stream don't erase the cursor —
+        # otherwise a 30s idle ReadTimeout would replay every event since
+        # ``after_sequence`` on each reconnect, re-mirroring user messages.
+        cursor: list[int | None] = [after_sequence]
         while True:
             try:
-                last_sequence = await self._stream_once(
-                    on_event, last_sequence, on_progress,
-                )
+                await self._stream_once(on_event, cursor, on_progress)
             except (
                 httpx.ReadError,
+                httpx.ReadTimeout,
                 httpx.RemoteProtocolError,
                 httpx.ConnectError,
             ) as exc:
-                logger.warning("SSE connection lost (%s), reconnecting in 2s...", exc)
+                logger.warning(
+                    "SSE connection lost at seq=%s (%s), reconnecting in 2s...",
+                    cursor[0], exc,
+                )
                 await asyncio.sleep(2)
             except Exception:
-                logger.exception("SSE stream error, reconnecting in 5s...")
+                logger.exception(
+                    "SSE stream error at seq=%s, reconnecting in 5s...", cursor[0],
+                )
                 await asyncio.sleep(5)
 
     async def _stream_once(
         self,
         on_event: Callable[[str, dict], Awaitable[None]],
-        after_sequence: int | None,
+        cursor: list[int | None],
         on_progress: Callable[[int], Awaitable[None]] | None,
-    ) -> int | None:
-        params = {"after": str(after_sequence)} if after_sequence is not None else None
-        async with self._http.stream("GET", "/v1/events", params=params) as resp:
+    ) -> None:
+        params = (
+            {"after": str(cursor[0])} if cursor[0] is not None else None
+        )
+        # ``timeout=None`` on the read disables httpx's idle-byte timeout —
+        # SSE streams are intentionally long-lived and may go quiet for
+        # minutes between events. The agent-harness ``ping`` event is
+        # infrequent and shouldn't be relied on for liveness.
+        stream_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+        async with self._http.stream(
+            "GET", "/v1/events", params=params, timeout=stream_timeout,
+        ) as resp:
             resp.raise_for_status()
             event_type = ""
             data_buf = ""
@@ -257,13 +274,12 @@ class AgentHarnessClient:
                     data_buf += line[5:].strip()
                 elif line == "":
                     if data_buf:
-                        after_sequence = await self._dispatch_sse_event(
-                            event_type, data_buf, on_event, after_sequence,
+                        cursor[0] = await self._dispatch_sse_event(
+                            event_type, data_buf, on_event, cursor[0],
                             on_progress,
                         )
                     event_type = ""
                     data_buf = ""
-        return after_sequence
 
     async def _dispatch_sse_event(
         self,
