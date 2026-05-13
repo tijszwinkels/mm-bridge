@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from mm_bridge.agent_harness_client import (
+    SSE_READ_TIMEOUT_SECONDS,
     AgentHarnessClient,
     HarnessForkUnsupported,
     HarnessInterruptUnsupported,
@@ -521,6 +522,130 @@ async def test_stream_events_resets_cursor_on_detected_harness_restart(monkeypat
     assert events_seen == [8001, 8002, 13]
     assert reset_called == 1
     # Third connect (after probe + reset) must request from 0.
+    assert requests[2][1] == "0", f"expected after=0 on reset, got {requests[2][1]!r}"
+
+
+async def test_stream_events_ignores_sse_comment_keepalive_frames():
+    """The harness emits ``: ka`` comment frames during bus silence. The
+    SSE parser must skip them entirely — they must not show up as events,
+    must not perturb the next real event's parsing, and must not break
+    cursor tracking on the surrounding event."""
+    requests: list[str] = []
+    events: list[tuple[str, dict]] = []
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        requests.append(str(req.url))
+        # Interleave keepalive comments before, between, and after a real
+        # event. Both ``: ka`` and ``:ka`` (no space) are valid SSE
+        # comments — exercise both.
+        body = (
+            ": ka\n\n"
+            f"event: message\n"
+            f"data: {json.dumps({'sequence': 7, 'event': 'message', 'data': {}})}\n\n"
+            ":ka\n\n"
+            f"event: message\n"
+            f"data: {json.dumps({'sequence': 8, 'event': 'message', 'data': {}})}\n\n"
+        ).encode()
+        return httpx.Response(200, content=body)
+
+    client = _client(handler)
+
+    async def on_event(name: str, data: dict) -> None:
+        events.append((name, data))
+        if len(events) >= 2:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.stream_events(on_event)
+
+    assert [name for name, _ in events] == ["message", "message"]
+    assert [data.get("sequence") for _, data in events] == [7, 8]
+
+
+async def test_stream_once_uses_finite_read_timeout():
+    """The SSE stream must run with a finite read timeout so a silently
+    stuck stream (e.g. our cursor "in the future" after a harness restart,
+    or a half-open TCP connection) eventually trips ``httpx.ReadTimeout``
+    and falls into the reconnect+reset path. Regression for the 2026-05-13
+    incident: ``read=None`` left the bridge listening forever to a stream
+    that the new harness silently filtered to zero events."""
+    captured: dict[str, object] = {}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"")
+
+    client = _client(handler)
+
+    original = client._http.stream
+
+    def capture_stream(method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return original(method, url, **kwargs)
+
+    # Patch on the instance so MockTransport still runs.
+    object.__setattr__(client._http, "stream", capture_stream)
+
+    cursor: list[int | None] = [None]
+    await client._stream_once(lambda *_: None, cursor, None)
+
+    timeout = captured["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read is not None and timeout.read == SSE_READ_TIMEOUT_SECONDS
+
+
+async def test_stream_events_resets_cursor_on_read_timeout(monkeypatch):
+    """A ``httpx.ReadTimeout`` (idle-stream death) must reach the same
+    reconnect + sequence-reset probe as ``httpx.ReadError``. With the
+    bridge's finite read timeout, this is the new primary recovery path
+    for harness restarts that go undetected because the reset rolls the
+    bus back without dropping the TCP connection."""
+    requests: list[tuple[str, str | None]] = []
+    events_seen: list[int] = []
+    reset_called = 0
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        requests.append((str(req.url), req.url.params.get("after")))
+        attempt = len(requests)
+        if attempt == 1:
+            return httpx.Response(
+                200,
+                content=(
+                    f"event: message\ndata: {json.dumps({'sequence': 9001, 'event': 'message'})}\n\n"
+                ).encode(),
+            )
+        if attempt == 2:
+            raise httpx.ReadTimeout("simulated idle-stream timeout")
+        return httpx.Response(
+            200,
+            content=(
+                f"event: message\ndata: {json.dumps({'sequence': 5, 'event': 'message'})}\n\n"
+            ).encode(),
+        )
+
+    client = _client(handler)
+
+    async def fake_probe(**_kwargs):
+        return 4
+
+    monkeypatch.setattr(client, "probe_current_sequence", fake_probe)
+    monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+
+    async def on_event(_name: str, data: dict) -> None:
+        events_seen.append(data.get("sequence"))
+        if len(events_seen) >= 2:
+            raise asyncio.CancelledError
+
+    async def on_reset() -> None:
+        nonlocal reset_called
+        reset_called += 1
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.stream_events(
+            on_event, after_sequence=9000, on_reset=on_reset,
+        )
+
+    assert events_seen == [9001, 5]
+    assert reset_called == 1
     assert requests[2][1] == "0", f"expected after=0 on reset, got {requests[2][1]!r}"
 
 
