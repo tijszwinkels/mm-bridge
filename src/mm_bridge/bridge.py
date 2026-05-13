@@ -415,6 +415,18 @@ class Bridge:
                 self._known_sessions.add(session_id)
                 continue
             if not is_external:
+                # Harness-origin sessions in the repo at bootstrap are
+                # either pre-existing spawn-CLI / bridge-created records
+                # whose channel was wired in a previous run, or test
+                # leftovers from prior ``agent-harness`` runs. Either way,
+                # we must NOT auto-create a channel for them on startup —
+                # but we MUST mark them ``known`` so the SSE bootstrap-
+                # replay of their ``session.updated`` event doesn't trip
+                # the live-create path in ``_on_harness_session_seen``.
+                # Without this guard the cursor-reset recovery flow would
+                # re-spawn an MM channel for every leftover test session
+                # in the harness DB (the 2026-05-12 ghost-channel burst).
+                self._known_sessions.add(session_id)
                 continue
             if await self._create_channel_for_session(session):
                 self._known_sessions.add(session_id)
@@ -2033,15 +2045,17 @@ class Bridge:
         if _is_suppressed_session(session_id):
             self._known_sessions.add(session_id)
             return
-        # Only externally-launched sessions (CLI processes the operator
-        # started outside the harness) auto-spawn an MM channel. Harness-
-        # origin sessions are created via the API — by the bridge itself,
-        # by ``mm-bridge spawn``, or by tests — and the creator is
-        # responsible for linking the channel. Mirrors the filter in
-        # ``_bootstrap_known_sessions``.
-        if session.get("origin") != "external":
-            self._known_sessions.add(session_id)
-            return
+        # Both external and harness-origin sessions surface as channels
+        # here. External sessions are CLI processes the operator started
+        # outside the harness. Harness-origin sessions reach this branch
+        # when something outside the daemon created them (``mm-bridge
+        # spawn``, integration tests against a live harness, or a future
+        # IPC client) — the bridge daemon's own creations register the
+        # mapping synchronously via ``mapping.link`` and hit the early
+        # ``get_anchor`` exit above. Pre-existing test ghosts are filtered
+        # by ``_bootstrap_known_sessions`` marking them ``known``, so the
+        # bootstrap SSE replay of their stale ``session.updated`` events
+        # is skipped before reaching this line.
         # Only mark known after the channel actually exists; otherwise a
         # transient MM error means we'd silently skip future
         # ``session.updated`` events for this session and never spawn its
