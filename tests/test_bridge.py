@@ -406,6 +406,49 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
         self.assertEqual(len(created), 1)
 
+    async def test_bootstrap_marks_harness_origin_sessions_as_known(self):
+        """Pre-existing harness-origin sessions (test leftovers, prior
+        spawn-CLI records whose mapping survived in state.json, or future
+        IPC-created sessions) must be marked ``known`` at bootstrap time
+        WITHOUT auto-creating an MM channel.
+
+        Without this, the SSE bootstrap replay (especially after a cursor
+        reset following a detected harness restart) would re-emit
+        ``session.updated`` for every leftover row and trip the live-create
+        path in ``_on_harness_session_seen`` — the 2026-05-12 ghost-channel
+        burst. The post-spawn-fix invariant is: live ``session.updated``
+        events freely spawn channels, but bootstrap pre-registers every
+        already-existing session as known so the replay can't double-spawn."""
+        self.bridge.harness.sessions_meta = [{
+            "id": "ses_harness_leftover",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "title": "Ghost leftover",
+            "origin": "harness",
+        }]
+
+        await self.bridge._bootstrap_known_sessions()
+
+        # Marked known so the SSE replay's session.updated is a no-op.
+        self.assertIn("ses_harness_leftover", self.bridge._known_sessions)
+        # But NOT auto-mapped to a channel — only external sessions get
+        # the bootstrap-time auto-spawn treatment.
+        self.assertIsNone(self.bridge.mapping.get_anchor("ses_harness_leftover"))
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [])
+
+        # And the SSE bootstrap-replay of the same session.updated must
+        # remain a no-op now (no channel-create from the live handler).
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {
+                "session_id": "ses_harness_leftover",
+                "session": self.bridge.harness.sessions_meta[0],
+            }},
+        )
+        created_after = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created_after, [])
+
     async def test_failed_channel_create_does_not_block_future_retry(self):
         """A transient MM failure on first ``session.updated`` must NOT
         leave the session permanently in ``_known_sessions`` — otherwise
@@ -453,14 +496,17 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         self.assertEqual(created, [])
         self.assertIn("codex_existing", self.bridge._known_sessions)
 
-    async def test_harness_origin_session_does_not_spawn_channel(self):
-        """``session.updated`` for a harness-origin session (created via the
-        API, e.g. by ``mm-bridge spawn``, by the bridge itself, or by tests)
-        must NOT auto-spawn an MM channel. Only externally-launched CLI
-        sessions get the auto-spawn treatment — mirrors the origin filter in
-        ``_bootstrap_known_sessions``. Regression for the bootstrap-window
-        channel-spam incident on 2026-05-12 where 7 leftover integration-test
-        ``ses_*`` sessions each triggered a fresh MM channel-create."""
+    async def test_harness_origin_session_spawns_channel_when_unknown(self):
+        """A fresh harness-origin ``session.updated`` (e.g. from ``mm-bridge
+        spawn``, an integration test, or a future IPC client that created
+        the session via the harness API) DOES auto-spawn an MM channel —
+        otherwise the spawn CLI's ``_wait_for_new_sidecar`` times out and
+        the new session is left orphaned with no channel.
+
+        Pre-existing harness-origin sessions are protected from re-spawn
+        by ``_bootstrap_known_sessions`` marking them ``known`` before the
+        SSE replay reaches this handler; see
+        ``test_bootstrap_marks_harness_origin_sessions_as_known``."""
         session = {
             "id": "ses_harness_origin",
             "backend": "claude-code",
@@ -474,11 +520,9 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         )
 
         created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
-        self.assertEqual(created, [])
-        self.assertIsNone(self.bridge.mapping.get_anchor("ses_harness_origin"))
-        # Cache the decision so subsequent ``session.updated`` for the same
-        # id don't re-enter the check (or, worse, race past it on a later
-        # event that happens to have origin missing).
+        self.assertEqual(len(created), 1)
+        anchor = self.bridge.mapping.get_anchor("ses_harness_origin")
+        self.assertIsNotNone(anchor)
         self.assertIn("ses_harness_origin", self.bridge._known_sessions)
 
     async def test_claude_agent_subagent_session_is_suppressed(self):
