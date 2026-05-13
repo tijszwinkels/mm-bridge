@@ -182,17 +182,24 @@ class AgentHarnessClient:
 
         ``hard_timeout`` is a safety ceiling for the probe overall. Returns
         ``0`` when no events were observed (e.g. empty harness).
+
+        Connect-time and HTTP-status failures propagate as ``httpx.HTTPError``
+        so callers can distinguish "harness reported 0 events" from "probe
+        could not confirm anything". Both the bootstrap and reconnect-reset
+        paths interpret a confirmed 0 as a harness restart; silently
+        returning 0 on a network blip caused spurious cursor resets and
+        replay floods.
         """
         max_seq = 0
         loop = asyncio.get_event_loop()
         start = loop.time()
         last_recv = start
-        try:
-            async with self._http.stream(
-                "GET", "/v1/events", timeout=hard_timeout,
-            ) as resp:
-                resp.raise_for_status()
-                data_buf = ""
+        async with self._http.stream(
+            "GET", "/v1/events", timeout=hard_timeout,
+        ) as resp:
+            resp.raise_for_status()
+            data_buf = ""
+            try:
                 async for line in resp.aiter_lines():
                     now = loop.time()
                     if line.startswith("data:"):
@@ -209,10 +216,11 @@ class AgentHarnessClient:
                         data_buf = ""
                     if now - last_recv > idle_window or now - start > hard_timeout:
                         break
-        except (httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
-            logger.debug("probe_current_sequence: %s (max_seq=%d)", exc, max_seq)
-        except httpx.HTTPError as exc:
-            logger.warning("probe_current_sequence failed: %s", exc)
+            except (httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+                # Mid-stream interruption after a successful connect — return
+                # what we've already observed. This is the "bus went idle"
+                # path; connect-time errors raised above never reach here.
+                logger.debug("probe_current_sequence mid-stream: %s (max_seq=%d)", exc, max_seq)
         return max_seq
 
     async def stream_events(

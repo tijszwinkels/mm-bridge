@@ -314,6 +314,85 @@ async def test_probe_current_sequence_returns_zero_on_empty_stream():
     assert seq == 0
 
 
+async def test_probe_current_sequence_propagates_connect_failure():
+    """Connect-time HTTP failure must NOT be silently turned into 0 — the
+    bootstrap + reconnect reset paths both interpret a successful probe of 0
+    as 'harness was restarted, replay from 0'. Returning 0 on a transient
+    network blip would cause spurious replays."""
+    async def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated connect failure")
+
+    client = _client(handler)
+    with pytest.raises(httpx.HTTPError):
+        await client.probe_current_sequence(idle_window=0.05, hard_timeout=0.5)
+
+
+async def test_probe_current_sequence_propagates_5xx_status():
+    """5xx response on the events stream must propagate so callers can
+    distinguish 'harness sequence is 0' from 'harness errored on probe'."""
+    async def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"internal error")
+
+    client = _client(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.probe_current_sequence(idle_window=0.05, hard_timeout=0.5)
+
+
+async def test_stream_events_skips_reset_when_probe_raises(monkeypatch):
+    """If the post-disconnect probe raises (transient network, harness 5xx),
+    we cannot confidently say the harness was reset. Skip the cursor reset
+    and the on_reset callback rather than blast-replaying from 0."""
+    requests: list[tuple[str, str | None]] = []
+    events_seen: list[int] = []
+    reset_called = 0
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        requests.append((str(req.url), req.url.params.get("after")))
+        attempt = len(requests)
+        if attempt == 1:
+            return httpx.Response(
+                200,
+                content=(
+                    f"event: message\ndata: {json.dumps({'sequence': 8001, 'event': 'message'})}\n\n"
+                ).encode(),
+            )
+        if attempt == 2:
+            raise httpx.ReadError("simulated harness disconnect")
+        return httpx.Response(
+            200,
+            content=(
+                f"event: message\ndata: {json.dumps({'sequence': 8002, 'event': 'message'})}\n\n"
+            ).encode(),
+        )
+
+    client = _client(handler)
+
+    async def fake_probe(**_kwargs):
+        raise httpx.ConnectError("probe failed")
+
+    monkeypatch.setattr(client, "probe_current_sequence", fake_probe)
+    monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+
+    async def on_event(_name: str, data: dict) -> None:
+        events_seen.append(data.get("sequence"))
+        if len(events_seen) >= 2:
+            raise asyncio.CancelledError
+
+    async def on_reset() -> None:
+        nonlocal reset_called
+        reset_called += 1
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.stream_events(
+            on_event, after_sequence=8000, on_reset=on_reset,
+        )
+
+    assert events_seen == [8001, 8002]
+    assert reset_called == 0, "on_reset must not fire when probe could not confirm a reset"
+    # Reconnect must resume from latest observed seq, not from 0.
+    assert requests[2][1] == "8001", f"expected after=8001 on reconnect, got {requests[2][1]!r}"
+
+
 async def test_stream_events_preserves_cursor_across_reconnects():
     """Reconnect after a mid-stream error must continue from the latest seq
     observed — NOT from the original ``after_sequence``. Regression for the
