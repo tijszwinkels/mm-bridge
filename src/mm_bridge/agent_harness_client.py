@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 
 _BACKEND_WIRE: dict[str, str] = {"claude": "claude-code"}
 
+# Idle read timeout on the SSE stream. The harness emits an SSE keepalive
+# comment (`:ka`) every ~15s; missing several in a row almost certainly
+# means the connection is dead or the harness is stuck. The reconnect
+# path that fires on `httpx.ReadTimeout` also runs the sequence-reset
+# probe, so this doubles as the recovery trigger for the "stale future
+# cursor" case where the bus filters every event into silence.
+SSE_READ_TIMEOUT_SECONDS = 45.0
+
 
 def _wire_backend(name: str) -> str:
     return _BACKEND_WIRE.get(name.lower(), name)
@@ -310,11 +318,18 @@ class AgentHarnessClient:
         params = (
             {"after": str(cursor[0])} if cursor[0] is not None else None
         )
-        # ``timeout=None`` on the read disables httpx's idle-byte timeout —
-        # SSE streams are intentionally long-lived and may go quiet for
-        # minutes between events. The agent-harness ``ping`` event is
-        # infrequent and shouldn't be relied on for liveness.
-        stream_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+        # Finite read timeout pairs with the harness's `:ka` keepalive
+        # comment (emitted every ~15s). A healthy idle stream still
+        # produces bytes well within ``SSE_READ_TIMEOUT_SECONDS``; only
+        # a truly silent stream (dead connection, stuck server, or our
+        # cursor "in the future" after a harness restart) trips this
+        # and triggers the reconnect + reset-probe path.
+        stream_timeout = httpx.Timeout(
+            connect=10.0,
+            read=SSE_READ_TIMEOUT_SECONDS,
+            write=10.0,
+            pool=10.0,
+        )
         async with self._http.stream(
             "GET", "/v1/events", params=params, timeout=stream_timeout,
         ) as resp:
