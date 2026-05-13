@@ -52,6 +52,9 @@ async def test_create_session_request_shape_aliases_backend_and_derives_project_
         cwd="/tmp/project",
     )
 
+    # bypass_permissions defaults to True — MM has no UI to surface or
+    # accept Claude Code permission prompts, so every bridge-spawned
+    # session must run with --dangerously-skip-permissions or it stalls.
     assert seen == {
         "method": "POST",
         "path": "/v1/sessions",
@@ -59,6 +62,7 @@ async def test_create_session_request_shape_aliases_backend_and_derives_project_
             "backend": "claude-code",
             "model": "opus",
             "project": {"path": "/tmp/project", "name": "project"},
+            "bypass_permissions": True,
         },
     }
     assert session["id"] == "claude_abc"
@@ -83,7 +87,27 @@ async def test_create_session_drops_none_model_and_includes_title_when_present()
         "backend": "codex",
         "project": {"path": "/tmp/project", "name": "project"},
         "title": "My session",
+        "bypass_permissions": True,
     }
+
+
+async def test_create_session_allows_caller_to_disable_bypass_permissions():
+    """Callers with out-of-band permission UX can opt out of the default
+    bypass_permissions=True."""
+    seen: dict[str, object] = {}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(201, json={"id": "claude_abc"})
+
+    client = _client(handler)
+    await client.create_session(
+        backend="claude",
+        model="opus",
+        cwd="/tmp/project",
+        bypass_permissions=False,
+    )
+    assert seen["body"]["bypass_permissions"] is False
 
 
 async def test_create_run_posts_message_only_and_tracks_accepted_response():

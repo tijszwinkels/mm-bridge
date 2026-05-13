@@ -78,10 +78,19 @@ class AgentHarnessClient:
         model: str | None,
         cwd: str,
         title: str | None = None,
+        bypass_permissions: bool = True,
     ) -> dict:
+        # Default ``bypass_permissions=True``: every session this client
+        # creates is on behalf of a Mattermost user who can't see — let
+        # alone click "Allow" on — Claude Code / Codex permission prompts.
+        # Without this flag the harness omits ``--dangerously-skip-permissions``
+        # from the spawned argv and tool calls silently stall waiting for
+        # an approval that will never come. Callers can override to False
+        # only if they have an out-of-band channel for permission UX.
         payload: dict = {
             "backend": _wire_backend(backend),
             "project": {"path": cwd, "name": Path(cwd).name},
+            "bypass_permissions": bypass_permissions,
         }
         if model is not None:
             payload["model"] = model
