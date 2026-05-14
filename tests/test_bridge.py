@@ -3237,11 +3237,11 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
 
         welcomes = self._welcomes()
         self.assertEqual(len(welcomes), 1, "exactly one join welcome on /invite")
-        # Body checkpoints — the elevator pitch, the Purpose hint, and at
-        # least one example.
+        # Body checkpoints — the elevator pitch (with the configured bot
+        # username), the Purpose hint, and at least one example.
         body = welcomes[0].message
-        self.assertIn("Hi, I'm Claude", body)
-        self.assertIn("Channel Purpose", body)
+        self.assertIn("@claude", body)  # bot_username from the fake
+        self.assertIn("Purpose", body)
         self.assertIn("`claude`", body)  # backend list
         # The session-start welcome still fires too.
         self.assertTrue(
@@ -3277,8 +3277,9 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
         self.assertEqual(len(self._welcomes()), 2)
 
     async def test_welcome_reflects_configured_default_models(self):
-        """The backend list should show whatever ``Config.default_models``
-        is set to — not a hard-coded list."""
+        """The backend list comes from ``Config.default_models`` — only
+        configured backends appear, so unimplemented entries from
+        ``KNOWN_BACKENDS`` (pi, opencode) never get advertised."""
         self.config.default_models = {"claude": "sonnet"}  # only one entry
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
@@ -3286,13 +3287,15 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
 
         body = self._welcomes()[0].message
         self.assertIn("`claude` (default `sonnet`)", body)
-        # codex listed but with no default since we removed it.
-        self.assertIn("`codex`", body)
-        self.assertNotIn("`codex` (default `", body)
+        # codex/pi/opencode all absent from the backend list — only
+        # configured ones appear.
+        self.assertNotIn("`codex`", body)
+        self.assertNotIn("`pi`", body)
+        self.assertNotIn("`opencode`", body)
 
     async def test_welcome_names_channel_effective_config_when_purpose_set(self):
         """When the Purpose already pins a backend/model, the welcome
-        prepends a 'this channel: …' line so users see what they got."""
+        appends a 'this channel: …' summary so users see what they got."""
         self.bridge.mm.channels["c1"] = {
             "id": "c1", "purpose": "claude, sonnet, mention-only",
         }
@@ -3300,8 +3303,9 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
         body = self._welcomes()[0].message
-        self.assertIn("This channel: backend `claude`", body)
-        self.assertIn("model `sonnet`", body)
+        self.assertIn("This channel:", body)
+        self.assertIn("`claude`", body)
+        self.assertIn("`sonnet`", body)
         self.assertIn("mention-only", body)
 
     async def test_welcome_carries_filter_marker_prop(self):
