@@ -576,11 +576,20 @@ class SpawnCommandTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _simulate_daemon_creates_sidecar(
-        self, sess_id: str = "new-sess", chan_id: str = "new-chan",
+        self,
+        sess_id: str = "new-sess",
+        chan_id: str = "new-chan",
+        expected_model: str | None = "opus",
     ):
-        """Return an async stub that mimics harness → daemon → sidecar appearance."""
+        """Return an async stub that mimics harness → daemon → sidecar appearance.
+
+        ``expected_model`` is the per-backend default that the spawn CLI is
+        expected to compute via ``Config.default_model_for(backend)``.
+        Defaults to ``opus`` since the test fixture's ``default_backend``
+        is claude.
+        """
         async def _stub(harness_url, message, cwd, backend, model):
-            self.assertEqual(model, self.cfg.default_model)
+            self.assertEqual(model, expected_model)
             sidecar.write(self.sdir, sess_id, chan_id)
             return {"status": "started"}
         return _stub
@@ -691,6 +700,34 @@ class SpawnCommandTests(unittest.TestCase):
         ])
         self.assertEqual(rc, 0)
         self.assertEqual(self.fake_mm.invited, [("new-chan", "u-alice")])
+
+    def test_spawn_codex_backend_uses_codex_default_model(self) -> None:
+        """``mm-bridge spawn --backend codex`` must not inherit claude's
+        default model. The single ``default_model = "opus"`` scalar that
+        used to live on Config caused ``codex exec --model opus`` to exit
+        1 immediately — the whole point of the per-backend table.
+        """
+        captured: dict = {}
+
+        async def _stub(harness_url, message, cwd, backend, model):
+            captured["backend"] = backend
+            captured["model"] = model
+            sidecar.write(self.sdir, "new-sess", "new-chan")
+            return {"status": "started"}
+
+        with patch("sys.argv", [
+            "mm-bridge", "spawn", "hi", "--backend", "codex",
+        ]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+
+        self.assertEqual(captured["backend"], "codex")
+        self.assertEqual(captured["model"], "gpt-5.5")
 
     def test_spawn_without_session_env_exits_2(self) -> None:
         with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \

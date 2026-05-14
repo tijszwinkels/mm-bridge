@@ -874,7 +874,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 args.prompt,
                 cwd,
                 backend,
-                cfg.default_model,
+                # Per-backend default so ``--backend codex`` doesn't inherit
+                # claude's ``opus`` — that combination exits 1 immediately.
+                cfg.default_model_for(backend),
             ),
         )
     except Exception as exc:
