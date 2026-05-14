@@ -45,7 +45,16 @@ class Config:
 
     # Session defaults
     default_backend: str = "claude"
-    default_model: str | None = "opus"
+    # Per-backend default model. ``opus`` is the right default for Claude
+    # Code; codex needs ``gpt-5.5`` (a backend-agnostic ``opus`` here caused
+    # codex sessions to die immediately — ``codex exec --model opus`` exits
+    # 1). Backends not in this dict get no model hint — the harness picks
+    # its own backend default. Keys match ``KNOWN_BACKENDS`` in
+    # ``mm_bridge.purpose``.
+    default_models: dict[str, str] = field(default_factory=lambda: {
+        "claude": "opus",
+        "codex": "gpt-5.5",
+    })
     default_cwd: str = str(Path.home())
     default_autorespond: bool = False
 
@@ -144,6 +153,18 @@ class Config:
         cfg.allowed_attachment_roots = [_expand(p) for p in cfg.allowed_attachment_roots]
         return cfg
 
+    def default_model_for(self, backend: str | None) -> str | None:
+        """Return the configured default model for ``backend``, or ``None``.
+
+        ``None`` means "let the harness pick" — we deliberately do not
+        guess a model for an unconfigured backend, since a wrong guess is
+        what crashed codex sessions when this used to be a single
+        backend-agnostic scalar.
+        """
+        if not backend:
+            return None
+        return self.default_models.get(backend.lower())
+
     # ----- internals -----
 
     def _apply_mm_url(self, raw: str) -> None:
@@ -168,7 +189,6 @@ class Config:
     def _apply_toml(self, data: dict) -> None:
         for key in (
             "default_backend",
-            "default_model",
             "default_cwd",
             "default_autorespond",
             "show_tool_use",
@@ -208,6 +228,23 @@ class Config:
         if "url" in ah:
             self.agent_harness_url = ah["url"]
 
+        # New per-backend table — wins over the legacy scalar.
+        dm_table = data.get("default_models")
+        if isinstance(dm_table, dict):
+            self.default_models = {
+                str(k).lower(): str(v) for k, v in dm_table.items() if v
+            }
+        # Legacy scalar — applied to claude only. Warn so operators migrate.
+        legacy_model = data.get("default_model")
+        if legacy_model:
+            logger.warning(
+                "TOML key `default_model` is deprecated — applying %r to claude. "
+                "Use a `[default_models]` table (e.g. `claude = \"opus\"`, "
+                "`codex = \"gpt-5.5\"`) instead.",
+                legacy_model,
+            )
+            self.default_models["claude"] = str(legacy_model)
+
     def _apply_env(self) -> None:
         env = os.environ
         if "MM_URL" in env:
@@ -228,8 +265,32 @@ class Config:
             self.default_cwd = env["MM_BRIDGE_DEFAULT_CWD"]
         if "MM_BRIDGE_DEFAULT_BACKEND" in env:
             self.default_backend = env["MM_BRIDGE_DEFAULT_BACKEND"]
+        # Per-backend env vars: ``MM_BRIDGE_DEFAULT_MODEL_<BACKEND>``.
+        # Empty string removes the default for that backend (so the harness
+        # picks). Anything else overrides the built-in.
+        for key, value in env.items():
+            if not key.startswith("MM_BRIDGE_DEFAULT_MODEL_"):
+                continue
+            backend = key[len("MM_BRIDGE_DEFAULT_MODEL_"):].lower()
+            if not backend:
+                continue
+            if value:
+                self.default_models[backend] = value
+            else:
+                self.default_models.pop(backend, None)
+        # Legacy scalar — applied to claude only.
         if "MM_BRIDGE_DEFAULT_MODEL" in env:
-            self.default_model = env["MM_BRIDGE_DEFAULT_MODEL"] or None
+            legacy = env["MM_BRIDGE_DEFAULT_MODEL"]
+            logger.warning(
+                "MM_BRIDGE_DEFAULT_MODEL is deprecated — applying %r to claude. "
+                "Use MM_BRIDGE_DEFAULT_MODEL_CLAUDE / MM_BRIDGE_DEFAULT_MODEL_CODEX "
+                "etc. for per-backend defaults.",
+                legacy,
+            )
+            if legacy:
+                self.default_models["claude"] = legacy
+            else:
+                self.default_models.pop("claude", None)
         if "MM_BRIDGE_DEFAULT_AUTORESPOND" in env:
             self.default_autorespond = env["MM_BRIDGE_DEFAULT_AUTORESPOND"].lower() in (
                 "1", "true", "yes", "on",

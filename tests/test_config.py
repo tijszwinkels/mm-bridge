@@ -89,19 +89,13 @@ class AgentHarnessConfigTests(unittest.TestCase):
             "AH_URL": "http://harness:8877",
             "MM_BRIDGE_DEFAULT_CWD": "/work",
             "MM_BRIDGE_DEFAULT_BACKEND": "codex",
-            "MM_BRIDGE_DEFAULT_MODEL": "gpt-5.4",
             "MM_BRIDGE_DEFAULT_AUTORESPOND": "yes",
         })
 
         self.assertEqual(cfg.agent_harness_url, "http://harness:8877")
         self.assertEqual(cfg.default_cwd, "/work")
         self.assertEqual(cfg.default_backend, "codex")
-        self.assertEqual(cfg.default_model, "gpt-5.4")
         self.assertTrue(cfg.default_autorespond)
-
-    def test_empty_default_model_env_unsets_model(self) -> None:
-        cfg = self._apply({"MM_BRIDGE_DEFAULT_MODEL": ""})
-        self.assertIsNone(cfg.default_model)
 
     def test_old_vd_env_and_toml_are_ignored(self) -> None:
         cfg = self._apply({
@@ -116,8 +110,86 @@ class AgentHarnessConfigTests(unittest.TestCase):
         self.assertEqual(cfg.agent_harness_url, "http://localhost:8877")
         self.assertNotEqual(cfg.default_cwd, "/old")
         self.assertEqual(cfg.default_backend, "claude")
-        self.assertEqual(cfg.default_model, "opus")
+        self.assertEqual(cfg.default_model_for("claude"), "opus")
         self.assertFalse(cfg.default_autorespond)
+
+
+class DefaultModelsTests(unittest.TestCase):
+    """Per-backend default model resolution.
+
+    A single ``default_model`` scalar previously caused codex sessions to
+    crash on startup (``codex exec --model opus`` exits 1). The bridge now
+    keeps a per-backend table so each backend gets the right default.
+    """
+
+    def _apply(self, env: dict[str, str]) -> Config:
+        cfg = Config()
+        with patch.dict("os.environ", env, clear=True):
+            cfg._apply_env()
+        return cfg
+
+    def test_built_in_defaults(self) -> None:
+        cfg = Config()
+        self.assertEqual(cfg.default_model_for("claude"), "opus")
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
+
+    def test_default_model_for_unknown_backend_is_none(self) -> None:
+        cfg = Config()
+        # No baked-in default for pi/opencode — harness picks.
+        self.assertIsNone(cfg.default_model_for("pi"))
+        self.assertIsNone(cfg.default_model_for("opencode"))
+        self.assertIsNone(cfg.default_model_for(None))
+        self.assertIsNone(cfg.default_model_for(""))
+
+    def test_default_model_for_is_case_insensitive(self) -> None:
+        cfg = Config()
+        self.assertEqual(cfg.default_model_for("Claude"), "opus")
+        self.assertEqual(cfg.default_model_for("CODEX"), "gpt-5.5")
+
+    def test_per_backend_env_overrides_built_in(self) -> None:
+        cfg = self._apply({
+            "MM_BRIDGE_DEFAULT_MODEL_CLAUDE": "sonnet",
+            "MM_BRIDGE_DEFAULT_MODEL_CODEX": "gpt-5.4-mini",
+        })
+        self.assertEqual(cfg.default_model_for("claude"), "sonnet")
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.4-mini")
+
+    def test_per_backend_env_can_add_new_backend(self) -> None:
+        cfg = self._apply({"MM_BRIDGE_DEFAULT_MODEL_PI": "some-pi-model"})
+        self.assertEqual(cfg.default_model_for("pi"), "some-pi-model")
+
+    def test_per_backend_env_empty_string_unsets(self) -> None:
+        """Empty value lets the harness pick rather than baking in a guess."""
+        cfg = self._apply({"MM_BRIDGE_DEFAULT_MODEL_CLAUDE": ""})
+        self.assertIsNone(cfg.default_model_for("claude"))
+        # Other backends untouched.
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
+
+    def test_legacy_env_applies_to_claude_only(self) -> None:
+        cfg = self._apply({"MM_BRIDGE_DEFAULT_MODEL": "haiku"})
+        self.assertEqual(cfg.default_model_for("claude"), "haiku")
+        # Codex default must not be overwritten by the legacy scalar.
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
+
+    def test_legacy_env_empty_string_unsets_claude_only(self) -> None:
+        cfg = self._apply({"MM_BRIDGE_DEFAULT_MODEL": ""})
+        self.assertIsNone(cfg.default_model_for("claude"))
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
+
+    def test_toml_table_replaces_built_in(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({
+            "default_models": {"claude": "sonnet", "codex": "gpt-5.4"},
+        })
+        self.assertEqual(cfg.default_model_for("claude"), "sonnet")
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.4")
+
+    def test_toml_legacy_scalar_applies_to_claude_only(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"default_model": "haiku"})
+        self.assertEqual(cfg.default_model_for("claude"), "haiku")
+        # Codex default must not be overwritten by the legacy scalar.
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
 
 
 class PublicUrlTests(unittest.TestCase):
