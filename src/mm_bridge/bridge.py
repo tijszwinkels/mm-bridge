@@ -376,6 +376,15 @@ class Bridge:
         )
 
     async def stop(self) -> None:
+        # Flush any throttled SSE cursor before tearing down — a clean
+        # stop inside the 2s persist window would otherwise discard the
+        # latest seq, and the next boot would replay up to ~2s of events.
+        if self._pending_seq is not None:
+            try:
+                self.mapping.set_event_seq(self._pending_seq)
+            except Exception:
+                logger.exception("Failed to flush pending event seq on shutdown")
+            self._pending_seq = None
         if self.typing:
             await self.typing.shutdown()
         await self.harness.close()

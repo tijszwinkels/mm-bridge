@@ -685,6 +685,25 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         await self.bridge._persist_event_seq(101)
         self.assertEqual(self.bridge.mapping.last_event_seq, 101)
 
+    async def test_stop_flushes_pending_event_seq(self):
+        """The 2s persist throttle means a clean shutdown inside the window
+        leaves the latest seq pending only in memory; restart would replay
+        up to ~2s of events. ``stop()`` must flush ``_pending_seq`` so the
+        next boot resumes exactly where we left off."""
+        self.bridge._pending_seq = 9999
+        await self.bridge.stop()
+        self.assertEqual(self.bridge.mapping.last_event_seq, 9999)
+        # Idempotent: no pending value after flush.
+        self.assertIsNone(self.bridge._pending_seq)
+
+    async def test_stop_is_safe_with_no_pending_seq(self):
+        """Stop without any pending seq must not regress the persisted
+        cursor (or crash)."""
+        self.bridge.mapping.set_event_seq(123)
+        self.bridge._pending_seq = None
+        await self.bridge.stop()
+        self.assertEqual(self.bridge.mapping.last_event_seq, 123)
+
     async def test_bootstrap_tracks_mapped_external_sessions(self):
         """Bootstrap populates ``_external_sessions`` with mapped session
         ids whose harness ``origin`` is ``external``. Such sessions can't
