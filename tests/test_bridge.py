@@ -3238,10 +3238,10 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
         welcomes = self._welcomes()
         self.assertEqual(len(welcomes), 1, "exactly one join welcome on /invite")
         # Body checkpoints — the elevator pitch (with the configured bot
-        # username), the Purpose hint, and at least one example.
+        # username), the first-message reconfig hint, and the backend list.
         body = welcomes[0].message
         self.assertIn("@claude", body)  # bot_username from the fake
-        self.assertIn("Purpose", body)
+        self.assertIn("first message", body)
         self.assertIn("`claude`", body)  # backend list
         # The session-start welcome still fires too.
         self.assertTrue(

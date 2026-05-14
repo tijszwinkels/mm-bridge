@@ -76,9 +76,9 @@ CHANNEL_JOIN_WELCOME_TEMPLATE = (
     "Tag `@{bot}` to talk to me (or set `autorespond` so every message "
     "reaches me).{context}\n"
     "\n"
-    "Pick a backend/model by editing the channel **Purpose** — "
-    "comma-separated tokens, first token is the backend "
-    "(e.g. `{example}`). Backends: {backends}.\n"
+    "Pick a backend/model by sending it as your **first message** "
+    "(comma-separated, first token is the backend — "
+    "e.g. `{example}, autorespond`). Backends: {backends}.\n"
     "\n"
     "Commands: `@{bot} catch up {catch_up_n}` · `@{bot} stop` · "
     "`@{bot} leave`. "
@@ -1462,11 +1462,13 @@ class Bridge:
         )
         # Pick the operator's primary backend for the inline example so
         # we never advertise an unconfigured one (e.g. don't say `codex`
-        # if only `claude` has a default model).
+        # if only `claude` has a default model). The template appends
+        # `, autorespond` after this, so keep ``example`` to the backend
+        # name only.
         primary = self.config.default_backend
         if primary not in self.config.default_models and configured:
             primary = configured[0][0]
-        example = f"{primary}, autorespond, cwd=~/projects/foo"
+        example = primary
 
         context = ""
         if cfg is not None:
