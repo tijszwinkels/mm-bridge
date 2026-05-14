@@ -2312,6 +2312,12 @@ class Bridge:
         except Exception:
             logger.exception("Failed to create channel for session %s", session_id[:12])
             return None
+        # External-origin sessions have no harness stdin — a later MM post
+        # must trigger ``_replace_external_session`` instead of a silent
+        # ``create_run``. Tag the mapping so ``_on_mm_posted`` takes the
+        # replacement path on the next inbound message.
+        if data.get("origin") == "external":
+            self._external_sessions.add(session_id)
         await self._update_resume_purpose(
             channel_id, session_id,
             data.get("backend"), project.get("path"),
