@@ -3217,5 +3217,117 @@ class HarnessEventEnvelopeTests(_BridgeTestCase):
         self.assertNotIn("unknown", tool_posts[0].message)
 
 
+class ChannelJoinWelcomeTests(_BridgeTestCase):
+    """Channel-join welcome — a manual-style post fired when the bot is
+    added to a channel (auto-join OR /invite), independent of session
+    creation. The session-start welcome (``_format_welcome``) continues
+    to fire from inside ``_start_invited_session`` and is unrelated.
+    """
+
+    def _welcomes(self) -> list:
+        return [
+            p for p in self.bridge.mm.posted
+            if p.props and p.props.get("from_bridge") == "welcome"
+        ]
+
+    async def test_invite_posts_join_welcome_before_session_start(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        welcomes = self._welcomes()
+        self.assertEqual(len(welcomes), 1, "exactly one join welcome on /invite")
+        # Body checkpoints — the elevator pitch, the Purpose hint, and at
+        # least one example.
+        body = welcomes[0].message
+        self.assertIn("Hi, I'm Claude", body)
+        self.assertIn("Channel Purpose", body)
+        self.assertIn("`claude`", body)  # backend list
+        # The session-start welcome still fires too.
+        self.assertTrue(
+            any("Session started" in p.message for p in self.bridge.mm.posted),
+            "session-start welcome must continue to fire",
+        )
+
+    async def test_auto_join_posts_join_welcome_with_silent_presence(self):
+        self.config.auto_join_public_channels = True
+        # Mark `c-new` as self-joined the same way the reconciler would,
+        # then drive the user_added event.
+        self.bridge._self_joined_channels.add("c-new")
+        self.bridge.mm.channels["c-new"] = {"id": "c-new", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c-new", self.bridge.mm.bot_user_id)
+
+        # Silent presence — no session yet.
+        self.assertEqual(self.bridge.vd.created, [])
+        # But the welcome did go out.
+        self.assertEqual(len(self._welcomes()), 1)
+
+    async def test_re_invite_posts_a_second_welcome(self):
+        """Idempotent at the call site, deliberate at the post site: a
+        re-add IS the user reaching out again, so welcome them again."""
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        # Unlink so the second add isn't short-circuited by the
+        # already-mapped guard.
+        self.bridge.mapping.unlink(Anchor("c1"))
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertEqual(len(self._welcomes()), 2)
+
+    async def test_welcome_reflects_configured_default_models(self):
+        """The backend list should show whatever ``Config.default_models``
+        is set to — not a hard-coded list."""
+        self.config.default_models = {"claude": "sonnet"}  # only one entry
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        body = self._welcomes()[0].message
+        self.assertIn("`claude` (default `sonnet`)", body)
+        # codex listed but with no default since we removed it.
+        self.assertIn("`codex`", body)
+        self.assertNotIn("`codex` (default `", body)
+
+    async def test_welcome_names_channel_effective_config_when_purpose_set(self):
+        """When the Purpose already pins a backend/model, the welcome
+        prepends a 'this channel: …' line so users see what they got."""
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, sonnet, mention-only",
+        }
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        body = self._welcomes()[0].message
+        self.assertIn("This channel: backend `claude`", body)
+        self.assertIn("model `sonnet`", body)
+        self.assertIn("mention-only", body)
+
+    async def test_welcome_carries_filter_marker_prop(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        welcomes = self._welcomes()
+        self.assertEqual(welcomes[0].props, {"from_bridge": "welcome"})
+
+    async def test_get_channel_failure_still_posts_welcome(self):
+        """If we can't fetch the channel (network blip, racing delete),
+        we still post a generic welcome rather than nothing."""
+        def boom(_channel_id):
+            raise RuntimeError("simulated mm.get_channel failure")
+        self.config.auto_join_public_channels = True
+        self.bridge._self_joined_channels.add("c-new")
+        self.bridge.mm.get_channel = boom  # type: ignore[assignment]
+
+        await self.bridge._on_mm_user_added("c-new", self.bridge.mm.bot_user_id)
+
+        welcomes = self._welcomes()
+        self.assertEqual(len(welcomes), 1)
+        # No "This channel: …" line because we couldn't derive cfg.
+        self.assertNotIn("This channel:", welcomes[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()
