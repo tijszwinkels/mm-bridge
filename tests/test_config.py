@@ -176,6 +176,16 @@ class DefaultModelsTests(unittest.TestCase):
         self.assertIsNone(cfg.default_model_for("claude"))
         self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
 
+    def test_per_backend_env_wins_over_legacy_for_claude(self) -> None:
+        """Operator opt-in to per-backend env defaults must not be silently
+        undone by an older legacy ``MM_BRIDGE_DEFAULT_MODEL`` scalar still
+        sitting in the same environment."""
+        cfg = self._apply({
+            "MM_BRIDGE_DEFAULT_MODEL_CLAUDE": "sonnet",
+            "MM_BRIDGE_DEFAULT_MODEL": "opus",
+        })
+        self.assertEqual(cfg.default_model_for("claude"), "sonnet")
+
     def test_toml_table_replaces_built_in(self) -> None:
         cfg = Config()
         cfg._apply_toml({
@@ -190,6 +200,16 @@ class DefaultModelsTests(unittest.TestCase):
         self.assertEqual(cfg.default_model_for("claude"), "haiku")
         # Codex default must not be overwritten by the legacy scalar.
         self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
+
+    def test_toml_per_backend_table_wins_over_legacy_scalar(self) -> None:
+        """If a TOML file carries both the deprecated scalar and the new
+        per-backend table, the table (operator's explicit migration) wins."""
+        cfg = Config()
+        cfg._apply_toml({
+            "default_model": "opus",
+            "default_models": {"claude": "sonnet"},
+        })
+        self.assertEqual(cfg.default_model_for("claude"), "sonnet")
 
 
 class PublicUrlTests(unittest.TestCase):

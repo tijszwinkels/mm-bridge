@@ -228,13 +228,10 @@ class Config:
         if "url" in ah:
             self.agent_harness_url = ah["url"]
 
-        # New per-backend table — wins over the legacy scalar.
-        dm_table = data.get("default_models")
-        if isinstance(dm_table, dict):
-            self.default_models = {
-                str(k).lower(): str(v) for k, v in dm_table.items() if v
-            }
-        # Legacy scalar — applied to claude only. Warn so operators migrate.
+        # Legacy scalar first — applied to claude only. Warn so operators
+        # migrate. The per-backend table below is applied last so an
+        # operator who has both keys gets the explicit table (their
+        # migration in progress), not the deprecated scalar.
         legacy_model = data.get("default_model")
         if legacy_model:
             logger.warning(
@@ -244,6 +241,12 @@ class Config:
                 legacy_model,
             )
             self.default_models["claude"] = str(legacy_model)
+        # New per-backend table — wins over the legacy scalar.
+        dm_table = data.get("default_models")
+        if isinstance(dm_table, dict):
+            self.default_models = {
+                str(k).lower(): str(v) for k, v in dm_table.items() if v
+            }
 
     def _apply_env(self) -> None:
         env = os.environ
@@ -265,6 +268,22 @@ class Config:
             self.default_cwd = env["MM_BRIDGE_DEFAULT_CWD"]
         if "MM_BRIDGE_DEFAULT_BACKEND" in env:
             self.default_backend = env["MM_BRIDGE_DEFAULT_BACKEND"]
+        # Legacy scalar first — applied to claude only. Per-backend env
+        # vars below override, so an operator who's set both gets the
+        # per-backend opt-in (their migration in progress) rather than the
+        # deprecated scalar silently winning.
+        if "MM_BRIDGE_DEFAULT_MODEL" in env:
+            legacy = env["MM_BRIDGE_DEFAULT_MODEL"]
+            logger.warning(
+                "MM_BRIDGE_DEFAULT_MODEL is deprecated — applying %r to claude. "
+                "Use MM_BRIDGE_DEFAULT_MODEL_CLAUDE / MM_BRIDGE_DEFAULT_MODEL_CODEX "
+                "etc. for per-backend defaults.",
+                legacy,
+            )
+            if legacy:
+                self.default_models["claude"] = legacy
+            else:
+                self.default_models.pop("claude", None)
         # Per-backend env vars: ``MM_BRIDGE_DEFAULT_MODEL_<BACKEND>``.
         # Empty string removes the default for that backend (so the harness
         # picks). Anything else overrides the built-in.
@@ -278,19 +297,6 @@ class Config:
                 self.default_models[backend] = value
             else:
                 self.default_models.pop(backend, None)
-        # Legacy scalar — applied to claude only.
-        if "MM_BRIDGE_DEFAULT_MODEL" in env:
-            legacy = env["MM_BRIDGE_DEFAULT_MODEL"]
-            logger.warning(
-                "MM_BRIDGE_DEFAULT_MODEL is deprecated — applying %r to claude. "
-                "Use MM_BRIDGE_DEFAULT_MODEL_CLAUDE / MM_BRIDGE_DEFAULT_MODEL_CODEX "
-                "etc. for per-backend defaults.",
-                legacy,
-            )
-            if legacy:
-                self.default_models["claude"] = legacy
-            else:
-                self.default_models.pop("claude", None)
         if "MM_BRIDGE_DEFAULT_AUTORESPOND" in env:
             self.default_autorespond = env["MM_BRIDGE_DEFAULT_AUTORESPOND"].lower() in (
                 "1", "true", "yes", "on",
