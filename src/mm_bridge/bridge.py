@@ -1103,12 +1103,27 @@ class Bridge:
         new: purpose.PurposeConfig,
     ) -> purpose.PurposeConfig:
         """Layer `new` on top of `current`. Any field explicitly set by the
-        new parse wins; omitted fields fall back to current."""
+        new parse wins; omitted fields fall back to current.
+
+        Exception: when the backend changes, the carried model is dropped.
+        Models are backend-specific (``sonnet`` is claude-only, ``gpt-5.5``
+        is codex-only) — letting one leak across a backend swap crashes
+        session-create on the new backend. With ``model=None`` the
+        per-backend default in ``Config.default_models`` kicks in at
+        ``_resolve_session_model`` time.
+        """
         if current is None:
             return new
+        backend_changed = new.backend != current.backend
+        if new.model is not None:
+            model = new.model
+        elif backend_changed:
+            model = None
+        else:
+            model = current.model
         return purpose.PurposeConfig(
             backend=new.backend,
-            model=new.model if new.model is not None else current.model,
+            model=model,
             mention_only=new.mention_only,
             cwd=new.cwd if new.cwd is not None else current.cwd,
             warnings=[],

@@ -1827,6 +1827,48 @@ class FirstMessageConfigTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent[1][1], "claude, sonnet")
 
 
+class MergeConfigsTests(_BridgeTestCase):
+    """`_merge_configs` layers a freshly-parsed Purpose on top of the
+    channel's current Purpose. Per-backend default models live in
+    ``Config.default_models`` and are resolved at session-create time —
+    so when the operator changes ONLY the backend, the previous model
+    token MUST be dropped (otherwise a claude model would leak into a
+    codex session and crash `codex exec --model <claude-name>`)."""
+
+    def test_backend_change_drops_carried_model(self):
+        from mm_bridge.purpose import PurposeConfig
+        current = PurposeConfig(backend="claude", model="sonnet", mention_only=False)
+        new = PurposeConfig(backend="codex", model=None, mention_only=False)
+
+        merged = self.bridge._merge_configs(current, new)
+
+        self.assertEqual(merged.backend, "codex")
+        # Critical: the carried "sonnet" must NOT survive a backend swap.
+        self.assertIsNone(merged.model)
+
+    def test_same_backend_carries_model(self):
+        """When the backend doesn't change and the new parse omits the
+        model, the current model is preserved (per-channel stickiness)."""
+        from mm_bridge.purpose import PurposeConfig
+        current = PurposeConfig(backend="claude", model="sonnet", mention_only=False)
+        new = PurposeConfig(backend="claude", model=None, mention_only=False)
+
+        merged = self.bridge._merge_configs(current, new)
+
+        self.assertEqual(merged.backend, "claude")
+        self.assertEqual(merged.model, "sonnet")
+
+    def test_same_backend_explicit_model_overrides(self):
+        """An explicitly-set new model still wins on same-backend updates."""
+        from mm_bridge.purpose import PurposeConfig
+        current = PurposeConfig(backend="claude", model="sonnet", mention_only=False)
+        new = PurposeConfig(backend="claude", model="opus", mention_only=False)
+
+        merged = self.bridge._merge_configs(current, new)
+
+        self.assertEqual(merged.model, "opus")
+
+
 class RuntimeToggleTests(_BridgeTestCase):
     """After the first message, only the literal words `autorespond` and
     `noautorespond` toggle the mention_only flag — nothing else."""
