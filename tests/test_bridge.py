@@ -290,7 +290,6 @@ class _BridgeTestCase(unittest.IsolatedAsyncioTestCase):
             state_file=f"{self.tmp.name}/state.json",
             sidecar_dir=f"{self.tmp.name}/sidecar",
             default_backend="claude",
-            default_model="opus",
         )
         self.bridge = Bridge(self.config)
         self.bridge.mm = FakeMattermostClient()

@@ -749,8 +749,11 @@ class Bridge:
         cfg = purpose.parse(
             purpose_text,
             self.config.default_backend,
-            self.config.default_model,
-            lambda b: models_by_backend.get(b, []),
+            # The per-backend default is applied at session-create time
+            # (``_resolve_session_model``) so codex channels don't inherit
+            # claude's ``opus`` here.
+            default_model=None,
+            available_models_for=lambda b: models_by_backend.get(b, []),
             default_autorespond=self.config.default_autorespond,
         )
 
@@ -799,8 +802,8 @@ class Bridge:
         parsed = purpose.parse(
             candidate,
             self.config.default_backend,
-            self.config.default_model,
-            lambda b: models_by_backend.get(b, []),
+            default_model=None,
+            available_models_for=lambda b: models_by_backend.get(b, []),
             default_autorespond=self.config.default_autorespond,
             # Same reasoning as ``_try_apply_first_message_config``: the
             # harness returns an empty model catalog, and without strict
@@ -930,8 +933,8 @@ class Bridge:
         cfg = purpose.parse(
             purpose_text,
             self.config.default_backend,
-            self.config.default_model,
-            lambda b: models_by_backend.get(b, []),
+            default_model=None,
+            available_models_for=lambda b: models_by_backend.get(b, []),
             default_autorespond=self.config.default_autorespond,
         )
 
@@ -958,7 +961,7 @@ class Bridge:
         try:
             session = await self.harness.create_session(
                 backend=cfg.backend,
-                model=cfg.model,
+                model=self._resolve_session_model(cfg),
                 cwd=effective_cwd,
                 title=display_name,
             )
@@ -1055,8 +1058,8 @@ class Bridge:
         parsed = purpose.parse(
             candidate,
             self.config.default_backend,
-            self.config.default_model,
-            lambda b: models_by_backend.get(b, []),
+            default_model=None,
+            available_models_for=lambda b: models_by_backend.get(b, []),
             default_autorespond=self.config.default_autorespond,
             # The harness's claude-code backend currently returns an empty
             # model catalog. Without strict mode any first word in a chat
@@ -1194,7 +1197,7 @@ class Bridge:
         try:
             session = await self.harness.create_session(
                 backend=cfg.backend,
-                model=cfg.model,
+                model=self._resolve_session_model(cfg),
                 cwd=effective_cwd,
             )
             session_id = session.get("id")
@@ -1223,6 +1226,21 @@ class Bridge:
         if session_id and queued and queued.queued_messages:
             await self._flush_queued(channel_id, session_id, queued.queued_messages)
 
+    def _resolve_session_model(self, cfg: purpose.PurposeConfig) -> str | None:
+        """Pick the model to send to ``harness.create_session``.
+
+        Operators who set a model token in Channel Purpose win. Otherwise we
+        fall back to the per-backend default (``opus`` for claude,
+        ``gpt-5.5`` for codex; ``None`` for backends without an explicit
+        default — letting the harness pick). This is the only place that
+        knows the backend → model mapping; the parser layer always sees
+        ``default_model=None`` so a claude default never leaks into a codex
+        session.
+        """
+        if cfg.model:
+            return cfg.model
+        return self.config.default_model_for(cfg.backend)
+
     async def _models_for_known_backends(self) -> dict[str, list[str]]:
         models: dict[str, list[str]] = {}
         for b in purpose.KNOWN_BACKENDS:
@@ -1241,7 +1259,9 @@ class Bridge:
         turn_on_autorespond = message.strip().lower() in purpose.AUTORESPOND_ALIASES
         current = self.purpose_by_channel.get(channel_id) or purpose.PurposeConfig(
             backend=self.config.default_backend,
-            model=self.config.default_model,
+            # Don't bake a model token into the persisted Purpose — the
+            # per-backend default applies at session-create time.
+            model=None,
             mention_only=not self.config.default_autorespond,
         )
         updated = purpose.PurposeConfig(
@@ -2222,7 +2242,7 @@ class Bridge:
         parsed = purpose.parse(
             raw,
             default_backend=self.config.default_backend,
-            default_model=self.config.default_model,
+            default_model=None,
             available_models_for=lambda _b: [],
             default_autorespond=self.config.default_autorespond,
         )
