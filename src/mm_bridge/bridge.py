@@ -1155,17 +1155,18 @@ class Bridge:
             "Adopting channel %s — replacing external session %s with a fresh harness session",
             channel_id, old_session_id[:12],
         )
+        # Unlink the old mapping up front so concurrent MM posts hit the
+        # ``warming_up_sessions`` queue rather than re-entering this path
+        # against the same dead session. Per-session bookkeeping for the
+        # old id is safe to drop now: even if replacement fails, the old
+        # session is by definition unreachable from MM.
         self.mapping.unlink(Anchor(channel_id))
-        self.mapping.mark_adopted(old_session_id)
         self._end_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
         self._forget_channel_silent_drops(channel_id)
         self._session_triggerer.pop(old_session_id, None)
         self._recent_harness_sends.pop(old_session_id, None)
         self._external_sessions.discard(old_session_id)
-        # Stop the bootstrap recovery path from re-spawning a fresh
-        # channel for this session id on the next restart.
-        self._known_sessions.add(old_session_id)
         if self.typing:
             await self.typing.stop(old_session_id)
         try:
@@ -1183,6 +1184,31 @@ class Bridge:
             post_welcome=False,
             exclude_post_id=post.get("id"),
         )
+
+        # Commit the "old session is gone" state ONLY if the replacement
+        # actually produced a fresh mapping. ``_start_invited_session``
+        # logs+returns on harness/MM failure without raising and without
+        # linking; if we'd ``mark_adopted``'d the old id eagerly, the
+        # next bootstrap would skip auto-recovery for the still-mapped
+        # channel and the operator would have to surgically edit
+        # ``state.json`` to recover.
+        new_session_id = self.mapping.get_session(Anchor(channel_id))
+        if new_session_id and new_session_id != old_session_id:
+            self.mapping.mark_adopted(old_session_id)
+            # Stop the bootstrap recovery path from re-spawning a fresh
+            # channel for this session id on the next restart.
+            self._known_sessions.add(old_session_id)
+        else:
+            # Replacement failed — restore the old mapping so the next MM
+            # post re-enters this path and retries. ``_start_invited_session``
+            # has already posted a user-visible warning on its own error path.
+            self.mapping.link(Anchor(channel_id), old_session_id)
+            self._external_sessions.add(old_session_id)
+            logger.warning(
+                "Replacement of external session %s failed — restored old "
+                "mapping for retry on next MM post",
+                old_session_id[:12],
+            )
 
     async def _restart_session_with_config(
         self,
