@@ -709,6 +709,63 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         self.assertIn("claude_legacy", self.bridge._external_sessions)
         self.assertNotIn("ses_managed", self.bridge._external_sessions)
 
+    async def test_bootstrap_tracks_external_sessions_after_channel_create(self):
+        """External sessions that arrive at bootstrap WITHOUT an anchor go
+        through ``_create_channel_for_session`` (which links them) — but
+        they're still external, so the resulting channel cannot deliver
+        injected user turns. The bridge must tag the new mapping in
+        ``_external_sessions`` so the first MM reply routes through
+        ``_replace_external_session`` instead of silently calling
+        ``create_run`` on a session the harness has no stdin for."""
+        self.bridge.harness.sessions_meta = [{
+            "id": "claude_orphan",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "origin": "external",
+        }]
+        # No anchor yet — bootstrap must create the channel.
+        self.assertIsNone(self.bridge.mapping.get_anchor("claude_orphan"))
+
+        await self.bridge._bootstrap_known_sessions()
+
+        anchor = self.bridge.mapping.get_anchor("claude_orphan")
+        self.assertIsNotNone(anchor, "bootstrap must create a channel")
+        self.assertIn(
+            "claude_orphan", self.bridge._external_sessions,
+            "newly-mapped external sessions must be tagged so the first "
+            "MM post triggers replacement rather than a vanishing run",
+        )
+
+        # End-to-end: a user post to the new channel must route via
+        # _replace_external_session, NOT a silent create_run on the
+        # un-reachable external session id.
+        self.bridge.harness.next_session_id = "ses_fresh"
+        self.bridge.mm.channels[anchor.channel_id] = {
+            "id": anchor.channel_id, "purpose": "",
+        }
+
+        await self.bridge._on_mm_posted({
+            "id": "p1",
+            "channel_id": anchor.channel_id,
+            "user_id": "u1",
+            "message": "first post after restart",
+            "type": "",
+        })
+
+        # Old external mapping is replaced.
+        self.assertNotIn("claude_orphan", self.bridge._external_sessions)
+        # Message landed on the fresh harness session, not the dead one.
+        forwarded = list(self.bridge.harness.sent)
+        self.assertTrue(
+            any(sid == "ses_fresh" and "first post after restart" in body
+                for sid, body in forwarded),
+            f"expected user message on the fresh session; got {forwarded}",
+        )
+        self.assertFalse(
+            any(sid == "claude_orphan" for sid, _ in forwarded),
+            "no create_run to the dead external session",
+        )
+
     async def test_bootstrap_skips_adopted_external_sessions(self):
         """Once an external session has been replaced via adoption, the
         harness still lists it (sessions aren't deleted) — bootstrap
