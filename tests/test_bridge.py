@@ -22,6 +22,7 @@ class _Post:
     message: str
     file_ids: list[str] | None = None
     root_id: str | None = None
+    props: dict | None = None
 
 
 @dataclass
@@ -79,9 +80,9 @@ class FakeMattermostClient:
         self.own_post_ids.add(pid)
         return {"id": pid}
 
-    def post(self, channel_id: str, message: str, *, file_ids=None, root_id=None):
+    def post(self, channel_id: str, message: str, *, file_ids=None, root_id=None, props=None):
         pid = self._next_post_id()
-        self.posted.append(_Post(channel_id, message, file_ids, root_id))
+        self.posted.append(_Post(channel_id, message, file_ids, root_id, props))
         self.own_post_ids.add(pid)
         return {"id": pid}
 
