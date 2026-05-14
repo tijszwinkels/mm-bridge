@@ -789,6 +789,62 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         )
         self.assertIn("claude_already_adopted", self.bridge._known_sessions)
 
+    async def test_external_session_replacement_failure_preserves_state(self):
+        """If ``_start_invited_session`` fails to bring up a fresh session
+        (harness error, MM outage, etc.), ``_replace_external_session``
+        must NOT permanently break the channel:
+
+        - The channel mapping must remain pointing at the old external
+          session so the next MM post can retry the replacement.
+        - ``_external_sessions`` must still contain the old session so
+          the retry path takes ``_replace_external_session`` rather than
+          a silent ``create_run`` against the un-reachable session.
+        - ``mark_adopted`` must NOT have been called, otherwise the next
+          bootstrap would refuse to spawn a recovery channel for it.
+
+        Without this, a transient harness failure during replacement
+        would require manual state.json surgery to recover.
+        """
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mapping.link(Anchor("c1"), "claude_dead")
+        self.bridge._external_sessions.add("claude_dead")
+        self.bridge._known_sessions.add("claude_dead")
+
+        # Inject a harness failure on the next create_session call.
+        original_create = self.bridge.harness.create_session
+
+        async def boom(**_kwargs):
+            raise RuntimeError("simulated harness create_session failure")
+
+        self.bridge.harness.create_session = boom  # type: ignore[assignment]
+        try:
+            await self.bridge._on_mm_posted({
+                "id": "p1",
+                "channel_id": "c1",
+                "user_id": "u1",
+                "message": "still here?",
+                "type": "",
+            })
+        finally:
+            self.bridge.harness.create_session = original_create  # type: ignore[assignment]
+
+        # Old mapping preserved for retry.
+        self.assertEqual(
+            self.bridge.mapping.get_session(Anchor("c1")), "claude_dead",
+            "channel must remain mapped to the dead session so retry routes "
+            "through _replace_external_session again",
+        )
+        self.assertIn(
+            "claude_dead", self.bridge._external_sessions,
+            "external-session tag must survive a failed replacement",
+        )
+        self.assertNotIn(
+            "claude_dead", self.bridge.mapping.adopted_session_ids,
+            "mark_adopted must NOT fire when no fresh session was linked",
+        )
+        # Channel was not left in a warming-up state.
+        self.assertNotIn("c1", self.bridge.warming_up_sessions)
+
     async def test_external_session_replaced_on_user_post(self):
         """When a channel is mapped to a pre-cutover external session,
         an inbound MM message must NOT silently fail via ``create_run``.
