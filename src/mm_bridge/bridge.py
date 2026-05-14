@@ -62,6 +62,54 @@ MAX_CHANNEL_CREATE_ATTEMPTS = 3
 # parent run and would just spam channels.
 SUPPRESSED_SESSION_PREFIXES = ("claude_agent-",)
 
+# Channel-join welcome — posted when the bot is added to a channel (auto-join
+# OR manual /invite). Edit the template to change what new users see first.
+# The `{backends}` and `{context}` placeholders are filled in by
+# ``Bridge._format_channel_join_welcome`` so the message reflects the actually
+# configured per-backend default models and (when known) the channel's
+# effective config.
+CHANNEL_JOIN_WELCOME_PROP = "from_bridge"
+CHANNEL_JOIN_WELCOME_PROP_VALUE = "welcome"
+
+CHANNEL_JOIN_WELCOME_TEMPLATE = (
+    ":wave: **Hi, I'm Claude — an AI coding assistant.** "
+    "Send a message and I'll reply. In autorespond channels every post "
+    "reaches me; in mention-only channels (the default), tag `@claude`.\n"
+    "{context}"
+    "\n**Pick a backend / model — via Channel Purpose**\n\n"
+    "Edit the channel's *Purpose* (☰ → View Info → Edit) with "
+    "comma-separated tokens. The first token chooses the backend; the "
+    "rest are options.\n\n"
+    "- Backends: {backends}\n"
+    "- Examples:\n"
+    "  - `claude` — Claude Code with the default model\n"
+    "  - `claude, sonnet` — pick a specific model\n"
+    "  - `codex, gpt-5.5, cwd=~/projects/foo` — backend + model + working dir\n"
+    "  - `claude, autorespond` — reply to every message (no @mention needed)\n"
+    "  - `claude, mention-only` — only reply when tagged (default)\n\n"
+    "**First-message reconfig**\n\n"
+    "The very first message in a fresh session can be pure Purpose tokens "
+    "(e.g. `claude, sonnet, autorespond`) and I'll restart with those "
+    "settings instead of treating it as a normal turn. After that, the "
+    "literal words `autorespond` / `noautorespond` toggle auto-reply at "
+    "runtime.\n\n"
+    "**Useful in-channel commands**\n\n"
+    "- `@claude catch up {catch_up_n}` — read the last {catch_up_n} channel "
+    "messages as context before replying\n"
+    "- `@claude stop` — interrupt the current run\n"
+    "- `@claude leave` — end my session in this channel\n\n"
+    "**Useful CLI** (from your shell, anywhere)\n\n"
+    "- `mm-bridge invite <user>` — pull me into the current channel from "
+    "inside a Claude/codex session\n"
+    "- `mm-bridge spawn \"<prompt>\"` — fork a new sibling channel with a "
+    "fresh session\n"
+    "- `mm-bridge channels` / `mm-bridge read` / `mm-bridge post` — list, "
+    "peek, post into any channel\n\n"
+    "**Read more**: "
+    "[README](https://github.com/tijszwinkels/mm-bridge#readme) · "
+    "`mm-bridge --help`"
+)
+
 _CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _LEAVE_CMD_RE = re.compile(r"^@claude\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
 _STOP_CMD_RE = re.compile(r"^(?P<mention>@claude\s+)?stop\s*$", re.IGNORECASE)
@@ -719,16 +767,25 @@ class Bridge:
     async def _on_mm_user_added(self, channel_id: str, user_id: str) -> None:
         if user_id != self.mm.bot_user_id:
             return
-        # Self-initiated auto-join — silent presence, no session.
+        # Self-initiated auto-join — silent presence, no session yet, but
+        # post a one-time manual so anyone browsing the channel sees how
+        # to reach the bot.
         if channel_id in self._self_joined_channels:
             self._self_joined_channels.discard(channel_id)
             logger.info("Auto-joined %s — silent presence (no session until engagement)", channel_id)
+            await self._post_channel_join_welcome(channel_id)
             return
         if self.mapping.get_session(Anchor(channel_id)):
             logger.info("Bot already mapped for channel %s — skipping", channel_id)
             return
         if channel_id in self.warming_up_sessions:
             return
+        # Manual /invite path: welcome the channel before spinning up the
+        # session. The session-start welcome (``_format_welcome``) fires
+        # afterwards via ``_start_invited_session``; the two serve different
+        # moments — this one is "what this bot is", that one is "what just
+        # got configured".
+        await self._post_channel_join_welcome(channel_id)
         await self._start_invited_session(channel_id)
 
     async def _maybe_start_engagement_session(
@@ -1408,6 +1465,82 @@ class Bridge:
             "`autorespond` or `noautorespond` toggles auto-reply._"
         )
         return f"{head}\n\n{hint}\n\n{config_hint}"
+
+    def _format_channel_join_welcome(
+        self, cfg: purpose.PurposeConfig | None,
+    ) -> str:
+        """Render the channel-join welcome / mini-manual.
+
+        Reflects the actually configured per-backend default models from
+        ``Config.default_models``. When ``cfg`` is given (purpose parsed),
+        prepends a one-line "this channel" summary so users see what they
+        landed on, not just the menu of choices.
+        """
+        backends_parts: list[str] = []
+        for b in sorted(purpose.KNOWN_BACKENDS):
+            m = self.config.default_models.get(b)
+            if m:
+                backends_parts.append(f"`{b}` (default `{m}`)")
+            else:
+                backends_parts.append(f"`{b}`")
+        backends = ", ".join(backends_parts)
+
+        context = ""
+        if cfg is not None:
+            model = (
+                cfg.model
+                or self.config.default_models.get(cfg.backend)
+                or "default"
+            )
+            flag = "mention-only" if cfg.mention_only else "autorespond"
+            context = (
+                f"\n_This channel: backend `{cfg.backend}`, "
+                f"model `{model}`, {flag}._\n"
+            )
+
+        return CHANNEL_JOIN_WELCOME_TEMPLATE.format(
+            backends=backends,
+            catch_up_n=self.config.catch_up_default_n,
+            context=context,
+        )
+
+    async def _post_channel_join_welcome(self, channel_id: str) -> None:
+        """Post the channel-join welcome. Best-effort, never raises.
+
+        Idempotent at the call site: a re-add posts the welcome again on
+        purpose — a re-invite implies fresh contact. The post is tagged
+        with ``props.{CHANNEL_JOIN_WELCOME_PROP}=welcome`` so operators
+        can filter / dedupe historically.
+        """
+        cfg: purpose.PurposeConfig | None = None
+        try:
+            ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
+            purpose_text = (ch.get("purpose") or "")
+            models_by_backend = await self._models_for_known_backends()
+            cfg = purpose.parse(
+                purpose_text,
+                self.config.default_backend,
+                default_model=None,
+                available_models_for=lambda b: models_by_backend.get(b, []),
+                default_autorespond=self.config.default_autorespond,
+            )
+        except Exception:
+            logger.debug(
+                "failed to derive cfg for join welcome on %s",
+                channel_id, exc_info=True,
+            )
+
+        body = self._format_channel_join_welcome(cfg)
+        try:
+            self.mm.post(
+                channel_id, body,
+                props={CHANNEL_JOIN_WELCOME_PROP: CHANNEL_JOIN_WELCOME_PROP_VALUE},
+            )
+        except Exception:
+            logger.warning(
+                "failed to post channel-join welcome on %s",
+                channel_id, exc_info=True,
+            )
 
     # ─────────────────────── Forwarding user posts ─────────────────────────
 
