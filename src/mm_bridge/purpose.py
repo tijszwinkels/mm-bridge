@@ -22,6 +22,7 @@ KNOWN_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "pi", "opencode"}
 _BACKEND_ALIASES: dict[str, str] = {
     "claude-code": "claude",
     "claudecode": "claude",
+    "claude code": "claude",
 }
 
 # A standalone line equal to this string splits the Channel Purpose into a

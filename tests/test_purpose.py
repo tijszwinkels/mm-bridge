@@ -528,6 +528,20 @@ def test_parse_accepts_claude_code_backend_alias():
     assert cfg.warnings == []
 
 
+def test_parse_accepts_claude_code_with_space_alias():
+    """The natural display string ``Claude Code`` (with space, as the
+    product is branded) must canonicalise to the ``claude`` backend.
+    Without this, the empty-catalog ``accept_unknown`` fallback silently
+    treats ``claude code`` as a *model* under whatever the default
+    backend is, with no warning — wrong backend, no operator signal."""
+    cfg = parse(
+        "Claude Code, sonnet", "codex", None, lambda _b: [],
+    )
+    assert cfg.backend == "claude"
+    assert cfg.model == "sonnet"
+    assert cfg.warnings == []
+
+
 # ---------------------------------------------------------------------------
 # strict_catalog: chat-message parsing must not silently consume plain words
 # ---------------------------------------------------------------------------
