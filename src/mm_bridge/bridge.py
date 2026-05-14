@@ -72,42 +72,17 @@ CHANNEL_JOIN_WELCOME_PROP = "from_bridge"
 CHANNEL_JOIN_WELCOME_PROP_VALUE = "welcome"
 
 CHANNEL_JOIN_WELCOME_TEMPLATE = (
-    ":wave: **Hi, I'm Claude — an AI coding assistant.** "
-    "Send a message and I'll reply. In autorespond channels every post "
-    "reaches me; in mention-only channels (the default), tag `@claude`.\n"
-    "{context}"
-    "\n**Pick a backend / model — via Channel Purpose**\n\n"
-    "Edit the channel's *Purpose* (☰ → View Info → Edit) with "
-    "comma-separated tokens. The first token chooses the backend; the "
-    "rest are options.\n\n"
-    "- Backends: {backends}\n"
-    "- Examples:\n"
-    "  - `claude` — Claude Code with the default model\n"
-    "  - `claude, sonnet` — pick a specific model\n"
-    "  - `codex, gpt-5.5, cwd=~/projects/foo` — backend + model + working dir\n"
-    "  - `claude, autorespond` — reply to every message (no @mention needed)\n"
-    "  - `claude, mention-only` — only reply when tagged (default)\n\n"
-    "**First-message reconfig**\n\n"
-    "The very first message in a fresh session can be pure Purpose tokens "
-    "(e.g. `claude, sonnet, autorespond`) and I'll restart with those "
-    "settings instead of treating it as a normal turn. After that, the "
-    "literal words `autorespond` / `noautorespond` toggle auto-reply at "
-    "runtime.\n\n"
-    "**Useful in-channel commands**\n\n"
-    "- `@claude catch up {catch_up_n}` — read the last {catch_up_n} channel "
-    "messages as context before replying\n"
-    "- `@claude stop` — interrupt the current run\n"
-    "- `@claude leave` — end my session in this channel\n\n"
-    "**Useful CLI** (from your shell, anywhere)\n\n"
-    "- `mm-bridge invite <user>` — pull me into the current channel from "
-    "inside a Claude/codex session\n"
-    "- `mm-bridge spawn \"<prompt>\"` — fork a new sibling channel with a "
-    "fresh session\n"
-    "- `mm-bridge channels` / `mm-bridge read` / `mm-bridge post` — list, "
-    "peek, post into any channel\n\n"
-    "**Read more**: "
-    "[README](https://github.com/tijszwinkels/mm-bridge#readme) · "
-    "`mm-bridge --help`"
+    ":wave: Hi, I'm **@{bot}** — an AI coding assistant. "
+    "Tag `@{bot}` to talk to me (or set `autorespond` so every message "
+    "reaches me).{context}\n"
+    "\n"
+    "Pick a backend/model by editing the channel **Purpose** — "
+    "comma-separated tokens, first token is the backend "
+    "(e.g. `{example}`). Backends: {backends}.\n"
+    "\n"
+    "Commands: `@{bot} catch up {catch_up_n}` · `@{bot} stop` · "
+    "`@{bot} leave`. "
+    "More: [README](https://github.com/tijszwinkels/mm-bridge#readme)."
 )
 
 _CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
@@ -1469,21 +1444,29 @@ class Bridge:
     def _format_channel_join_welcome(
         self, cfg: purpose.PurposeConfig | None,
     ) -> str:
-        """Render the channel-join welcome / mini-manual.
+        """Render the channel-join welcome.
 
-        Reflects the actually configured per-backend default models from
-        ``Config.default_models``. When ``cfg`` is given (purpose parsed),
-        prepends a one-line "this channel" summary so users see what they
-        landed on, not just the menu of choices.
+        Backend list comes from ``Config.default_models`` keys — only
+        backends the operator has actually configured a default model for
+        appear in the welcome (so unimplemented entries in
+        ``KNOWN_BACKENDS`` don't get advertised to users). When ``cfg``
+        is given (Purpose was parsed), append a one-line "this channel"
+        summary so users see what they landed on.
         """
-        backends_parts: list[str] = []
-        for b in sorted(purpose.KNOWN_BACKENDS):
-            m = self.config.default_models.get(b)
-            if m:
-                backends_parts.append(f"`{b}` (default `{m}`)")
-            else:
-                backends_parts.append(f"`{b}`")
-        backends = ", ".join(backends_parts)
+        configured = [
+            (b, m) for b, m in sorted(self.config.default_models.items()) if m
+        ]
+        backends = (
+            ", ".join(f"`{b}` (default `{m}`)" for b, m in configured)
+            if configured else "none configured"
+        )
+        # Pick the operator's primary backend for the inline example so
+        # we never advertise an unconfigured one (e.g. don't say `codex`
+        # if only `claude` has a default model).
+        primary = self.config.default_backend
+        if primary not in self.config.default_models and configured:
+            primary = configured[0][0]
+        example = f"{primary}, autorespond, cwd=~/projects/foo"
 
         context = ""
         if cfg is not None:
@@ -1494,12 +1477,13 @@ class Bridge:
             )
             flag = "mention-only" if cfg.mention_only else "autorespond"
             context = (
-                f"\n_This channel: backend `{cfg.backend}`, "
-                f"model `{model}`, {flag}._\n"
+                f" _This channel: `{cfg.backend}` / `{model}` / {flag}._"
             )
 
         return CHANNEL_JOIN_WELCOME_TEMPLATE.format(
+            bot=self.mm.bot_username,
             backends=backends,
+            example=example,
             catch_up_n=self.config.catch_up_default_n,
             context=context,
         )
