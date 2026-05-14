@@ -194,6 +194,15 @@ class DefaultModelsTests(unittest.TestCase):
         self.assertEqual(cfg.default_model_for("claude"), "sonnet")
         self.assertEqual(cfg.default_model_for("codex"), "gpt-5.4")
 
+    def test_toml_partial_table_preserves_built_in_for_other_backends(self) -> None:
+        """Operator who writes ``[default_models] claude = "sonnet"`` must
+        not silently lose the codex=gpt-5.5 built-in — that's what kept
+        codex sessions alive in the first place."""
+        cfg = Config()
+        cfg._apply_toml({"default_models": {"claude": "sonnet"}})
+        self.assertEqual(cfg.default_model_for("claude"), "sonnet")
+        self.assertEqual(cfg.default_model_for("codex"), "gpt-5.5")
+
     def test_toml_legacy_scalar_applies_to_claude_only(self) -> None:
         cfg = Config()
         cfg._apply_toml({"default_model": "haiku"})

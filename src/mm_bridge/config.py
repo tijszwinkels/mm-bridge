@@ -241,12 +241,15 @@ class Config:
                 legacy_model,
             )
             self.default_models["claude"] = str(legacy_model)
-        # New per-backend table — wins over the legacy scalar.
+        # New per-backend table — wins over the legacy scalar. Merge into
+        # the built-ins rather than replacing so a partial table
+        # (e.g. only ``claude = "sonnet"``) keeps codex=gpt-5.5 alive —
+        # without that, codex sessions silently revert to no-model-hint.
         dm_table = data.get("default_models")
         if isinstance(dm_table, dict):
-            self.default_models = {
+            self.default_models.update({
                 str(k).lower(): str(v) for k, v in dm_table.items() if v
-            }
+            })
 
     def _apply_env(self) -> None:
         env = os.environ
