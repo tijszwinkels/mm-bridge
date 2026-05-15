@@ -588,7 +588,7 @@ class SpawnCommandTests(unittest.TestCase):
         Defaults to ``opus`` since the test fixture's ``default_backend``
         is claude.
         """
-        async def _stub(harness_url, message, cwd, backend, model):
+        async def _stub(harness_url, message, cwd, backend, model, title=None):
             self.assertEqual(model, expected_model)
             sidecar.write(self.sdir, sess_id, chan_id)
             return {"status": "started"}
@@ -709,9 +709,10 @@ class SpawnCommandTests(unittest.TestCase):
         """
         captured: dict = {}
 
-        async def _stub(harness_url, message, cwd, backend, model):
+        async def _stub(harness_url, message, cwd, backend, model, title=None):
             captured["backend"] = backend
             captured["model"] = model
+            captured["title"] = title
             sidecar.write(self.sdir, "new-sess", "new-chan")
             return {"status": "started"}
 
@@ -728,6 +729,33 @@ class SpawnCommandTests(unittest.TestCase):
 
         self.assertEqual(captured["backend"], "codex")
         self.assertEqual(captured["model"], "gpt-5.5")
+        # No --title flag passed: title arrives as None.
+        self.assertIsNone(captured["title"])
+
+    def test_spawn_passes_title_to_harness_create_session(self) -> None:
+        """``mm-bridge spawn --title "Foo"`` must surface "Foo" as the
+        harness Session.title so consumers (e.g. command-bridge lane
+        headers) display the human-readable name instead of falling
+        back to project name or session id."""
+        captured: dict = {}
+
+        async def _stub(harness_url, message, cwd, backend, model, title=None):
+            captured["title"] = title
+            sidecar.write(self.sdir, "new-sess", "new-chan")
+            return {"status": "started"}
+
+        with patch("sys.argv", [
+            "mm-bridge", "spawn", "hi", "--title", "Yellow Pages",
+        ]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+
+        self.assertEqual(captured["title"], "Yellow Pages")
 
     def test_spawn_without_session_env_exits_2(self) -> None:
         with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \

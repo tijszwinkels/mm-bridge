@@ -280,6 +280,7 @@ async def _harness_create_session(
     cwd: str,
     backend: str | None,
     model: str | None,
+    title: str | None = None,
 ) -> dict:
     """Async wrapper: one-shot harness client for the spawn CLI path."""
     harness = AgentHarnessClient(harness_url)
@@ -288,6 +289,7 @@ async def _harness_create_session(
             backend=backend or "claude",
             model=model,
             cwd=cwd,
+            title=title,
         )
         session_id = session.get("id")
         if not session_id:
@@ -877,6 +879,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 # Per-backend default so ``--backend codex`` doesn't inherit
                 # claude's ``opus`` — that combination exits 1 immediately.
                 cfg.default_model_for(backend),
+                title=args.title,
             ),
         )
     except Exception as exc:
