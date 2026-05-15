@@ -80,6 +80,60 @@ class SidecarTests(unittest.TestCase):
         (self.dir / "sess-1").write_text("chan-1\n\n")
         self.assertEqual(sidecar.read(self.dir, "sess-1"), ("chan-1", None))
 
+    def test_read_dashed_uuid_falls_back_to_canonical_ses_form(self) -> None:
+        """Claude sub-sessions see ``CLAUDE_SESSION_ID`` as a dashed UUID
+        (8-4-4-4-12), but the harness writes sidecars under the canonical
+        ``ses_<32hex>`` form. The read path must try the canonical form
+        when the literal lookup misses, otherwise ``mm-bridge channel``
+        and friends report 'no sidecar' from inside a spawned sub-session.
+        """
+        sidecar.write(self.dir, "ses_e6cc19e7a0b94e7896a6ea5b51e7fa24", "chan-X")
+        self.assertEqual(
+            sidecar.read(self.dir, "e6cc19e7-a0b9-4e78-96a6-ea5b51e7fa24"),
+            ("chan-X", None),
+        )
+
+    def test_read_raw_32_hex_falls_back_to_canonical_ses_form(self) -> None:
+        """Same canonicalization should also catch a 32-hex id without
+        dashes — defensive against callers that already stripped them."""
+        sidecar.write(self.dir, "ses_e6cc19e7a0b94e7896a6ea5b51e7fa24", "chan-Y")
+        self.assertEqual(
+            sidecar.read(self.dir, "e6cc19e7a0b94e7896a6ea5b51e7fa24"),
+            ("chan-Y", None),
+        )
+
+    def test_read_canonical_ses_form_does_not_double_prefix(self) -> None:
+        """An input already in ``ses_<hex>`` form must not be rewritten
+        to ``ses_ses_<hex>``."""
+        sidecar.write(self.dir, "ses_e6cc19e7a0b94e7896a6ea5b51e7fa24", "chan-Z")
+        # And there is no second file at the doubly-prefixed name.
+        self.assertEqual(
+            sidecar.read(self.dir, "ses_e6cc19e7a0b94e7896a6ea5b51e7fa24"),
+            ("chan-Z", None),
+        )
+        self.assertFalse(
+            (self.dir / "ses_ses_e6cc19e7a0b94e7896a6ea5b51e7fa24").exists(),
+        )
+
+    def test_read_literal_match_wins_over_canonical_fallback(self) -> None:
+        """A sidecar at the literal lookup path beats the canonical
+        fallback — so codex / MM_BRIDGE_SESSION_ID ids that already
+        match their on-disk filename round-trip unchanged."""
+        sidecar.write(self.dir, "e6cc19e7-a0b9-4e78-96a6-ea5b51e7fa24", "chan-literal")
+        sidecar.write(self.dir, "ses_e6cc19e7a0b94e7896a6ea5b51e7fa24", "chan-canonical")
+        self.assertEqual(
+            sidecar.read(self.dir, "e6cc19e7-a0b9-4e78-96a6-ea5b51e7fa24"),
+            ("chan-literal", None),
+        )
+
+    def test_read_unknown_dashed_uuid_still_returns_none(self) -> None:
+        """A dashed UUID with no sidecar in either form returns None
+        cleanly — no spurious matches from the fallback."""
+        self.dir.mkdir(parents=True)
+        self.assertIsNone(
+            sidecar.read(self.dir, "deadbeef-dead-beef-dead-beefdeadbeef"),
+        )
+
     def test_reconcile_writes_missing_and_removes_stale(self) -> None:
         self.dir.mkdir(parents=True)
         (self.dir / "stale").write_text("old-chan")

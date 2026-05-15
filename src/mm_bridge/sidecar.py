@@ -70,18 +70,22 @@ def read(directory: Path, session_id: str) -> tuple[str, str | None] | None:
     A missing file, empty file, or blank channel_id all yield ``None``.
     A missing or blank second line yields ``root_id = None`` so legacy
     single-line sidecars round-trip to channel-level anchors.
+
+    Claude sub-sessions see ``CLAUDE_SESSION_ID`` as a dashed UUID
+    (8-4-4-4-12) but the harness writes sidecars under the canonical
+    ``ses_<32hex>`` form. When the literal lookup misses we also try
+    that canonical form, so the bridge resolves either spelling. The
+    fallback only fires when the literal file is absent — codex and
+    pre-existing exact-match ids stay unchanged.
     """
     if not session_id:
         return None
-    path = directory / session_id
-    try:
-        text = path.read_text()
-    except FileNotFoundError:
-        return None
-    except OSError:
-        logger.warning(
-            "Failed to read sidecar for session %s", session_id[:8], exc_info=True,
-        )
+    text = _read_text_or_none(directory / session_id, session_id)
+    if text is None and not session_id.startswith("ses_"):
+        canonical = f"ses_{session_id.replace('-', '')}"
+        if canonical != session_id:
+            text = _read_text_or_none(directory / canonical, session_id)
+    if text is None:
         return None
     lines = text.splitlines()
     channel_id = lines[0].strip() if lines else ""
@@ -89,6 +93,23 @@ def read(directory: Path, session_id: str) -> tuple[str, str | None] | None:
         return None
     root_id = lines[1].strip() if len(lines) >= 2 and lines[1].strip() else None
     return channel_id, root_id
+
+
+def _read_text_or_none(path: Path, session_id: str) -> str | None:
+    """Read *path* as UTF-8 text, returning ``None`` on missing/unreadable.
+
+    Logs OSErrors (other than ``FileNotFoundError``) with a truncated
+    session_id, matching the original error semantics.
+    """
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.warning(
+            "Failed to read sidecar for session %s", session_id[:8], exc_info=True,
+        )
+        return None
 
 
 def delete(directory: Path, session_id: str) -> None:
