@@ -3333,5 +3333,124 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
         self.assertNotIn("This channel:", welcomes[0].message)
 
 
+class HarnessWatchdogEventsTests(_BridgeTestCase):
+    """Watchdog events from agent-harness PR #10:
+
+    - ``run.terminated_after_end_turn`` (subprocess didn't exit within
+      grace window after ``end_turn``) — render SILENT.
+    - ``run.timed_out_idle`` (30min without ``message``/``message.delta``/
+      ``tool_use``) — render a VISIBLE warning post in the session anchor.
+
+    Both events are supplemental; a normal terminal event still follows,
+    so this handler must NOT touch typing/run-id state.
+    """
+
+    async def test_terminated_after_end_turn_is_silent(self):
+        """The LLM already finished its turn — no operator-facing post."""
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+        posts_before = list(self.bridge.mm.posted)
+
+        await self.bridge._on_harness_event(
+            "run.terminated_after_end_turn",
+            {
+                "sequence": 12,
+                "event": "run.terminated_after_end_turn",
+                "data": {
+                    "grace_seconds": 20,
+                    "hard_kill": False,
+                    "returncode": -15,
+                    "reason": "subprocess_did_not_exit_after_end_turn",
+                },
+                "session_id": "codex_s1",
+                "run_id": "run-1",
+            },
+        )
+
+        # mm.posted unchanged — purely silent.
+        self.assertEqual(self.bridge.mm.posted, posts_before)
+
+    async def test_timed_out_idle_posts_warning_to_anchor(self):
+        from mm_bridge.bridge import IDLE_TIMEOUT_WARNING
+        self.bridge.mapping.link(Anchor("c1", "root-post"), "codex_s1")
+
+        await self.bridge._on_harness_event(
+            "run.timed_out_idle",
+            {
+                "sequence": 13,
+                "event": "run.timed_out_idle",
+                "data": {
+                    "idle_seconds": 1800,
+                    "last_activity_event": "message.delta",
+                    "last_activity_at": "2026-05-17T12:00:00Z",
+                    "hard_kill": False,
+                    "reason": "no_activity_within_threshold",
+                },
+                "session_id": "codex_s1",
+                "run_id": "run-1",
+            },
+        )
+
+        warnings = [
+            p for p in self.bridge.mm.posted if p.message == IDLE_TIMEOUT_WARNING
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0].channel_id, "c1")
+        self.assertEqual(warnings[0].root_id, "root-post")
+
+    async def test_timed_out_idle_unmapped_session_does_not_post(self):
+        """Without an anchor we have nowhere to put the warning — log and
+        return, do not raise."""
+        # No mapping.link — session is unknown.
+        posts_before = list(self.bridge.mm.posted)
+
+        await self.bridge._on_harness_event(
+            "run.timed_out_idle",
+            {
+                "sequence": 14,
+                "event": "run.timed_out_idle",
+                "data": {
+                    "idle_seconds": 1800,
+                    "last_activity_event": "message.delta",
+                    "last_activity_at": "2026-05-17T12:00:00Z",
+                    "hard_kill": False,
+                    "reason": "no_activity_within_threshold",
+                },
+                "session_id": "unknown_session",
+                "run_id": "run-1",
+            },
+        )
+
+        self.assertEqual(self.bridge.mm.posted, posts_before)
+
+    async def test_timed_out_idle_swallows_mm_post_failure(self):
+        """If MM rejects the warning post, log and move on — don't bubble
+        the exception up through the SSE dispatcher (matches the pattern
+        used by ``_mention_triggerer_on_done``)."""
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated mm.post failure")
+
+        self.bridge.mm.post = boom  # type: ignore[assignment]
+
+        # Must not raise.
+        await self.bridge._on_harness_event(
+            "run.timed_out_idle",
+            {
+                "sequence": 15,
+                "event": "run.timed_out_idle",
+                "data": {
+                    "idle_seconds": 1800,
+                    "last_activity_event": "tool_use",
+                    "last_activity_at": "2026-05-17T12:00:00Z",
+                    "hard_kill": True,
+                    "reason": "no_activity_within_threshold",
+                },
+                "session_id": "codex_s1",
+                "run_id": "run-1",
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
