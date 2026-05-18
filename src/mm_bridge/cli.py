@@ -83,52 +83,76 @@ def _current_session_id(sidecar_dir: Path | str | None = None) -> str:
     """Resolve the current session id, trying multiple sources in order.
 
     Resolver chain:
-      1. ``CLAUDE_SESSION_ID`` env var — set by the Claude Code SessionStart
-         hook (see ``~/.claude/hooks/export-session-id.sh``).
-      2. ``MM_BRIDGE_SESSION_ID`` env var — backend-agnostic contract.
-         Backend launchers can pin this into tool-shell environments so
-         follow-up commands self-identify cleanly.
-      3. Live-codex parent (``/proc`` tie-breaker). When env vars miss,
+      1. ``MM_BRIDGE_SESSION_ID`` env var WITH a matching sidecar — the
+         explicit pin from ``mm-bridge spawn``. When set and resolvable,
+         this wins outright: it's the authoritative "this shell belongs
+         to that bridge session" signal, and it overrides a leaked
+         ``CLAUDE_SESSION_ID`` from the parent shell. The sidecar gate
+         is what makes the override safe — an orphan env value with no
+         sidecar on disk falls through to the next step.
+      2. ``CLAUDE_SESSION_ID`` env var — set by the Claude Code
+         SessionStart hook (see ``~/.claude/hooks/export-session-id.sh``).
+         The legacy claude path: when ``MM_BRIDGE_SESSION_ID`` is unset
+         (or has no sidecar), this is the source of truth. No sidecar
+         gate here for backward compatibility — claude sessions
+         routinely run before the daemon has written a sidecar and the
+         caller surfaces the env value verbatim.
+      3. ``MM_BRIDGE_SESSION_ID`` env var WITHOUT a matching sidecar —
+         backend-agnostic fallback. Returned verbatim when no other
+         source resolves but the env var carries something. Preserves
+         the original "trust the env" behaviour for any consumer that
+         pre-dates the sidecar-gating contract.
+      4. Live-codex parent (``/proc`` tie-breaker). When env vars miss,
          walk the parent-pid chain looking for a live ``codex`` ancestor
          and read the rollout filename from its open fds. This is the
          in-turn case — first-turn tool shells, where the env wasn't
          pinned yet — and it's the case where multiple codex sessions
          share a cwd. Linux-only; macOS / no-``/proc`` falls through.
-      4. Cwd-matched codex rollout files. Mtime-ordered walk of rollouts
+      5. Cwd-matched codex rollout files. Mtime-ordered walk of rollouts
          under ``~/.codex/sessions``; adopts the first candidate whose
-         sidecar reads back. Catches the cases (3) misses: shells that
+         sidecar reads back. Catches the cases (4) misses: shells that
          outlive their codex parent (background tasks, stale shells)
          and macOS hosts where ``/proc`` doesn't exist.
 
-    Why this order: the env-vars are authoritative when present.
-    Step (3) only fires when a codex process is actually in our
-    ancestor chain — that's the strongest "this shell belongs to that
-    session" signal we can get. Step (4)'s mtime ordering is a heuristic
-    that fails when an idle same-cwd session's rollout is newer than
-    the active session's; (3) prevents that miscall.
+    Why this order: an authoritative pin from ``mm-bridge spawn`` (step
+    1) trumps everything — that's how we break the RC1 leak where a
+    parent's ``CLAUDE_SESSION_ID`` would otherwise mis-resolve to the
+    parent's channel inside the child. Steps (2)/(3) preserve the
+    legacy semantics for non-spawn paths. Steps (4)/(5) only fire when
+    the env vars don't resolve at all.
 
     The fallback steps require *sidecar_dir* — callers without a config
     handy get only the env-var paths.
     """
-    sid = os.environ.get("CLAUDE_SESSION_ID", "").strip()
-    if sid:
-        return sid
-    sid = os.environ.get("MM_BRIDGE_SESSION_ID", "").strip()
-    if sid:
-        return sid
+    mm_sid = os.environ.get("MM_BRIDGE_SESSION_ID", "").strip()
+    claude_sid = os.environ.get("CLAUDE_SESSION_ID", "").strip()
+
+    # 1. Explicit pin: MM_BRIDGE_SESSION_ID + sidecar present.
+    if mm_sid and sidecar_dir is not None:
+        if sidecar.read(Path(sidecar_dir), mm_sid) is not None:
+            return mm_sid
+
+    # 2. Legacy claude path: CLAUDE_SESSION_ID surfaced verbatim.
+    if claude_sid:
+        return claude_sid
+
+    # 3. MM_BRIDGE_SESSION_ID without a sidecar (or no sidecar_dir).
+    if mm_sid:
+        return mm_sid
+
     if sidecar_dir is not None:
         sdir = Path(sidecar_dir)
-        # 3. PPid tie-breaker — live codex ancestor wins outright.
+        # 4. PPid tie-breaker — live codex ancestor wins outright.
         active_uuid = find_active_codex_rollout_uuid()
         if active_uuid is not None and sidecar.read(sdir, active_uuid) is not None:
             return active_uuid
-        # 4. Mtime walk — newest cwd-matched rollout with a sidecar.
+        # 5. Mtime walk — newest cwd-matched rollout with a sidecar.
         for candidate in iter_session_ids_by_cwd(os.getcwd()):
             if sidecar.read(sdir, candidate) is not None:
                 return candidate
     raise NotInMattermostChannel(
         "could not determine current session id — checked "
-        "CLAUDE_SESSION_ID, MM_BRIDGE_SESSION_ID, the codex parent's "
+        "MM_BRIDGE_SESSION_ID, CLAUDE_SESSION_ID, the codex parent's "
         "open rollout file, and cwd-matched codex rollout files. This "
         "command only works inside a Claude Code or codex session "
         "linked to a Mattermost channel.",
@@ -416,20 +440,25 @@ def _resolve_post_anchor(
     )
 
 
-def _resolve_self_channel_id(cfg: Config) -> str | None:
-    """Return the channel id of the current session's bridge anchor, if any.
+def _resolve_self_identity(cfg: Config) -> tuple[str, str] | None:
+    """Return ``(session_id, channel_id)`` of the current bridge session.
 
-    Used to stamp ``props.from_bridge_cli_channel`` on CLI-authored
-    posts. The recorded channel is the one whose linked session must
-    NOT see the post as a user turn (own-channel echo). When the CLI
-    is invoked from outside any bridge session, returns ``None`` and
-    the caller omits the marker — there is no echo to suppress.
+    Used to stamp ``props.from_bridge_cli_channel`` AND
+    ``props.from_bridge_cli_session`` on CLI-authored posts. The
+    channel id is the one whose linked session must NOT see the post
+    as a user turn in the cross-post-mirror case (own-channel echo);
+    the session id is recorded for telemetry and for the bridge's
+    incoming-post predicate to distinguish "explicit agentcom from a
+    sibling session" from "own-process self-echo". When the CLI is
+    invoked from outside any bridge session, returns ``None`` and the
+    caller omits the marker entirely — there is no echo to suppress.
     """
     try:
         sid = _current_session_id(cfg.sidecar_dir)
-        return _resolve_anchor_from_session(cfg.sidecar_dir, sid).channel_id
+        channel_id = _resolve_anchor_from_session(cfg.sidecar_dir, sid).channel_id
     except NotInMattermostChannel:
         return None
+    return sid, channel_id
 
 
 def _resolve_effective_root(
@@ -545,16 +574,24 @@ def cmd_post(args: argparse.Namespace) -> int:
     # Marker only matters when the CLI is running inside a bridge
     # session: the daemon's per-process own-post tracker can't suppress
     # the WS echo for posts that the CLI authored, so we tag those
-    # posts with the SENDER's channel id. The dispatcher drops a
-    # tagged post iff it lands in the recorded channel (own-channel
-    # echo) — cross-channel posts pass through. From a non-session
-    # shell there is no echo concern, so emit no marker at all.
-    self_channel_id = _resolve_self_channel_id(cfg)
+    # posts with the SENDER's channel AND session ids. The dispatcher
+    # uses ``from_bridge_cli="post"`` as the "explicit agentcom" signal
+    # and forwards the post regardless of the recorded channel; only
+    # the explicit cross-post mirror (``from_bridge_cli="cross-post-mirror"``)
+    # is suppressed by the recipient. The session id is recorded for
+    # telemetry and so the bridge can distinguish "explicit agentcom
+    # from a sibling session" from "own-process self-echo" when a
+    # misresolved sender mis-stamps the channel field. From a
+    # non-session shell there is no echo concern, so emit no marker at
+    # all.
+    identity = _resolve_self_identity(cfg)
     post_props: dict | None = None
-    if self_channel_id is not None:
+    if identity is not None:
+        self_session_id, self_channel_id = identity
         post_props = {
             "from_bridge_cli": "post",
             "from_bridge_cli_channel": self_channel_id,
+            "from_bridge_cli_session": self_session_id,
         }
     try:
         post = mm.post(
@@ -619,10 +656,12 @@ def _maybe_mirror_cross_channel_post(
             # it exists only for transcript visibility in the sender's
             # session view. Recording the same channel id makes the
             # daemon's predicate fire and drop it, instead of looping
-            # it back as a user turn.
+            # it back as a user turn. The session id rides along for
+            # telemetry symmetry with the explicit-agentcom marker.
             props={
                 "from_bridge_cli": "cross-post-mirror",
                 "from_bridge_cli_channel": self_anchor.channel_id,
+                "from_bridge_cli_session": sid,
             },
         )
     except Exception:
@@ -903,6 +942,26 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 3
+
+    # Compute the env-overlay the spawned child SHOULD inherit. The
+    # contract (see ``spawn.build_spawn_child_env``) is to pin
+    # ``MM_BRIDGE_SESSION_ID`` to the new session id and unset the
+    # parent's ``CLAUDE_SESSION_ID`` — that's how RC1 is closed at the
+    # child end. Today the agent-harness ``create_session`` API does
+    # not accept an env override (``extra="forbid"`` on its request
+    # model), so this is logged at debug for operator visibility and
+    # forms the hook point for when the harness adds env-pinning
+    # support. Until then, the bridge's resolver-order fix
+    # (``MM_BRIDGE_SESSION_ID`` with sidecar beats ``CLAUDE_SESSION_ID``)
+    # provides defence in depth for any backend that DOES inherit the
+    # right ``MM_BRIDGE_SESSION_ID`` via other means.
+    child_env_overlay = spawn_mod.build_spawn_child_env(
+        os.environ, new_session_id=session_id, backend=backend,
+    )
+    logger.debug(
+        "spawn: child env overlay for session %s: %s",
+        session_id, child_env_overlay,
+    )
 
     try:
         new_channel = mm.get_channel(new_channel_id)

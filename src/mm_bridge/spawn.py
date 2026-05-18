@@ -7,8 +7,64 @@ without mocking Mattermost or the agent backend.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 
 MM_DISPLAY_NAME_MAX = 64
+
+
+def build_spawn_child_env(
+    parent_env: Mapping[str, str],
+    new_session_id: str,
+    backend: str,
+) -> dict[str, str]:
+    """Return the env-overlay a spawned sub-session's process tree should
+    inherit, given the parent shell's *parent_env*.
+
+    The overlay achieves two things:
+
+    1. Pins ``MM_BRIDGE_SESSION_ID`` to the *new_session_id* so any
+       ``mm-bridge`` tool-shell call inside the child resolves to the
+       child's own bridge sidecar — not the parent's. This is the
+       explicit, backend-agnostic contract documented in the resolver.
+    2. Strips ``CLAUDE_SESSION_ID`` from the inherited env. Both
+       backends need this: for the **codex** path, the inherited value
+       would poison the resolver (codex has no SessionStart hook to
+       overwrite it). For the **claude** path, Claude Code's own
+       SessionStart hook (``~/.claude/hooks/export-session-id.sh``)
+       writes the correct dashed UUID on first tool invocation — but
+       until then, the child env shouldn't carry the parent's. The
+       cost of unsetting is negligible; the cost of keeping it is the
+       cross-channel-agentcom drop we're closing.
+
+    Returns the **overlay** (not the full merged env): the keys to set
+    are present with their target values, and keys to unset are present
+    with empty-string values. Callers that hand the result to a
+    ``subprocess`` family can iterate the items, applying ``os.environ |
+    overlay`` and then filtering empty values out — or pass the overlay
+    verbatim to a service that supports an "unset" sentinel. The pair
+    ``(MM_BRIDGE_SESSION_ID=<id>, CLAUDE_SESSION_ID="")`` documents both
+    sides of the contract symmetrically.
+
+    *backend* is accepted today purely for the documented contract:
+    both ``"claude"`` and ``"codex"`` get the same treatment. The
+    parameter keeps the door open for backend-specific tweaks (e.g.
+    pinning a codex-rollout path) without breaking the call site.
+    """
+    del backend  # uniform treatment today; kept for future backend tweaks
+    overlay: dict[str, str] = {}
+    if not new_session_id:
+        raise ValueError("new_session_id must be non-empty")
+    overlay["MM_BRIDGE_SESSION_ID"] = new_session_id
+    # Explicit unset signal: empty string conveys "remove this from the
+    # child env" to any caller that respects the convention. We include
+    # the key even when the parent didn't have CLAUDE_SESSION_ID set —
+    # the contract is symmetric, and a missing key on the parent side
+    # is indistinguishable from a present-but-empty one to a child that
+    # only looks at ``os.environ.get(...)``.
+    overlay["CLAUDE_SESSION_ID"] = ""
+    del parent_env  # currently unused; reserved for future env carry-over
+    return overlay
 
 
 def format_parent_header(

@@ -120,6 +120,65 @@ class FormatSpawnKickoffTests(unittest.TestCase):
         self.assertNotIn(">", out)
 
 
+class BuildSpawnChildEnvTests(unittest.TestCase):
+    """Pin ``MM_BRIDGE_SESSION_ID`` and unset ``CLAUDE_SESSION_ID``.
+
+    The two together close the door on RC1 (parent ``CLAUDE_SESSION_ID``
+    leaking into the spawned child and poisoning the bridge's session
+    resolver). The overlay is symmetric across both backends — codex
+    needs it because it has no SessionStart hook to overwrite the
+    inherited value; claude needs it as defense in depth until its own
+    hook fires on first tool use.
+    """
+
+    def test_codex_overlay_pins_mm_bridge_session_id_and_unsets_claude(
+        self,
+    ) -> None:
+        parent = {"CLAUDE_SESSION_ID": "parent-claude-sid", "PATH": "/usr/bin"}
+        overlay = spawn.build_spawn_child_env(
+            parent, new_session_id="ses_new123", backend="codex",
+        )
+        self.assertEqual(overlay["MM_BRIDGE_SESSION_ID"], "ses_new123")
+        self.assertEqual(overlay["CLAUDE_SESSION_ID"], "")
+
+    def test_claude_overlay_pins_mm_bridge_session_id_and_unsets_claude(
+        self,
+    ) -> None:
+        parent = {"CLAUDE_SESSION_ID": "parent-claude-sid", "PATH": "/usr/bin"}
+        overlay = spawn.build_spawn_child_env(
+            parent, new_session_id="ses_new123", backend="claude",
+        )
+        self.assertEqual(overlay["MM_BRIDGE_SESSION_ID"], "ses_new123")
+        self.assertEqual(overlay["CLAUDE_SESSION_ID"], "")
+
+    def test_overlay_includes_claude_unset_even_when_parent_missing_it(
+        self,
+    ) -> None:
+        """Symmetric contract: an absent parent value gets an explicit
+        empty-string overlay so downstream code doesn't have to
+        distinguish "absent" from "present-but-empty"."""
+        parent: dict[str, str] = {"PATH": "/usr/bin"}
+        overlay = spawn.build_spawn_child_env(
+            parent, new_session_id="ses_new", backend="codex",
+        )
+        self.assertEqual(overlay["CLAUDE_SESSION_ID"], "")
+
+    def test_empty_new_session_id_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            spawn.build_spawn_child_env(
+                {}, new_session_id="", backend="codex",
+            )
+
+    def test_overlay_does_not_carry_unrelated_keys(self) -> None:
+        """The overlay is the *changeset*, not the full child env."""
+        parent = {"PATH": "/usr/bin", "HOME": "/root"}
+        overlay = spawn.build_spawn_child_env(
+            parent, new_session_id="ses_new", backend="claude",
+        )
+        self.assertNotIn("PATH", overlay)
+        self.assertNotIn("HOME", overlay)
+
+
 class DeriveDisplayNameTests(unittest.TestCase):
     def test_uses_title_when_given(self) -> None:
         self.assertEqual(
