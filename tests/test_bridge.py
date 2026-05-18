@@ -1045,8 +1045,7 @@ class ForwardingTests(_BridgeTestCase):
         records the SENDER's own channel id. When the post lands in a
         different channel (the destination), the dispatcher must forward
         it as a normal user turn so the recipient session receives the
-        message. This is the regression that broke claude/codex
-        cross-channel agentcom after the original marker drop landed."""
+        message."""
         self.bridge.mapping.link(Anchor("c-target"), "s-target")
 
         await self.bridge._on_mm_posted({
@@ -1055,10 +1054,66 @@ class ForwardingTests(_BridgeTestCase):
             "props": {
                 "from_bridge_cli": "post",
                 "from_bridge_cli_channel": "c-sender",
+                "from_bridge_cli_session": "s-sender",
             },
         })
 
         self.assertEqual(self.bridge.vd.sent, [("s-target", "Hello from sibling")])
+
+    async def test_bridge_forwards_agentcom_post_even_with_channel_equality(self):
+        """Spec test 7 — explicit regression for today's incident.
+
+        Today (post id ``tc8ssq5j7jdr3y18qgu9t5nmuw``): RC1 caused the
+        sender's resolver to return the parent agent's session id, so
+        the sender mis-stamped its own ``from_bridge_cli_channel`` as
+        the destination channel. The old predicate then dropped the
+        post via channel-equality, silently breaking agentcom. After
+        the fix, any post with ``from_bridge_cli="post"`` is treated
+        as explicit agentcom and forwarded regardless of the stamped
+        origin channel — the upstream self-echo filter
+        (``mm_client.py``'s ``is_own_post`` by post id) takes care of
+        the daemon's own outbound dedup."""
+        self.bridge.mapping.link(Anchor("c-destination"), "s-destination")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-destination",
+            "message": "Hello agent in c-destination",
+            "user_id": "u1", "type": "",
+            "props": {
+                # Pathological stamp: sender mis-resolved its own
+                # channel as the destination. Reproduces the wire-level
+                # state of post `tc8ssq5j7jdr3y18qgu9t5nmuw` from today.
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "c-destination",
+                "from_bridge_cli_session": "s-misresolved",
+            },
+        })
+
+        self.assertEqual(
+            self.bridge.vd.sent,
+            [("s-destination", "Hello agent in c-destination")],
+        )
+
+    async def test_bridge_drops_cross_post_mirror_in_same_channel(self):
+        """Spec test 8: ``cross-post-mirror`` posts are the only
+        sender-side artifacts that the recipient should suppress
+        without forwarding. The mirror lives in the sender's own
+        channel by design (transcript visibility); the linked session
+        must not read it back as a user turn."""
+        self.bridge.mapping.link(Anchor("c-sender"), "s-sender")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-sender",
+            "message": "hello\n\n_→ also sent to ~other~_",
+            "user_id": "u1", "type": "",
+            "props": {
+                "from_bridge_cli": "cross-post-mirror",
+                "from_bridge_cli_channel": "c-sender",
+                "from_bridge_cli_session": "s-sender",
+            },
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_posted_with_marker_and_no_channel_field_is_skipped(self):
         """Backwards compat: posts that carry the marker but no

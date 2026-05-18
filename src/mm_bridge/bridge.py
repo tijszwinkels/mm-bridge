@@ -662,22 +662,45 @@ class Bridge:
         if _is_mm_system_post(post):
             return
         # Bridge CLI subcommands stamp `props.from_bridge_cli` on posts
-        # they author themselves (spawn's parent announcement, spawn's
-        # kickoff in the new channel, `mm-bridge post`, the cross-channel
-        # mirror). The marker pairs with `from_bridge_cli_channel`: the
-        # channel id of the session that should NOT see the post as a
-        # user turn — typically the channel the post lands in. We drop
-        # only when the recorded channel matches the post's channel
-        # (real own-channel echo); cross-channel agentcom posts carry
-        # the SENDER's channel id, which differs from the destination,
-        # so they pass through to the recipient session. Marker present
-        # without a channel field is treated as "drop" for backwards
-        # compatibility with older CLI processes in flight — the only
-        # authors of the marker live in this codebase.
+        # they author themselves. Marker taxonomy and dispatch:
+        #
+        #   * ``"post"`` — an explicit ``mm-bridge post`` call. Always
+        #     forwarded to the recipient session as a user turn,
+        #     regardless of the stamped ``from_bridge_cli_channel``.
+        #     This is the agentcom path: a sender in channel X tells
+        #     the recipient in channel Y "hi". RC1 (a poisoned sender
+        #     session resolver) used to mis-stamp the destination
+        #     channel as the origin and the recipient would silently
+        #     drop the post — that's the regression we're closing here.
+        #     Self-echoes of the sender's own outbound post are dedup'd
+        #     upstream by post id (`mm_client.py`'s `is_own_post`); we
+        #     don't need a separate channel-equality guard at this layer.
+        #   * ``"cross-post-mirror"`` — the informational mirror that
+        #     ``mm-bridge post --channel <other>`` lands in the
+        #     SENDER's own channel for transcript visibility. Drop
+        #     iff the recorded origin channel matches where the post
+        #     landed (own-channel mirror); otherwise (shouldn't happen
+        #     in practice) treat as agentcom and forward.
+        #   * ``"spawn-announcement"`` / ``"spawn-kickoff"`` — bridge
+        #     artifacts that the sender's or new channel's linked
+        #     session must not consume as a user turn. Keep the
+        #     channel-equality drop for these.
+        #   * Any other / future marker with no channel field — drop
+        #     conservatively (marker authors all live in this
+        #     codebase, so an absent channel field is a forwards-compat
+        #     hedge for a marker we don't recognise yet).
         props = post.get("props") or {}
         if isinstance(props, dict) and props.get("from_bridge_cli"):
+            marker = props.get("from_bridge_cli")
             origin_channel = props.get("from_bridge_cli_channel")
-            if origin_channel is None or origin_channel == post["channel_id"]:
+            if marker == "post":
+                # Explicit agentcom — always forward. Falls through to
+                # the normal dispatch below.
+                pass
+            elif origin_channel is None or origin_channel == post["channel_id"]:
+                # Mirror / spawn-artifact landing in the recorded
+                # channel — drop so the linked session doesn't read it
+                # back as a user turn.
                 return
         message = (post.get("message") or "").strip()
         if not message and not post.get("file_ids"):

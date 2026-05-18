@@ -127,10 +127,14 @@ class AnchorLookupTests(unittest.TestCase):
 class CurrentSessionIdTests(unittest.TestCase):
     """`cli._current_session_id` — env-var-first resolver chain.
 
-    Order: ``CLAUDE_SESSION_ID`` → ``MM_BRIDGE_SESSION_ID`` → live-codex
-    PPid tie-breaker → cwd-mtime walk over codex rollouts. The fallback
-    steps require a *sidecar_dir* and additionally gate every candidate
-    id on whether a sidecar exists for it.
+    Order: ``MM_BRIDGE_SESSION_ID`` (with valid sidecar) → ``CLAUDE_SESSION_ID``
+    → ``MM_BRIDGE_SESSION_ID`` (orphan) → live-codex PPid tie-breaker →
+    cwd-mtime walk over codex rollouts. The sidecar-gated form of
+    ``MM_BRIDGE_SESSION_ID`` takes precedence so an explicit pin from
+    ``mm-bridge spawn`` overrides a leaked ``CLAUDE_SESSION_ID`` from
+    the parent shell (RC1). The fallback steps require a *sidecar_dir*
+    and additionally gate every candidate id on whether a sidecar
+    exists for it.
     """
 
     def setUp(self) -> None:
@@ -167,6 +171,54 @@ class CurrentSessionIdTests(unittest.TestCase):
             {"CLAUDE_SESSION_ID": "", "MM_BRIDGE_SESSION_ID": "from-bridge"},
         ):
             self.assertEqual(cli._current_session_id(), "from-bridge")
+
+    def test_mm_bridge_session_id_with_sidecar_beats_claude_session_id(
+        self,
+    ) -> None:
+        """RC1 fix: an explicit ``MM_BRIDGE_SESSION_ID`` whose sidecar
+        resolves overrides a leaked ``CLAUDE_SESSION_ID`` from the
+        parent shell. Without the sidecar gate, the parent's claude id
+        would win and the child would resolve to the parent's
+        channel."""
+        sidecar.write(self.sdir, "child-sid", "child-chan")
+        sidecar.write(self.sdir, "parent-claude-sid", "parent-chan")
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_SESSION_ID": "parent-claude-sid",
+             "MM_BRIDGE_SESSION_ID": "child-sid"},
+        ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir), "child-sid",
+            )
+
+    def test_claude_session_id_used_when_mm_bridge_has_no_sidecar(self) -> None:
+        """Backward compat: an orphan ``MM_BRIDGE_SESSION_ID`` (no
+        sidecar on disk) must not block the legacy claude path. The
+        sidecar gate filters orphan env values, then ``CLAUDE_SESSION_ID``
+        takes over with its existing semantics (no sidecar gate)."""
+        sidecar.write(self.sdir, "from-claude", "claude-chan")
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_SESSION_ID": "from-claude",
+             "MM_BRIDGE_SESSION_ID": "orphan-no-sidecar"},
+        ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir), "from-claude",
+            )
+
+    def test_mm_bridge_session_id_returned_as_fallback_when_no_sidecar(
+        self,
+    ) -> None:
+        """Orphan ``MM_BRIDGE_SESSION_ID`` with no ``CLAUDE_SESSION_ID``
+        is still returned verbatim — preserves the original "trust the
+        env" behaviour for consumers that pre-date the sidecar gate."""
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_SESSION_ID": "", "MM_BRIDGE_SESSION_ID": "orphan"},
+        ):
+            self.assertEqual(
+                cli._current_session_id(self.sdir), "orphan",
+            )
 
     def test_rollout_fallback_returns_id_when_sidecar_present(self) -> None:
         sidecar.write(self.sdir, "codex-sid-007", "chan-007")
