@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,9 +119,19 @@ class SidecarTests(unittest.TestCase):
     def test_read_literal_match_wins_over_canonical_fallback(self) -> None:
         """A sidecar at the literal lookup path beats the canonical
         fallback — so codex / MM_BRIDGE_SESSION_ID ids that already
-        match their on-disk filename round-trip unchanged."""
+        match their on-disk filename round-trip unchanged.
+
+        The two ids here intentionally do *not* canonicalize to each
+        other (different hex). The original PR #18 test paired a dashed
+        UUID with its own canonical ses_<hex>, but those refer to the
+        same logical session under the new symlink-alias semantics —
+        writing the canonical now refreshes the dashed symlink, so the
+        collision is no longer representable. The invariant being tested
+        (literal lookup wins for codex-shaped ids that don't follow the
+        ses_<hex> convention) is preserved with the new id pair.
+        """
         sidecar.write(self.dir, "e6cc19e7-a0b9-4e78-96a6-ea5b51e7fa24", "chan-literal")
-        sidecar.write(self.dir, "ses_e6cc19e7a0b94e7896a6ea5b51e7fa24", "chan-canonical")
+        sidecar.write(self.dir, "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "chan-canonical")
         self.assertEqual(
             sidecar.read(self.dir, "e6cc19e7-a0b9-4e78-96a6-ea5b51e7fa24"),
             ("chan-literal", None),
@@ -162,6 +173,161 @@ class SidecarTests(unittest.TestCase):
         (self.dir / "b").write_text("y")
         sidecar.reconcile(self.dir, {})
         self.assertEqual(list(self.dir.iterdir()), [])
+
+
+class DashedAliasTests(unittest.TestCase):
+    """The dashed-UUID symlink alias makes the literal
+    ``test -f ~/.mm-bridge/sessions/$CLAUDE_SESSION_ID`` check pass from
+    inside a spawned Claude Code sub-session, where ``$CLAUDE_SESSION_ID``
+    is the dashed UUID rather than the canonical ``ses_<32hex>`` filename.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name) / "sessions"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_dashed_alias_helper(self) -> None:
+        """The pure helper accepts canonical ses_<32hex> only."""
+        cases = [
+            # valid canonical → dashed UUID
+            (
+                "ses_e7c23a68538d4393a1b0fa3d75a34b2a",
+                "e7c23a68-538d-4393-a1b0-fa3d75a34b2a",
+            ),
+            # too few hex chars
+            ("ses_e7c23a68538d4393a1b0fa3d75a34b2", None),
+            # too many hex chars
+            ("ses_e7c23a68538d4393a1b0fa3d75a34b2af", None),
+            # non-hex char ('G')
+            ("ses_e7c23a68538d4393a1b0fa3d75a34b2G", None),
+            # uppercase hex isn't canonical
+            ("ses_E7C23A68538D4393A1B0FA3D75A34B2A", None),
+            # claude-style dashed UUID isn't a canonical id
+            ("claude_e7c23a68-538d-4393-a1b0-fa3d75a34b2a", None),
+            # bare dashed UUID
+            ("e7c23a68-538d-4393-a1b0-fa3d75a34b2a", None),
+            # empty
+            ("", None),
+            # bare prefix
+            ("ses_", None),
+            # codex-style id is left alone
+            ("codex_019ef2a3b4c5d6e7f80123456789abcd", None),
+        ]
+        for session_id, expected in cases:
+            with self.subTest(session_id=session_id):
+                self.assertEqual(sidecar._dashed_alias(session_id), expected)
+
+    def test_write_creates_dashed_alias(self) -> None:
+        sid = "ses_e7c23a68538d4393a1b0fa3d75a34b2a"
+        sidecar.write(self.dir, sid, "chan-1")
+        alias = self.dir / "e7c23a68-538d-4393-a1b0-fa3d75a34b2a"
+        self.assertTrue(alias.is_symlink())
+        # Relative target — just the canonical filename, not an absolute path.
+        self.assertEqual(os.readlink(str(alias)), sid)
+        # Following the symlink yields the canonical channel data.
+        self.assertEqual(alias.read_text(), "chan-1")
+
+    def test_write_no_alias_for_claude_prefix(self) -> None:
+        """Claude harness sessions with a dashed-UUID id already match
+        the on-disk filename — no alias needed."""
+        sidecar.write(
+            self.dir,
+            "claude_e7c23a68-538d-4393-a1b0-fa3d75a34b2a",
+            "chan-1",
+        )
+        symlinks = [p for p in self.dir.iterdir() if p.is_symlink()]
+        self.assertEqual(symlinks, [])
+
+    def test_write_no_alias_for_codex_prefix(self) -> None:
+        """Codex uuid7 ids already include a unique suffix."""
+        sidecar.write(
+            self.dir,
+            "codex_019ef2a3b4c5d6e7f80123456789abcd",
+            "chan-1",
+        )
+        symlinks = [p for p in self.dir.iterdir() if p.is_symlink()]
+        self.assertEqual(symlinks, [])
+
+    def test_write_alias_idempotent(self) -> None:
+        sid = "ses_e7c23a68538d4393a1b0fa3d75a34b2a"
+        sidecar.write(self.dir, sid, "chan-1")
+        sidecar.write(self.dir, sid, "chan-2")  # update channel, same session
+        alias = self.dir / "e7c23a68-538d-4393-a1b0-fa3d75a34b2a"
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(os.readlink(str(alias)), sid)
+        self.assertEqual(alias.read_text(), "chan-2")
+
+    def test_write_alias_replaces_wrong_symlink(self) -> None:
+        """A pre-existing alias pointing somewhere else is corrected."""
+        self.dir.mkdir(parents=True)
+        alias = self.dir / "e7c23a68-538d-4393-a1b0-fa3d75a34b2a"
+        os.symlink("some-other-target", str(alias))
+        sid = "ses_e7c23a68538d4393a1b0fa3d75a34b2a"
+        sidecar.write(self.dir, sid, "chan-1")
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(os.readlink(str(alias)), sid)
+
+    def test_write_alias_replaces_regular_file_at_alias_path(self) -> None:
+        """A stale regular file at the alias path is replaced with a symlink."""
+        self.dir.mkdir(parents=True)
+        alias = self.dir / "e7c23a68-538d-4393-a1b0-fa3d75a34b2a"
+        alias.write_text("hand-edited junk")
+        sid = "ses_e7c23a68538d4393a1b0fa3d75a34b2a"
+        sidecar.write(self.dir, sid, "chan-1")
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(os.readlink(str(alias)), sid)
+        self.assertEqual(alias.read_text(), "chan-1")
+
+    def test_delete_removes_alias(self) -> None:
+        sid = "ses_e7c23a68538d4393a1b0fa3d75a34b2a"
+        sidecar.write(self.dir, sid, "chan-1")
+        alias = self.dir / "e7c23a68-538d-4393-a1b0-fa3d75a34b2a"
+        self.assertTrue(alias.is_symlink())
+        sidecar.delete(self.dir, sid)
+        self.assertFalse((self.dir / sid).exists())
+        # is_symlink() catches dangling symlinks too; exists() follows.
+        self.assertFalse(alias.is_symlink())
+        self.assertFalse(alias.exists())
+
+    def test_reconcile_preserves_aliases_for_kept_sessions(self) -> None:
+        sid_a = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        sid_b = "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        sidecar.write(self.dir, sid_a, "chan-a")
+        sidecar.write(self.dir, sid_b, "chan-b")
+        sidecar.reconcile(
+            self.dir,
+            {sid_a: ("chan-a", None), sid_b: ("chan-b", None)},
+        )
+        # Both canonicals survive.
+        self.assertEqual((self.dir / sid_a).read_text(), "chan-a")
+        self.assertEqual((self.dir / sid_b).read_text(), "chan-b")
+        # Both aliases survive and point correctly.
+        alias_a = self.dir / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        alias_b = self.dir / "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        self.assertTrue(alias_a.is_symlink())
+        self.assertTrue(alias_b.is_symlink())
+        self.assertEqual(os.readlink(str(alias_a)), sid_a)
+        self.assertEqual(os.readlink(str(alias_b)), sid_b)
+
+    def test_reconcile_removes_alias_when_session_removed(self) -> None:
+        sid_a = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        sid_b = "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        sidecar.write(self.dir, sid_a, "chan-a")
+        sidecar.write(self.dir, sid_b, "chan-b")
+        sidecar.reconcile(self.dir, {sid_a: ("chan-a", None)})
+        # Kept session — canonical + alias both survive.
+        self.assertEqual((self.dir / sid_a).read_text(), "chan-a")
+        alias_a = self.dir / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        self.assertTrue(alias_a.is_symlink())
+        self.assertEqual(os.readlink(str(alias_a)), sid_a)
+        # Dropped session — canonical + alias both gone.
+        self.assertFalse((self.dir / sid_b).exists())
+        alias_b = self.dir / "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        self.assertFalse(alias_b.is_symlink())
+        self.assertFalse(alias_b.exists())
 
 
 class ChannelMappingSidecarTests(unittest.TestCase):

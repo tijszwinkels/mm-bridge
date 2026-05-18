@@ -35,6 +35,91 @@ def _ensure_dir(directory: Path) -> None:
         logger.debug("Could not chmod sidecar dir %s", directory, exc_info=True)
 
 
+def _dashed_alias(session_id: str) -> str | None:
+    """Return the dashed-UUID alias filename for a canonical ``ses_<32hex>`` id.
+
+    Claude Code sub-sessions see ``$CLAUDE_SESSION_ID`` as a dashed UUID
+    (``<8>-<4>-<4>-<4>-<12>``) while the harness writes sidecars under the
+    canonical ``ses_<32hex>`` form. A symlink at the dashed-UUID path lets
+    the literal ``test -f ~/.mm-bridge/sessions/$CLAUDE_SESSION_ID`` check
+    pass directly, without going through the read-time fallback in
+    ``read()``.
+
+    Returns the dashed alias when ``session_id`` is exactly
+    ``ses_<32 lowercase hex chars>``. Returns ``None`` for any other shape
+    (non-``ses_`` prefix, wrong hex length, non-hex / uppercase chars) —
+    those ids already are or already include a unique on-disk filename.
+    """
+    if not session_id.startswith("ses_"):
+        return None
+    hex_part = session_id[4:]
+    if len(hex_part) != 32:
+        return None
+    # int(..., 16) accepts both cases; require lowercase explicitly so we
+    # don't alias a mixed-case canonical that doesn't actually exist on disk.
+    if hex_part != hex_part.lower():
+        return None
+    try:
+        int(hex_part, 16)
+    except ValueError:
+        return None
+    return (
+        f"{hex_part[:8]}-{hex_part[8:12]}-{hex_part[12:16]}"
+        f"-{hex_part[16:20]}-{hex_part[20:]}"
+    )
+
+
+def _write_dashed_alias(directory: Path, session_id: str) -> None:
+    """Create/refresh `<directory>/<dashed-uuid>` → `<session_id>` symlink.
+
+    Idempotent: a correct symlink is left alone; a wrong symlink or a
+    regular file at the alias path is replaced. Uses a relative target
+    (the bare canonical filename) so the alias survives moves of the
+    parent directory. Best-effort — OSErrors are logged, never raised.
+    """
+    alias = _dashed_alias(session_id)
+    if alias is None:
+        return
+    alias_path = directory / alias
+    try:
+        if alias_path.is_symlink():
+            try:
+                current = os.readlink(str(alias_path))
+            except OSError:
+                current = None
+            if current == session_id:
+                logger.debug(
+                    "Sidecar alias already correct for %s", session_id[:8],
+                )
+                return
+            alias_path.unlink()
+        elif alias_path.exists():
+            # Defensive: a stale regular file at the alias path.
+            alias_path.unlink()
+        os.symlink(session_id, str(alias_path))
+    except OSError:
+        logger.warning(
+            "Failed to create sidecar alias for session %s",
+            session_id[:8],
+            exc_info=True,
+        )
+
+
+def _delete_dashed_alias(directory: Path, session_id: str) -> None:
+    """Remove `<directory>/<dashed-uuid>` if `session_id` has one. Best-effort."""
+    alias = _dashed_alias(session_id)
+    if alias is None:
+        return
+    try:
+        (directory / alias).unlink(missing_ok=True)
+    except OSError:
+        logger.warning(
+            "Failed to delete sidecar alias for session %s",
+            session_id[:8],
+            exc_info=True,
+        )
+
+
 def write(
     directory: Path,
     session_id: str,
@@ -46,6 +131,11 @@ def write(
     Channel-level sessions get a single line (``channel_id``). Thread-fork
     sessions get two lines (``channel_id\\nroot_id``). Passing an empty
     ``session_id`` or ``channel_id`` is a no-op.
+
+    For canonical ``ses_<32hex>`` ids, also creates a dashed-UUID symlink
+    at `<directory>/<dashed-uuid>` pointing to `<session_id>`, so the
+    literal ``test -f ~/.mm-bridge/sessions/$CLAUDE_SESSION_ID`` check
+    from inside a spawned Claude Code session passes directly.
     """
     if not session_id or not channel_id:
         return
@@ -62,6 +152,8 @@ def write(
         logger.warning(
             "Failed to write sidecar for session %s", session_id[:8], exc_info=True,
         )
+        return
+    _write_dashed_alias(directory, session_id)
 
 
 def read(directory: Path, session_id: str) -> tuple[str, str | None] | None:
@@ -113,7 +205,11 @@ def _read_text_or_none(path: Path, session_id: str) -> str | None:
 
 
 def delete(directory: Path, session_id: str) -> None:
-    """Remove the sidecar for `session_id`, if it exists."""
+    """Remove the sidecar for `session_id`, if it exists.
+
+    Also removes the dashed-UUID alias symlink for canonical
+    ``ses_<32hex>`` ids, if present.
+    """
     if not session_id:
         return
     try:
@@ -122,6 +218,7 @@ def delete(directory: Path, session_id: str) -> None:
         logger.debug(
             "Failed to delete sidecar for session %s", session_id[:8], exc_info=True,
         )
+    _delete_dashed_alias(directory, session_id)
 
 
 def reconcile(
@@ -133,6 +230,12 @@ def reconcile(
     Writes sidecars for sessions in the mapping that don't have one on disk
     and removes any files in the directory that don't correspond to a
     current mapping entry. Failures are logged but don't raise.
+
+    Symlinks (the dashed-UUID aliases produced by ``write()``) are
+    reconcile-invariant: the existing-files probe skips them so they are
+    never flagged as stale, and ``write()`` recreates them idempotently
+    for every kept session. ``delete()`` removes the alias when its
+    canonical session is dropped.
     """
     try:
         _ensure_dir(directory)
@@ -143,7 +246,11 @@ def reconcile(
         return
 
     try:
-        existing = {p.name for p in directory.iterdir() if p.is_file()}
+        existing = {
+            p.name
+            for p in directory.iterdir()
+            if p.is_file() and not p.is_symlink()
+        }
     except OSError:
         logger.warning(
             "Could not read sidecar dir %s", directory, exc_info=True,
