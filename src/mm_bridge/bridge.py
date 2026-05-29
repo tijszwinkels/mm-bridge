@@ -33,8 +33,11 @@ INVITE_PLACEHOLDER = (
 
 MM_POST_MAX_LEN = 16000
 MM_DISPLAY_NAME_MAX = 64
+# Event types that unconditionally mean "the session is actively working" and
+# should (re)start the typing indicator. ``session.updated`` is NOT here: it is
+# status-driven (see ``_session_updated_is_activity``) because the harness reuses
+# it for both running- and idle-flips.
 HARNESS_ACTIVITY_EVENTS = {
-    "session.updated",
     "message",
     "message.delta",
     "tool.call",
@@ -43,6 +46,18 @@ HARNESS_ACTIVITY_EVENTS = {
     "permission.denied",
 }
 HARNESS_RUN_TERMINAL_EVENTS = {"run.completed", "run.failed", "run.interrupted"}
+
+# Session statuses (agent-harness ``SessionStatus``) that mean the session is
+# QUIET, not actively producing output. The harness freshness fix emits a
+# ``session.updated`` carrying one of these specifically to signal the session
+# went idle (see agent-harness ``observer._maybe_publish_status_flip``); a
+# bare event-type check would mis-read that "went quiet" flip as activity and
+# keep the typing indicator stuck ON. Only ``status == "running"`` on a
+# ``session.updated`` is treated as activity; missing/unknown status falls
+# back to the SAFE non-activity choice (genuine output always ALSO emits
+# ``message`` / ``message.delta`` / ``tool.*`` events, which keep typing alive
+# on their own), and those QUIET flips additionally STOP typing.
+HARNESS_QUIET_SESSION_STATUSES = {"idle", "waiting_for_input", "archived"}
 
 # Watchdog events — emitted by the harness `RunProcess` watchdogs (see
 # agent-harness PR #10). NOT in HARNESS_RUN_TERMINAL_EVENTS or
@@ -2233,6 +2248,19 @@ class Bridge:
         if session_id and event_type in HARNESS_ACTIVITY_EVENTS:
             self.last_activity_ts[session_id] = time.monotonic()
             await self._start_typing_for_activity(session_id)
+        elif session_id and event_type == "session.updated":
+            # The harness reuses ``session.updated`` for both running- and
+            # idle-flips. Read the status payload to decide: a running-flip is
+            # activity (keep typing); a quiet-flip is the explicit "went quiet"
+            # signal and must STOP typing — for external/observer sessions
+            # there is no run-terminal event to do that cleanup, and repeated
+            # freshness ticks would otherwise keep the silence watchdog from
+            # ever firing, leaving typing stuck ON.
+            if self._session_updated_is_activity(inner):
+                self.last_activity_ts[session_id] = time.monotonic()
+                await self._start_typing_for_activity(session_id)
+            else:
+                await self._stop_typing_for_idle(session_id)
 
         if event_type == "session.updated":
             await self._on_harness_session_seen(inner)
@@ -2252,6 +2280,31 @@ class Bridge:
             await self._on_harness_watchdog_event(event_type, inner)
         else:
             logger.debug("Unhandled agent-harness event %s", event_type)
+
+    @staticmethod
+    def _session_updated_is_activity(inner: dict) -> bool:
+        """Decide whether a ``session.updated`` payload represents the session
+        actively working (→ typing) or having gone quiet (→ no typing / stop).
+
+        The canonical status location is ``data.session.status`` (the harness
+        dumps the full ``Session`` row there); ``data.status`` is accepted as a
+        fallback. Only ``status == "running"`` counts as activity. Anything in
+        ``HARNESS_QUIET_SESSION_STATUSES`` — or a missing/unknown status — is
+        treated as NON-activity (the SAFE default): real output always also
+        emits ``message`` / ``message.delta`` / ``tool.*`` events that keep
+        typing alive independently, so a status-less freshness tick must not.
+        """
+        status = (inner.get("session") or {}).get("status") or inner.get("status")
+        return status == "running"
+
+    async def _stop_typing_for_idle(self, session_id: str) -> None:
+        """A quiet ``session.updated`` flip is the explicit "went quiet"
+        signal: drop the activity timestamp and stop the typing loop so the
+        indicator clears immediately rather than waiting on the silence
+        watchdog (which the prior freshness ticks would have kept resetting)."""
+        self.last_activity_ts.pop(session_id, None)
+        if self.typing:
+            await self.typing.stop(session_id)
 
     async def _start_typing_for_activity(self, session_id: str) -> None:
         if not self.typing:

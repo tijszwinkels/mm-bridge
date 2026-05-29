@@ -3507,5 +3507,142 @@ class HarnessWatchdogEventsTests(_BridgeTestCase):
         )
 
 
+class TypingIndicatorActivityTests(_BridgeTestCase):
+    """Typing indicator must follow the session's *status*, not merely the
+    SSE event TYPE.
+
+    The agent-harness freshness fix (harness main) emits a
+    ``session.updated`` SSE event carrying ``data.session.status == "idle"``
+    specifically to signal the session went QUIET. A ``session.updated``
+    carrying ``status == "running"`` (and every real activity event:
+    ``message`` / ``message.delta`` / ``tool.*``) means the session is busy.
+
+    Contract: ``data.session.status`` is the canonical location of the flip
+    payload (agent-harness ``observer._maybe_publish_status_flip``); a
+    top-level ``data.status`` is accepted as a fallback. An idle-flip must
+    NOT count as activity and must STOP typing; a running-flip / activity
+    event keeps typing alive.
+    """
+
+    async def _settle(self) -> None:
+        # Let the TypingIndicator refresh loop (refresh_s=0.01) tick at least
+        # once so a started loop has published into FakeMmClient.typing.
+        await asyncio.sleep(0.05)
+
+    async def test_session_updated_idle_does_not_start_typing(self):
+        """RED on pre-fix code: an idle-flip is treated as activity and
+        starts typing. After the fix, an idle ``session.updated`` is NOT
+        activity — no typing loop, no published indicator."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_x",
+                      "session": {"id": "ses_x", "status": "idle"}}},
+        )
+        await self._settle()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertEqual(self.bridge.mm.typing, [])
+        self.assertNotIn("ses_x", self.bridge.last_activity_ts)
+
+    async def test_message_event_starts_typing(self):
+        """Positive guard against over-correction: a real ``message`` event
+        is activity and starts typing."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+
+        await self.bridge._on_harness_event(
+            "message",
+            {"data": {"session_id": "ses_x",
+                      "message": {"role": "assistant", "content": "hi"}}},
+        )
+        await self._settle()
+
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertIn(("c1", None), self.bridge.mm.typing)
+        self.assertIn("ses_x", self.bridge.last_activity_ts)
+
+    async def test_session_updated_running_starts_typing(self):
+        """A ``session.updated`` carrying ``status == "running"`` is a real
+        activity signal and keeps current behavior (typing on)."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_x",
+                      "session": {"id": "ses_x", "status": "running"}}},
+        )
+        await self._settle()
+
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertIn(("c1", None), self.bridge.mm.typing)
+        self.assertIn("ses_x", self.bridge.last_activity_ts)
+
+    async def test_idle_flip_stops_already_running_typing(self):
+        """The explicit "went quiet" signal: a message starts typing, then
+        an idle ``session.updated`` must STOP it (external/observer sessions
+        have no run-terminal event to do this cleanup)."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+
+        await self.bridge._on_harness_event(
+            "message",
+            {"data": {"session_id": "ses_x",
+                      "message": {"role": "assistant", "content": "working"}}},
+        )
+        await self._settle()
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_x",
+                      "session": {"id": "ses_x", "status": "idle"}}},
+        )
+        await self._settle()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertNotIn("ses_x", self.bridge.last_activity_ts)
+
+    async def test_idle_status_at_top_level_data_is_honored(self):
+        """Defensive payload-shape: status may arrive at ``data.status``
+        instead of ``data.session.status``. Still treated as idle → no
+        typing."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_x", "status": "idle"}},
+        )
+        await self._settle()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertEqual(self.bridge.mm.typing, [])
+
+    async def test_session_updated_unknown_status_is_not_activity(self):
+        """SAFE fallback: a ``session.updated`` with missing/unknown status
+        must NOT start typing. Genuine output always also emits
+        ``message`` / ``message.delta`` / ``tool.*`` events that keep typing
+        alive, so a status-less freshness tick should not.
+
+        Use a session NOT in ``_known_sessions`` would trigger channel
+        creation; here it is mapped+known so the only effect under test is
+        the activity decision."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_x", "session": {"id": "ses_x"}}},
+        )
+        await self._settle()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertEqual(self.bridge.mm.typing, [])
+
+
 if __name__ == "__main__":
     unittest.main()
