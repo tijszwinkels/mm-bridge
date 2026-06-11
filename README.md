@@ -148,6 +148,7 @@ Creates a fresh sibling channel with its own agent-harness session and kicks off
 - `--title "<name>"` — display name for the new channel (default: derived from the prompt).
 - `--cwd <path>` — working directory for the new session.
 - `--backend claude|codex` — backend for the new session.
+- `--model <model>` — model for the new session (e.g. `claude-fable-5`), overriding the per-backend config default.
 - `--invite <user>` — invite a user to the new channel.
 - `--no-forward-prompt` — don't post the kickoff message in the parent channel.
 
