@@ -59,9 +59,13 @@ url = "http://localhost:8877"
 
 # Session defaults applied when a new session is created.
 default_backend   = "claude"   # or "codex"
-default_model     = "opus"
 default_cwd       = "~/projects"
 default_autorespond = false
+
+# Per-backend default model, applied when a channel / spawn doesn't pin one
+# explicitly. (The old scalar `default_model = "opus"` is deprecated but still
+# honoured — it maps onto `claude`.)
+default_models = { claude = "opus", codex = "gpt-5.5" }
 
 # Coalesce Claude's tool-use events into one per-turn placeholder post
 # (edited as more tools run, left as a compact summary when the turn
