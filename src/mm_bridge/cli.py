@@ -905,6 +905,10 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
     cwd = args.cwd or os.getcwd()
     backend = args.backend or cfg.default_backend
+    # Explicit --model wins; otherwise the per-backend default so
+    # ``--backend codex`` doesn't inherit claude's ``opus`` (that
+    # combination makes ``codex exec`` exit 1 immediately).
+    model = args.model or cfg.default_model_for(backend)
 
     before = _snapshot_sidecar_names(cfg.sidecar_dir)
 
@@ -915,9 +919,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 args.prompt,
                 cwd,
                 backend,
-                # Per-backend default so ``--backend codex`` doesn't inherit
-                # claude's ``opus`` — that combination exits 1 immediately.
-                cfg.default_model_for(backend),
+                model,
                 title=args.title,
             ),
         )
@@ -1187,6 +1189,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_spawn.add_argument(
         "--backend",
         help="Backend name (e.g. 'claude', 'codex'). Default: config default.",
+    )
+    p_spawn.add_argument(
+        "--model",
+        help=(
+            "Model for the sub-session (e.g. 'claude-fable-5'). "
+            "Default: per-backend config default."
+        ),
     )
     p_spawn.add_argument(
         "--title",

@@ -784,6 +784,35 @@ class SpawnCommandTests(unittest.TestCase):
         # No --title flag passed: title arrives as None.
         self.assertIsNone(captured["title"])
 
+    def test_spawn_model_flag_overrides_default_model(self) -> None:
+        """``mm-bridge spawn --model claude-fable-5`` must surface the
+        explicit model to ``create_session`` verbatim, overriding the
+        per-backend config default. This is the supported way for an
+        agent to spawn a sub-session on a non-default model (e.g. Fable)
+        without mutating the daemon's config."""
+        captured: dict = {}
+
+        async def _stub(harness_url, message, cwd, backend, model, title=None):
+            captured["backend"] = backend
+            captured["model"] = model
+            sidecar.write(self.sdir, "new-sess", "new-chan")
+            return {"status": "started"}
+
+        with patch("sys.argv", [
+            "mm-bridge", "spawn", "hi", "--model", "claude-fable-5",
+        ]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+
+        # Explicit --model wins over the claude default ("opus").
+        self.assertEqual(captured["backend"], "claude")
+        self.assertEqual(captured["model"], "claude-fable-5")
+
     def test_spawn_passes_title_to_harness_create_session(self) -> None:
         """``mm-bridge spawn --title "Foo"`` must surface "Foo" as the
         harness Session.title so consumers (e.g. command-bridge lane
