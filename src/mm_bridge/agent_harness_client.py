@@ -156,8 +156,20 @@ class AgentHarnessClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    async def get_run(self, session_id: str, run_id: str) -> dict | None:
+        resp = await self._http.get(f"/v1/sessions/{session_id}/runs/{run_id}")
+        if resp.status_code == 404:
+            return None
+        self._raise_for_status(resp)
+        return resp.json()
+
     async def list_sessions(self) -> list[dict]:
         resp = await self._http.get("/v1/sessions")
+        self._raise_for_status(resp)
+        return resp.json().get("data", [])
+
+    async def list_session_runs(self, session_id: str) -> list[dict]:
+        resp = await self._http.get(f"/v1/sessions/{session_id}/runs")
         self._raise_for_status(resp)
         return resp.json().get("data", [])
 
