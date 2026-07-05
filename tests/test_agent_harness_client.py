@@ -203,6 +203,49 @@ async def test_interrupt_run_maps_terminal_errors():
         await client.interrupt_run("codex_abc", "run_123")
 
 
+async def test_get_run_returns_run_row_and_none_on_404():
+    async def handler(req: httpx.Request) -> httpx.Response:
+        assert req.method == "GET"
+        if req.url.path == "/v1/sessions/ses_a/runs/run_1":
+            return httpx.Response(200, json={"id": "run_1", "status": "running"})
+        if req.url.path == "/v1/sessions/ses_a/runs/missing":
+            return httpx.Response(404, json={"error": {"code": "run_not_found"}})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    client = _client(handler)
+
+    assert await client.get_run("ses_a", "run_1") == {"id": "run_1", "status": "running"}
+    assert await client.get_run("ses_a", "missing") is None
+
+
+async def test_get_run_raises_on_5xx():
+    async def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"code": "boom"}})
+
+    client = _client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.get_run("ses_a", "run_1")
+
+
+async def test_list_session_runs_unwraps_data():
+    async def handler(req: httpx.Request) -> httpx.Response:
+        assert req.method == "GET"
+        assert req.url.path == "/v1/sessions/ses_a/runs"
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "run_1", "status": "completed"},
+                           {"id": "run_2", "status": "running"}]},
+        )
+
+    client = _client(handler)
+
+    assert await client.list_session_runs("ses_a") == [
+        {"id": "run_1", "status": "completed"},
+        {"id": "run_2", "status": "running"},
+    ]
+
+
 async def test_get_session_list_sessions_models_messages_and_health():
     async def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path == "/v1/sessions/missing":

@@ -115,3 +115,25 @@ on an idle/unknown-status `session.updated`).
 
 GREEN after fix: `6 passed`. Full suite: `611 passed, 1 skipped, 10 subtests
 passed` (the 1 skip is pre-existing), no regressions.
+
+## Addendum (2026-07-05): typing now follows the run lifecycle
+
+The PR #22 fix introduced its own mid-run failure modes, both triggered by
+long quiet tool calls / async subagent waits (the harness emits NO
+message/tool events for minutes while the run is alive):
+
+- The 15s silence watchdog stopped typing mid-run.
+- The harness observer flips `session.status` to "idle" on pure
+  ROLLOUT-file silence (freshness tick, ~30s threshold) — and the bridge
+  treated that quiet-flip as an explicit stop.
+
+New semantics (branch `fix/typing-follow-run-lifecycle`): typing ON ⇔ the
+session's harness run is active. `run.started` → terminal SSE events now
+maintain `active_run_by_session` (origin-agnostic). While a run is tracked,
+quiet `session.updated` flips are ignored (freshness noise), and the
+silence watchdog *reconciles* against the authoritative Run row
+(`GET /v1/sessions/{sid}/runs/{run_id}`: queued/running keeps typing;
+terminal/404/error stops it — which also recovers from a missed terminal
+event). Sessions without a tracked run (external/observer) keep the PR #22
+behavior unchanged. Tests: `TypingRunLifecycleTests` in
+`tests/test_bridge.py`.

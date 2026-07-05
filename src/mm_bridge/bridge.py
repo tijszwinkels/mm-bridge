@@ -47,6 +47,13 @@ HARNESS_ACTIVITY_EVENTS = {
 }
 HARNESS_RUN_TERMINAL_EVENTS = {"run.completed", "run.failed", "run.interrupted"}
 
+# Run statuses (agent-harness ``RunStatus``) that mean the run is still in
+# flight. The Run row is the authoritative "is the coding agent running?"
+# signal: unlike ``session.status`` (freshness-based, flips to "idle" on
+# rollout-file silence MID-RUN during long tool calls), run status only
+# changes on real lifecycle transitions.
+HARNESS_LIVE_RUN_STATUSES = {"queued", "running"}
+
 # Session statuses (agent-harness ``SessionStatus``) that mean the session is
 # QUIET, not actively producing output. The harness freshness fix emits a
 # ``session.updated`` carrying one of these specifically to signal the session
@@ -338,6 +345,13 @@ class Bridge:
         self.last_channel_state: dict[str, dict] = {}
         self.last_activity_ts: dict[str, float] = {}
         self.current_run_id_by_session: dict[str, str] = {}
+        # Sessions with a run currently in flight, from SSE ``run.started``
+        # → terminal events. Origin-agnostic (also tracks runs the bridge
+        # didn't submit, unlike ``current_run_id_by_session``). Value is the
+        # run_id, or None when the event omitted it. Read by the typing
+        # watchdog (reconcile instead of stop) and the quiet-flip handler
+        # (ignore freshness idle-flips mid-run).
+        self.active_run_by_session: dict[str, str | None] = {}
         self._known_sessions: set[str] = set()
         # Sessions the harness reports as ``origin: external`` — i.e. NOT
         # launched by the harness itself, so it has no stdin / IPC channel
@@ -654,22 +668,84 @@ class Bridge:
         self.mapping.reset_event_seq(0)
 
     async def _run_typing_watchdog(self) -> None:
-        """Stop a typing loop if session_status hasn't been heard from recently."""
+        """Stop or reconcile typing loops whose event stream went silent."""
         while True:
             await asyncio.sleep(self.config.typing_refresh_seconds)
-            if not self.typing:
+            await self._typing_watchdog_tick()
+
+    async def _typing_watchdog_tick(self) -> None:
+        """One watchdog pass over the typing sessions silent for longer than
+        ``typing_stop_after_silence_seconds``.
+
+        Silence alone is NOT proof the agent stopped: during a long tool
+        call or an async subagent wait the harness emits no message/tool
+        events for minutes while the run is very much alive. So a silent
+        session WITH a tracked active run is reconciled against the harness
+        Run row instead of blindly stopped; sessions without one (external/
+        observer — no run lifecycle events exist for them) keep the old
+        silence-stop behavior.
+        """
+        if not self.typing:
+            return
+        timeout = self.config.typing_stop_after_silence_seconds
+        now = time.monotonic()
+        for session_id in list(self.typing.running_sessions()):
+            last = self.last_activity_ts.get(session_id)
+            if last is not None and now - last <= timeout:
                 continue
-            timeout = self.config.typing_stop_after_silence_seconds
-            now = time.monotonic()
-            for session_id in list(self.typing.running_sessions()):
-                last = self.last_activity_ts.get(session_id)
-                if last is None or now - last > timeout:
-                    logger.debug(
-                        "No agent-harness activity for %s in %.0fs, stopping typing",
-                        session_id[:8], timeout,
-                    )
-                    await self.typing.stop(session_id)
-                    self.last_activity_ts.pop(session_id, None)
+            if session_id not in self.active_run_by_session:
+                logger.debug(
+                    "No agent-harness activity for %s in %.0fs, stopping typing",
+                    session_id[:8], timeout,
+                )
+                await self.typing.stop(session_id)
+                self.last_activity_ts.pop(session_id, None)
+                continue
+            if await self._active_run_is_alive(session_id):
+                # Run confirmed queued/running. Count the probe as activity
+                # so the next reconcile only happens after another full
+                # silence window (natural rate limit on harness GETs).
+                self.last_activity_ts[session_id] = time.monotonic()
+                continue
+            # Terminal, unknown (404), or unreachable harness →
+            # missed-terminal-event recovery. Conservative on errors so a
+            # dead harness can't leave typing stuck ON.
+            logger.info(
+                "Tracked run for %s not alive after %.0fs silence, "
+                "stopping typing",
+                session_id[:8], timeout,
+            )
+            await self.typing.stop(session_id)
+            self.last_activity_ts.pop(session_id, None)
+            self.active_run_by_session.pop(session_id, None)
+
+    async def _active_run_is_alive(self, session_id: str) -> bool:
+        """Ask the harness whether the session's tracked run is still in
+        flight (status queued/running).
+
+        ``session.status`` is deliberately NOT consulted: it is freshness-
+        based and flips to "idle" on rollout-file silence mid-run. When the
+        tracked run_id is missing (event omitted it) fall back to the
+        session's runs list — ANY live row counts. Every failure mode
+        (404, HTTP error, dead harness) returns False.
+        """
+        run_id = self.active_run_by_session.get(session_id)
+        try:
+            if run_id:
+                run = await self.harness.get_run(session_id, run_id)
+                runs = [run] if run else []
+            else:
+                runs = await self.harness.list_session_runs(session_id)
+        except Exception as exc:
+            logger.info(
+                "Typing reconcile probe failed for %s: %s",
+                session_id[:8], exc,
+            )
+            return False
+        return any(
+            (run or {}).get("status") in HARNESS_LIVE_RUN_STATUSES
+            for run in runs
+        )
 
     # ─────────────────────── Mattermost WS handlers ───────────────────────
 
@@ -2301,7 +2377,22 @@ class Bridge:
         """A quiet ``session.updated`` flip is the explicit "went quiet"
         signal: drop the activity timestamp and stop the typing loop so the
         indicator clears immediately rather than waiting on the silence
-        watchdog (which the prior freshness ticks would have kept resetting)."""
+        watchdog (which the prior freshness ticks would have kept resetting).
+
+        EXCEPT while a run is in flight: the harness observer flips
+        ``session.status`` to "idle" on pure rollout-file silence, which
+        fires MID-RUN during long quiet tool calls. Run lifecycle events
+        are authoritative — the terminal event (or the watchdog's Run-row
+        reconcile, for a missed one) does the cleanup then. Sessions
+        without a tracked run (external/observer) keep the immediate stop.
+        """
+        if session_id in self.active_run_by_session:
+            logger.debug(
+                "quiet status flip ignored: run %s still active — rollout "
+                "freshness noise during long tool calls",
+                self.active_run_by_session.get(session_id),
+            )
+            return
         self.last_activity_ts.pop(session_id, None)
         if self.typing:
             await self.typing.stop(session_id)
@@ -2901,6 +2992,13 @@ class Bridge:
             return
 
         if event_type == "run.started":
+            # Track the in-flight run origin-agnostically (also for runs the
+            # bridge didn't submit) so the silence watchdog and quiet-flip
+            # handler can tell "run still active" from "gone quiet". The
+            # run_id may legitimately be absent from the payload (None).
+            self.active_run_by_session[session_id] = (
+                data.get("run_id") or data.get("id")
+            )
             await self._start_typing_for_activity(session_id)
             return
 
@@ -2908,6 +3006,7 @@ class Bridge:
         current = self.current_run_id_by_session.get(session_id)
         if run_id and current == run_id:
             self.current_run_id_by_session.pop(session_id, None)
+        self.active_run_by_session.pop(session_id, None)
         self.last_activity_ts.pop(session_id, None)
         self._end_tool_use_run(session_id)
         if self.typing:

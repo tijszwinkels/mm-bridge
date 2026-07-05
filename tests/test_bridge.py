@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -183,6 +184,11 @@ class FakeAgentHarnessClient:
     session_create_count: int = 0
     fork_response: dict | None = None
     sessions_meta: list[dict] = field(default_factory=list)
+    # Run rows served by get_run / list_session_runs, mirroring the harness
+    # GET runs endpoints. ``run_probe_error`` simulates a dead harness.
+    runs_meta: dict = field(default_factory=dict)  # (session_id, run_id) → row
+    session_runs_meta: dict = field(default_factory=dict)  # session_id → [rows]
+    run_probe_error: Exception | None = None
     models_by_backend: dict = field(default_factory=lambda: {
         "claude": ["opus", "sonnet"],
         "codex": ["gpt-5.4"],
@@ -252,6 +258,16 @@ class FakeAgentHarnessClient:
 
     async def get_session_meta(self, session_id):
         return await self.get_session(session_id) or {}
+
+    async def get_run(self, session_id, run_id):
+        if self.run_probe_error is not None:
+            raise self.run_probe_error
+        return self.runs_meta.get((session_id, run_id))
+
+    async def list_session_runs(self, session_id):
+        if self.run_probe_error is not None:
+            raise self.run_probe_error
+        return self.session_runs_meta.get(session_id, [])
 
     async def set_session_title(self, session_id, title) -> None:
         self.titles.append((session_id, title))
@@ -3642,6 +3658,222 @@ class TypingIndicatorActivityTests(_BridgeTestCase):
 
         self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
         self.assertEqual(self.bridge.mm.typing, [])
+
+
+class TypingRunLifecycleTests(_BridgeTestCase):
+    """Typing must follow the harness RUN lifecycle: ON ⇔ a run is active.
+
+    During long tool calls / async subagent waits the harness emits NO
+    ``message``/``tool.*`` events for minutes, and its observer flips
+    ``session.status`` to "idle" on pure rollout-file silence — both fire
+    MID-RUN. So neither event-stream silence (the watchdog) nor a quiet
+    ``session.updated`` flip may kill the indicator while a run is active.
+    The Run row (``GET /v1/sessions/{sid}/runs/{run_id}``: status
+    queued/running vs terminal) is the authoritative liveness signal; the
+    watchdog reconciles against it instead of blindly stopping. Sessions
+    WITHOUT a tracked run (external/observer) keep the PR #22 behavior.
+    """
+
+    async def _settle(self) -> None:
+        await asyncio.sleep(0.05)
+
+    async def _start_run(self, run_id: str | None = "run-1") -> None:
+        """Drive a ``run.started`` SSE event for ses_x (anchor pre-linked).
+        The harness puts ``run_id`` in the event ENVELOPE (data={});
+        ``run_id=None`` simulates a payload that omitted it."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+        envelope: dict = {"session_id": "ses_x", "data": {}}
+        if run_id is not None:
+            envelope["run_id"] = run_id
+        await self.bridge._on_harness_event("run.started", envelope)
+
+    def _silence(self) -> None:
+        """Age ses_x's last activity far past typing_stop_after_silence_seconds."""
+        self.bridge.last_activity_ts["ses_x"] = time.monotonic() - 1000.0
+
+    async def test_run_started_tracks_active_run_and_starts_typing(self):
+        await self._start_run()
+        await self._settle()
+
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertIn(("c1", None), self.bridge.mm.typing)
+        self.assertEqual(self.bridge.active_run_by_session.get("ses_x"), "run-1")
+
+    async def test_watchdog_keeps_typing_while_run_alive(self):
+        """RED on pre-fix code: 15s of event silence stopped typing even
+        though the run was mid-tool-call. Now the watchdog asks the harness
+        for the Run row and keeps typing while it is queued/running."""
+        await self._start_run()
+        await self._settle()
+        self.bridge.harness.runs_meta[("ses_x", "run-1")] = {
+            "id": "run-1", "status": "running",
+        }
+        self._silence()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+        # The successful probe counts as activity, so the next reconcile
+        # only happens after another full silence window.
+        self.assertGreater(
+            self.bridge.last_activity_ts["ses_x"], time.monotonic() - 5.0,
+        )
+
+    async def test_quiet_flip_ignored_while_run_active(self):
+        """RED on pre-fix code: the observer's freshness-based idle-flip
+        (rollout-file silence during a long tool call) stopped typing
+        mid-run. With a run active, the flip is noise — ignore it."""
+        await self._start_run()
+        await self._settle()
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_x",
+                      "session": {"id": "ses_x", "status": "idle"}}},
+        )
+        await self._settle()
+
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+
+    async def test_watchdog_stops_typing_on_missed_terminal_event(self):
+        """Missed-terminal-event recovery: run tracked as active but the
+        harness says it completed → stop typing and clear all tracking."""
+        await self._start_run()
+        await self._settle()
+        self.bridge.harness.runs_meta[("ses_x", "run-1")] = {
+            "id": "run-1", "status": "completed",
+        }
+        self._silence()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertNotIn("ses_x", self.bridge.active_run_by_session)
+        self.assertNotIn("ses_x", self.bridge.last_activity_ts)
+
+    async def test_watchdog_stops_typing_when_run_unknown(self):
+        """get_run → None (404): can't confirm liveness → stop (conservative)."""
+        await self._start_run()
+        await self._settle()
+        self._silence()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertNotIn("ses_x", self.bridge.active_run_by_session)
+
+    async def test_watchdog_stops_typing_when_harness_probe_raises(self):
+        """A dead harness must not leave typing stuck ON: any probe error
+        counts as NOT alive."""
+        await self._start_run()
+        await self._settle()
+        self.bridge.harness.run_probe_error = RuntimeError("harness down")
+        self._silence()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertNotIn("ses_x", self.bridge.active_run_by_session)
+
+    async def test_watchdog_run_id_missing_falls_back_to_runs_list(self):
+        """run.started without a run_id: reconcile via the session's runs
+        list — ANY queued/running row keeps typing alive."""
+        await self._start_run(run_id=None)
+        await self._settle()
+        self.bridge.harness.session_runs_meta["ses_x"] = [
+            {"id": "r1", "status": "completed"},
+            {"id": "r2", "status": "running"},
+        ]
+        self._silence()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+
+    async def test_watchdog_run_id_missing_all_runs_terminal_stops(self):
+        await self._start_run(run_id=None)
+        await self._settle()
+        self.bridge.harness.session_runs_meta["ses_x"] = [
+            {"id": "r1", "status": "failed"},
+        ]
+        self._silence()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertNotIn("ses_x", self.bridge.active_run_by_session)
+
+    async def test_terminal_run_event_stops_typing_and_clears_active_run(self):
+        """Regression guard: the normal terminal event still does the
+        cleanup, now including the active-run entry."""
+        await self._start_run()
+        await self._settle()
+
+        await self.bridge._on_harness_event(
+            "run.completed",
+            {"session_id": "ses_x", "run_id": "run-1", "data": {}},
+        )
+        await self._settle()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertNotIn("ses_x", self.bridge.active_run_by_session)
+
+    async def test_watchdog_silence_without_active_run_stops_typing(self):
+        """Regression guard (external sessions): no tracked run → silence
+        still stops typing, no harness probe involved."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+        await self.bridge._on_harness_event(
+            "message",
+            {"data": {"session_id": "ses_x",
+                      "message": {"role": "assistant", "content": "hi"}}},
+        )
+        await self._settle()
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+        self._silence()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+        self.assertNotIn("ses_x", self.bridge.last_activity_ts)
+
+    async def test_watchdog_leaves_recently_active_sessions_alone(self):
+        """Within the silence window nothing is stopped or probed."""
+        await self._start_run()
+        await self._settle()
+
+        await self.bridge._typing_watchdog_tick()
+
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+
+    async def test_watchdog_loop_runs_ticks(self):
+        """Wiring guard: the long-lived watchdog task actually executes
+        ticks (silent no-run session gets stopped by the loop itself)."""
+        self.bridge.mapping.link(Anchor("c1"), "ses_x")
+        self.bridge._known_sessions.add("ses_x")
+        await self.bridge._on_harness_event(
+            "message",
+            {"data": {"session_id": "ses_x",
+                      "message": {"role": "assistant", "content": "hi"}}},
+        )
+        await self._settle()
+        self.assertIn("ses_x", self.bridge.typing.running_sessions())
+        self._silence()
+        self.bridge.config.typing_refresh_seconds = 0.01
+
+        task = asyncio.create_task(self.bridge._run_typing_watchdog())
+        try:
+            await asyncio.sleep(0.1)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
 
 
 if __name__ == "__main__":
