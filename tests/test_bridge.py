@@ -37,6 +37,7 @@ class FakeMattermostClient:
     deletes: list[tuple[str, bool]] = field(default_factory=list)  # (post_id, permanent)
     renames: list[tuple[str, str]] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    invited: list[tuple[str, str]] = field(default_factory=list)
     typing: list[tuple[str, str | None]] = field(default_factory=list)
     uploaded: list[tuple[str, str]] = field(default_factory=list)
     headers: list[tuple[str, str]] = field(default_factory=list)
@@ -124,6 +125,10 @@ class FakeMattermostClient:
 
     def remove_self_from_channel(self, channel_id: str) -> None:
         self.removed.append(channel_id)
+
+    def invite_user(self, channel_id: str, user_id: str) -> dict:
+        self.invited.append((channel_id, user_id))
+        return {"channel_id": channel_id, "user_id": user_id}
 
     def get_user(self, user_id: str) -> dict:
         return self.users.get(user_id, {"id": user_id, "username": f"u-{user_id[:4]}"})
@@ -2307,6 +2312,168 @@ class CommandPhase2Tests(_BridgeTestCase):
 
         joined = "\n".join(self._posted_texts()).lower()
         self.assertIn("no runs", joined)
+
+
+class CommandPhase3Tests(_BridgeTestCase):
+    """`.sessions`, `.invite` — phase 3 (channel creation + invite)."""
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    # ----- .sessions -----
+
+    async def test_dot_sessions_lists_mapped_and_external(self):
+        self.bridge.mapping.link(Anchor("c-mapped"), "s-mapped")
+        self.bridge.mm.channels["c-mapped"] = {
+            "id": "c-mapped", "display_name": "Mapped One",
+        }
+        self.bridge.harness.sessions_meta = [
+            {"id": "s-mapped", "backend": "claude", "title": "Mapped One",
+             "project": {"path": "/a", "name": "a"}, "origin": "harness",
+             "updated_at": "2026-07-01T10:00:00Z"},
+            {"id": "codex_ext", "backend": "codex", "title": None,
+             "project": {"path": "/work/proj", "name": "proj"},
+             "origin": "external", "updated_at": "2026-07-05T10:00:00Z"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".sessions",
+            "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        # External row is discoverable and carries an invite hint.
+        self.assertIn("codex_ext", joined)
+        self.assertIn(".invite codex_ext", joined)
+        # External label falls back to project name (its title is null).
+        self.assertIn("proj", joined)
+        # Mapped row points at its channel, not an invite hint.
+        self.assertIn("Mapped One", joined)
+
+    async def test_dot_sessions_sorts_by_updated_at_desc(self):
+        self.bridge.harness.sessions_meta = [
+            {"id": "old", "backend": "claude", "title": "Old",
+             "project": {"path": "/o", "name": "o"}, "origin": "harness",
+             "updated_at": "2026-06-01T00:00:00Z"},
+            {"id": "new", "backend": "claude", "title": "New",
+             "project": {"path": "/n", "name": "n"}, "origin": "harness",
+             "updated_at": "2026-07-06T00:00:00Z"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".sessions", "user_id": "u1", "type": "",
+        })
+
+        body = self._posted_texts()[-1]
+        self.assertLess(body.index("New"), body.index("Old"))
+
+    async def test_dot_sessions_respects_n_and_filters_suppressed(self):
+        self.bridge.harness.sessions_meta = [
+            {"id": f"s{i}", "backend": "claude", "title": f"S{i}",
+             "project": {"path": "/x", "name": "x"}, "origin": "harness",
+             "updated_at": f"2026-07-0{i}T00:00:00Z"}
+            for i in range(1, 6)
+        ] + [
+            {"id": "claude_agent-hidden", "backend": "claude", "title": "Hidden",
+             "project": {"path": "/x", "name": "x"}, "origin": "harness",
+             "updated_at": "2026-07-09T00:00:00Z"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".sessions 2", "user_id": "u1", "type": "",
+        })
+
+        body = self._posted_texts()[-1]
+        # Suppressed agent session never shown.
+        self.assertNotIn("Hidden", body)
+        # Only 2 rows (the two most recent non-suppressed: S5, S4).
+        self.assertIn("S5", body)
+        self.assertIn("S4", body)
+        self.assertNotIn("S3", body)
+
+    async def test_dot_sessions_harness_unreachable(self):
+        async def boom():
+            raise RuntimeError("down")
+        self.bridge.harness.list_sessions = boom
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".sessions", "user_id": "u1", "type": "",
+        })
+
+        self.assertIn("unreachable", "\n".join(self._posted_texts()).lower())
+
+    # ----- .invite -----
+
+    async def test_dot_invite_mapped_session_invites_requester(self):
+        self.bridge.mapping.link(Anchor("c-target"), "s-target")
+        self.bridge.mm.channels["c-target"] = {
+            "id": "c-target", "display_name": "Target",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".invite s-target",
+            "user_id": "u42", "type": "",
+        })
+
+        self.assertEqual(self.bridge.mm.invited, [("c-target", "u42")])
+
+    async def test_dot_invite_unmapped_external_creates_channel_and_warns(self):
+        self.bridge.harness.sessions_meta = [{
+            "id": "codex_ext", "backend": "codex", "title": "Ext",
+            "project": {"path": "/work/proj", "name": "proj"},
+            "origin": "external",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".invite codex_ext",
+            "user_id": "u7", "type": "",
+        })
+
+        # A channel was created and mapped to the session.
+        anchor = self.bridge.mapping.get_anchor("codex_ext")
+        self.assertIsNotNone(anchor)
+        # The requester was invited to it.
+        self.assertEqual(self.bridge.mm.invited[-1][1], "u7")
+        self.assertEqual(self.bridge.mm.invited[-1][0], anchor.channel_id)
+        # A resume-fork warning was posted into the new channel.
+        warned = [
+            p for p in self.bridge.mm.posted
+            if p.channel_id == anchor.channel_id and "fork" in p.message.lower()
+        ]
+        self.assertTrue(warned)
+
+    async def test_dot_invite_pi_external_is_rejected(self):
+        self.bridge.harness.sessions_meta = [{
+            "id": "pi_ext", "backend": "pi", "title": "PiExt",
+            "project": {"path": "/p", "name": "p"}, "origin": "external",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".invite pi_ext",
+            "user_id": "u1", "type": "",
+        })
+
+        # No channel created, no invite.
+        self.assertIsNone(self.bridge.mapping.get_anchor("pi_ext"))
+        self.assertEqual(self.bridge.mm.invited, [])
+        self.assertIn("can't be resumed", "\n".join(self._posted_texts()).lower())
+
+    async def test_dot_invite_unknown_session_errors(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".invite nope",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.mm.invited, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("no session", joined)
+
+    async def test_dot_invite_without_arg_shows_usage(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".invite", "user_id": "u1", "type": "",
+        })
+
+        self.assertIn("Usage", "\n".join(self._posted_texts()))
 
 
 class FirstMessageConfigTests(_BridgeTestCase):

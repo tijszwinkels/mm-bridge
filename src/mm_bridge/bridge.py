@@ -198,6 +198,25 @@ def _is_suppressed_session(session_id: str) -> bool:
     return any(session_id.startswith(p) for p in SUPPRESSED_SESSION_PREFIXES)
 
 
+# `.sessions` list sizing (client-side — the harness endpoint has no limit).
+_SESSIONS_DEFAULT_N = 15
+_SESSIONS_MAX_N = 50
+
+
+def _parse_count_arg(arg: str | None, *, default: int, maximum: int) -> int:
+    """Parse an optional integer command argument, clamped to [1, maximum].
+
+    Non-integer or absent args fall back to ``default``.
+    """
+    if not arg:
+        return default
+    try:
+        n = int(arg.strip())
+    except ValueError:
+        return default
+    return max(1, min(n, maximum))
+
+
 def _session_to_channel_name(session_id: str) -> str:
     """Derive a stable, collision-resistant MM channel slug.
 
@@ -2307,6 +2326,10 @@ class Bridge:
             await self._cmd_models(channel_id, session_id, thread_root)
         elif spec.name == "running":
             await self._cmd_running(channel_id, thread_root)
+        elif spec.name == "sessions":
+            await self._cmd_sessions(channel_id, parsed.arg, thread_root)
+        elif spec.name == "invite":
+            await self._cmd_invite(channel_id, post, parsed.arg, thread_root)
         else:  # registered but not wired — defensive, shouldn't happen
             self._post_cmd_reply(
                 channel_id,
@@ -2566,6 +2589,173 @@ class Bridge:
         """`" → ~channel~"` when mapped, else a not-on-Mattermost note."""
         name = self._channel_name_for_session(session_id)
         return f" → ~{name}~" if name else " · not on Mattermost"
+
+    async def _cmd_sessions(
+        self, channel_id: str, arg: str | None, thread_root: str | None,
+    ) -> None:
+        """`.sessions [N]` — the N most recent sessions across the harness,
+        including terminal TUI sessions (``origin:"external"`` rows the
+        transcript observer discovers). Sorted client-side by ``updated_at``.
+        """
+        n = _parse_count_arg(
+            arg, default=_SESSIONS_DEFAULT_N, maximum=_SESSIONS_MAX_N,
+        )
+        try:
+            sessions = await self.harness.list_sessions()
+        except Exception:
+            logger.debug("`.sessions` list_sessions failed", exc_info=True)
+            self._post_cmd_reply(
+                channel_id, ":warning: harness unreachable.", thread_root,
+            )
+            return
+        rows = [
+            s for s in (sessions or [])
+            if not _is_suppressed_session(s.get("id") or "")
+        ]
+        # The endpoint returns everything in insertion order with no limit —
+        # sort newest-first (ISO8601 strings sort lexically) and truncate.
+        rows.sort(
+            key=lambda s: s.get("updated_at") or s.get("created_at") or "",
+            reverse=True,
+        )
+        rows = rows[:n]
+        if not rows:
+            self._post_cmd_reply(
+                channel_id, ":information_source: No sessions found.", thread_root,
+            )
+            return
+        lines = [f"**Recent sessions** (top {len(rows)}):"]
+        for s in rows:
+            sid = s.get("id") or "?"
+            label = self._session_label(s, sid)
+            backend = s.get("backend") or "?"
+            name = self._channel_name_for_session(sid)
+            hint = (
+                f" → ~{name}~" if name
+                else f" · not on Mattermost — `.invite {sid}`"
+            )
+            lines.append(f"• {label} · `{backend}`{hint}")
+        self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
+
+    async def _cmd_invite(
+        self,
+        channel_id: str,
+        post: dict,
+        arg: str | None,
+        thread_root: str | None,
+    ) -> None:
+        """`.invite <session-id>` — get the requester into the session's MM
+        channel, creating it for unmapped/external sessions first.
+        """
+        session_id = (arg or "").strip()
+        if not session_id:
+            self._post_cmd_reply(
+                channel_id, ":grey_question: Usage: `.invite <session-id>`",
+                thread_root,
+            )
+            return
+        user_id = post.get("user_id") or ""
+
+        # Already mapped → just add the requester to its channel.
+        anchor = self.mapping.get_anchor(session_id)
+        if anchor:
+            await self._invite_requester(
+                anchor.channel_id, user_id, session_id, channel_id, thread_root,
+            )
+            return
+
+        # Unmapped — look the session up so we can create a channel for it.
+        try:
+            meta = await self.harness.get_session(session_id)
+        except Exception:
+            logger.debug("`.invite` get_session failed", exc_info=True)
+            self._post_cmd_reply(
+                channel_id, ":warning: harness unreachable.", thread_root,
+            )
+            return
+        if not meta:
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: No session `{session_id}` — check `.sessions`.",
+                thread_root,
+            )
+            return
+
+        # External pi sessions aren't resumable (harness 409), so a channel
+        # would be a dead end — reject up front.
+        backend = purpose.canonical_backend(meta.get("backend"))
+        if meta.get("origin") == "external" and backend == "pi":
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Session `{session_id[:12]}` is an external `pi` "
+                "session — it can't be resumed from Mattermost.",
+                thread_root,
+            )
+            return
+
+        new_channel_id = await self._create_channel_for_session(meta)
+        if not new_channel_id:
+            self._post_cmd_reply(
+                channel_id,
+                ":warning: Couldn't create a channel for that session.",
+                thread_root,
+            )
+            return
+
+        # Resuming a still-open TUI session forks it — the MM channel becomes
+        # a parallel branch, not a remote control of the live terminal.
+        if meta.get("origin") == "external":
+            try:
+                self.mm.post(
+                    new_channel_id,
+                    ":information_source: _Heads-up: posting here resumes this "
+                    "session via `--resume`. If it's still open in a terminal, "
+                    "this channel becomes a **fork** of the conversation, not a "
+                    "remote control of the live TUI._",
+                )
+            except Exception:
+                logger.debug("failed posting resume-fork warning", exc_info=True)
+
+        await self._invite_requester(
+            new_channel_id, user_id, session_id, channel_id, thread_root,
+        )
+
+    async def _invite_requester(
+        self,
+        target_channel_id: str,
+        user_id: str,
+        session_id: str,
+        reply_channel_id: str,
+        thread_root: str | None,
+    ) -> None:
+        """Add ``user_id`` to ``target_channel_id`` and confirm in the channel
+        the command was issued from."""
+        if not user_id:
+            self._post_cmd_reply(
+                reply_channel_id,
+                ":warning: Couldn't tell who to invite.",
+                thread_root,
+            )
+            return
+        try:
+            self.mm.invite_user(target_channel_id, user_id)
+        except Exception:
+            logger.exception(
+                "Failed to invite %s to channel %s", user_id, target_channel_id,
+            )
+            self._post_cmd_reply(
+                reply_channel_id,
+                ":warning: Failed to invite you to the channel.",
+                thread_root,
+            )
+            return
+        name = self._channel_name_for_session(session_id) or target_channel_id
+        self._post_cmd_reply(
+            reply_channel_id,
+            f":white_check_mark: Invited you to ~{name}~ "
+            f"for session `{session_id[:12]}`.",
+            thread_root,
+        )
 
     async def _run_stop_command(
         self,

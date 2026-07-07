@@ -83,6 +83,14 @@ _SPECS: tuple[CommandSpec, ...] = (
         "running", ".running",
         "List sessions with a run in flight right now.",
     ),
+    CommandSpec(
+        "sessions", ".sessions [N]",
+        "List recent sessions across all agents (incl. terminal ones).",
+    ),
+    CommandSpec(
+        "invite", ".invite <session-id>",
+        "Get invited to a session's Mattermost channel (creating it if needed).",
+    ),
 )
 
 REGISTRY: dict[str, CommandSpec] = {s.name: s for s in _SPECS}
