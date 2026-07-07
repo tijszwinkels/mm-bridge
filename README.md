@@ -67,6 +67,13 @@ default_autorespond = false
 # honoured — it maps onto `claude`.)
 default_models = { claude = "opus", codex = "gpt-5.5" }
 
+# Optional per-backend model catalog surfaced by the in-channel `.models`
+# command. The agent-harness `/v1/backends/{b}/models` endpoint returns []
+# for every backend today, so this operator-maintained list is the source
+# `.models` shows (merged with the harness catalog once it's populated).
+# `.model <name>` accepts any free-text name regardless of this list.
+models = { claude = ["opus", "sonnet", "haiku"], codex = ["gpt-5.5", "gpt-5.4-mini"] }
+
 # Coalesce Claude's tool-use events into one per-turn placeholder post
 # (edited as more tools run, left as a compact summary when the turn
 # ends). Set false to hide them entirely — channels then carry only
@@ -157,6 +164,28 @@ Creates a fresh sibling channel with its own agent-harness session and kicks off
 - `--no-forward-prompt` — don't post the kickoff message in the parent channel.
 
 The parent channel gets a `:thread: Spawned **Title** in ~slug~` announcement (threaded under the originating thread when spawning from a thread-fork). The new channel's header is set to `Parent: ~parent-slug~`, with a `[thread](permalink)` suffix when spawned from a thread-fork.
+
+## In-channel dot-commands
+
+Type these in any bridged channel (or thread) — the **bridge** handles them
+itself. They work with or without an `@claude` mention, bypass the
+mention-only gate, and are never forwarded to the agent. An unknown `.word`
+gets an "unknown command — try `.help`" reply rather than reaching the agent.
+
+| Command | What it does |
+|---|---|
+| `.help` | List these commands. |
+| `.stop` | Interrupt the running turn in this channel. |
+| `.autorespond [on\|off]` | Reply to every message, or only when @mentioned (bare = toggle). Persisted in the Channel Purpose. |
+| `.status` | Session id, backend, model, cwd, autorespond flag, run state, harness status. |
+| `.model [<name>]` | Show the current model, or switch it. Names are free text — a bad one fails loudly with the backend error. Switching recreates the session, so `.stop` any active run first. |
+| `.models` | List the available models for this channel's backend (from the `[models]` config table + the harness catalog), marking the current one. |
+| `.running` | Sessions with a run in flight right now. |
+| `.sessions [N]` | The N most recent sessions across all agents — including terminal (TUI) sessions not yet on Mattermost. Each shows its channel or an `.invite` hint. |
+| `.invite <session-id>` | Get added to a session's Mattermost channel, creating it first for unmapped/terminal sessions. Posting into a resumed terminal session **forks** it (see the channel's bootstrap note). |
+
+Session-scoped commands (`.stop`, `.status`, `.model`) reply "No session in
+this channel" when the channel has none; the rest work regardless.
 
 ## Inside-a-session directives
 
