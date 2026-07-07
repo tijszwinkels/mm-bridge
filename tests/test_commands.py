@@ -1,0 +1,151 @@
+"""Unit tests for mm_bridge.commands — the pure dot-command parser/registry.
+
+Mirrors the pure-unit-test style of tests/test_purpose.py: no I/O, no bridge.
+
+Spec: implementation plan (ig ...135aeb87), "Parser rules".
+"""
+
+from __future__ import annotations
+
+from mm_bridge.commands import (
+    REGISTRY,
+    CommandSpec,
+    ParsedCommand,
+    help_text,
+    parse,
+)
+
+
+# ---------------------------------------------------------------------------
+# Non-commands → None (forwarded to the agent)
+# ---------------------------------------------------------------------------
+
+
+def test_plain_message_is_not_a_command():
+    assert parse("hello there") is None
+
+
+def test_message_with_leading_dot_word_inside_is_not_a_command():
+    # The dot must lead the (mention-stripped) message.
+    assert parse("update the .gitignore please") is None
+
+
+def test_bare_dot_is_not_a_command():
+    assert parse(".") is None
+
+
+def test_dot_space_is_not_a_command():
+    assert parse(". hello") is None
+
+
+def test_natural_language_stop_is_not_a_dot_command():
+    # Existing natural-language commands keep flowing through untouched.
+    assert parse("stop") is None
+    assert parse("@claude catch up") is None
+    assert parse("autorespond") is None
+
+
+# ---------------------------------------------------------------------------
+# Known commands
+# ---------------------------------------------------------------------------
+
+
+def test_known_command_parses():
+    cmd = parse(".stop")
+    assert isinstance(cmd, ParsedCommand)
+    assert cmd.name == "stop"
+    assert cmd.arg is None
+    assert cmd.spec is REGISTRY["stop"]
+    assert cmd.known is True
+
+
+def test_command_is_case_insensitive():
+    cmd = parse(".HELP")
+    assert cmd.name == "help"
+    assert cmd.spec is REGISTRY["help"]
+
+
+def test_command_with_arg():
+    cmd = parse(".autorespond on")
+    assert cmd.name == "autorespond"
+    assert cmd.arg == "on"
+
+
+def test_command_arg_preserves_case_and_inner_spaces():
+    cmd = parse(".status  Some Thing ")
+    assert cmd.name == "status"
+    assert cmd.arg == "Some Thing"
+
+
+def test_trailing_whitespace_after_bare_command_yields_no_arg():
+    cmd = parse(".stop   ")
+    assert cmd.name == "stop"
+    assert cmd.arg is None
+
+
+# ---------------------------------------------------------------------------
+# Unknown dot-words → intercepted (spec is None), never forwarded
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_dot_word_is_a_command_with_no_spec():
+    cmd = parse(".frobnicate now")
+    assert isinstance(cmd, ParsedCommand)
+    assert cmd.name == "frobnicate"
+    assert cmd.arg == "now"
+    assert cmd.spec is None
+    assert cmd.known is False
+
+
+# ---------------------------------------------------------------------------
+# Mention stripping
+# ---------------------------------------------------------------------------
+
+
+def test_leading_claude_mention_is_stripped():
+    cmd = parse("@claude .stop")
+    assert cmd is not None
+    assert cmd.name == "stop"
+
+
+def test_leading_claude_mention_stripped_case_insensitively():
+    cmd = parse("@Claude   .status")
+    assert cmd is not None
+    assert cmd.name == "status"
+
+
+def test_configured_bot_mention_is_stripped():
+    cmd = parse("@mybot .help", mentions=("mybot",))
+    assert cmd is not None
+    assert cmd.name == "help"
+
+
+def test_foreign_mention_is_not_stripped_so_not_a_command():
+    # A mention that isn't ours leaves the text starting with '@', not '.'.
+    assert parse("@someoneelse .stop") is None
+
+
+# ---------------------------------------------------------------------------
+# Registry + help
+# ---------------------------------------------------------------------------
+
+
+def test_registry_entries_are_command_specs():
+    assert REGISTRY
+    for name, spec in REGISTRY.items():
+        assert isinstance(spec, CommandSpec)
+        assert spec.name == name
+        assert spec.usage.startswith(".")
+        assert spec.summary
+
+
+def test_help_lists_every_registered_command():
+    text = help_text()
+    for spec in REGISTRY.values():
+        assert spec.usage in text
+        assert spec.summary in text
+
+
+def test_pr1_commands_are_registered():
+    for name in ("help", "stop", "autorespond", "status"):
+        assert name in REGISTRY
