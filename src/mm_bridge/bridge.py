@@ -2301,6 +2301,12 @@ class Bridge:
             await self._cmd_autorespond(channel_id, parsed.arg, thread_root)
         elif spec.name == "status":
             await self._cmd_status(channel_id, session_id, thread_root)
+        elif spec.name == "model":
+            await self._cmd_model(channel_id, session_id, parsed.arg, thread_root)
+        elif spec.name == "models":
+            await self._cmd_models(channel_id, session_id, thread_root)
+        elif spec.name == "running":
+            await self._cmd_running(channel_id, thread_root)
         else:  # registered but not wired — defensive, shouldn't happen
             self._post_cmd_reply(
                 channel_id,
@@ -2381,6 +2387,185 @@ class Bridge:
         if hstatus:
             lines.append(f"• harness session: `{hstatus}`")
         self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
+
+    def _session_has_active_run(self, session_id: str) -> bool:
+        """True if a run is in flight for ``session_id`` (bridge-tracked)."""
+        return (
+            session_id in self.active_run_by_session
+            or bool(self.current_run_id_by_session.get(session_id))
+        )
+
+    async def _cmd_model(
+        self,
+        channel_id: str,
+        session_id: str,
+        arg: str | None,
+        thread_root: str | None,
+    ) -> None:
+        """`.model [<name>]` — show the current model, or switch it.
+
+        Names are free text (no catalog validation): a bad one fails loudly
+        with the backend error when the restarted session's first run runs.
+        Switching recreates the session (the harness has no model-mutate
+        endpoint), so it's refused while a run is active.
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        try:
+            meta = await self.harness.get_session(session_id) or {}
+        except Exception:
+            logger.debug("`.model` harness get_session failed", exc_info=True)
+            meta = {}
+        backend = purpose.canonical_backend(
+            meta.get("backend") or (cfg.backend if cfg else None)
+        ) or self.config.default_backend
+
+        # Bare `.model` → report the current model + hint `.models`.
+        if not arg:
+            model = (
+                meta.get("model")
+                or (cfg.model if cfg else None)
+                or self.config.default_model_for(backend)
+                or "default"
+            )
+            self._post_cmd_reply(
+                channel_id,
+                f":robot_face: Current model: `{model}` (backend `{backend}`). "
+                f"Switch with `.model <name>`; see options with `.models`.",
+                thread_root,
+            )
+            return
+
+        # Switching mid-run would orphan the active run — refuse.
+        if self._session_has_active_run(session_id):
+            self._post_cmd_reply(
+                channel_id,
+                ":warning: A run is active — `.stop` it first, then `.model <name>`.",
+                thread_root,
+            )
+            return
+
+        base = cfg or purpose.PurposeConfig(
+            backend=backend,
+            model=None,
+            mention_only=not self.config.default_autorespond,
+        )
+        new_cfg = purpose.PurposeConfig(
+            backend=base.backend,
+            model=arg,
+            mention_only=base.mention_only,
+            cwd=base.cwd,
+            warnings=[],
+        )
+        await self._restart_session_with_config(channel_id, session_id, new_cfg)
+        self._persist_purpose(channel_id, new_cfg)
+        self._post_cmd_reply(
+            channel_id,
+            f":gear: Model set to `{arg}` — session restarted. "
+            "If the backend rejects it, the error will appear above.",
+            thread_root,
+        )
+
+    async def _cmd_models(
+        self, channel_id: str, session_id: str | None, thread_root: str | None,
+    ) -> None:
+        """`.models` — list this channel's backend's models, marking the
+        current one. Merges the operator `[models]` catalog with the harness
+        catalog (empty today). Works without a session (uses default backend).
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        backend = cfg.backend if cfg else None
+        current_model = cfg.model if cfg else None
+        if session_id:
+            try:
+                meta = await self.harness.get_session(session_id) or {}
+            except Exception:
+                logger.debug("`.models` harness get_session failed", exc_info=True)
+                meta = {}
+            backend = meta.get("backend") or backend
+            current_model = meta.get("model") or current_model
+        backend = purpose.canonical_backend(backend) or self.config.default_backend
+
+        configured = self.config.configured_models_for(backend)
+        try:
+            catalog = await self.harness.list_backend_models(backend)
+        except Exception:
+            logger.debug("`.models` list_backend_models failed", exc_info=True)
+            catalog = []
+        # Dedup preserving order: configured first, then harness extras.
+        models = list(dict.fromkeys([*configured, *(catalog or [])]))
+
+        if not models:
+            self._post_cmd_reply(
+                channel_id,
+                f":information_source: No models listed for `{backend}`. "
+                "You can still switch to any name with `.model <name>` — "
+                "a bad one fails loudly.",
+                thread_root,
+            )
+            return
+
+        lines = [f"**Models for `{backend}`:**"]
+        for m in models:
+            mark = (
+                "  ← current"
+                if current_model and m.lower() == current_model.lower()
+                else ""
+            )
+            lines.append(f"• `{m}`{mark}")
+        self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
+
+    async def _cmd_running(
+        self, channel_id: str, thread_root: str | None,
+    ) -> None:
+        """`.running` — sessions with a run in flight right now.
+
+        Uses the bridge's in-memory ``active_run_by_session`` (populated from
+        SSE ``run.started`` → terminal, origin-agnostic — so it covers runs
+        the bridge didn't submit too).
+        """
+        active = [
+            sid for sid in self.active_run_by_session
+            if not _is_suppressed_session(sid)
+        ]
+        if not active:
+            self._post_cmd_reply(
+                channel_id, ":zzz: No runs are active right now.", thread_root,
+            )
+            return
+        lines = ["**Running now:**"]
+        for sid in active:
+            try:
+                meta = await self.harness.get_session(sid) or {}
+            except Exception:
+                meta = {}
+            label = self._session_label(meta, sid)
+            backend = meta.get("backend") or "?"
+            lines.append(f"• {label} · `{backend}`{self._channel_suffix(sid)}")
+        self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
+
+    def _session_label(self, meta: dict, session_id: str) -> str:
+        """A human label for a session row: title/project name + short id."""
+        title = meta.get("title") or (meta.get("project") or {}).get("name")
+        if title:
+            return f"{title} (`{session_id[:8]}`)"
+        return f"`{session_id[:12]}`"
+
+    def _channel_name_for_session(self, session_id: str) -> str | None:
+        """Display name of the MM channel mapped to ``session_id``, or None."""
+        anchor = self.mapping.get_anchor(session_id)
+        if not anchor:
+            return None
+        try:
+            ch = self.mm.get_channel(anchor.channel_id)
+        except Exception:
+            ch = None
+        ch = ch or {}
+        return ch.get("display_name") or ch.get("name") or anchor.channel_id
+
+    def _channel_suffix(self, session_id: str) -> str:
+        """`" → ~channel~"` when mapped, else a not-on-Mattermost note."""
+        name = self._channel_name_for_session(session_id)
+        return f" → ~{name}~" if name else " · not on Mattermost"
 
     async def _run_stop_command(
         self,

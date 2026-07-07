@@ -11,11 +11,32 @@ from mm_bridge.purpose import (
     KNOWN_BACKENDS,
     PurposeConfig,
     SECTION_SEPARATOR,
+    canonical_backend,
     join_sections,
     parse,
     split_config_section,
     to_purpose_string,
 )
+
+
+# ---------------------------------------------------------------------------
+# canonical_backend
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_backend_maps_wire_aliases():
+    assert canonical_backend("claude-code") == "claude"
+    assert canonical_backend("claudecode") == "claude"
+
+
+def test_canonical_backend_lowercases_and_passes_through_known():
+    assert canonical_backend("CODEX") == "codex"
+    assert canonical_backend("claude") == "claude"
+
+
+def test_canonical_backend_none_and_empty():
+    assert canonical_backend(None) is None
+    assert canonical_backend("") == ""
 
 
 # A fixed model catalogue used by most tests — mirrors what VibeDeck would return.

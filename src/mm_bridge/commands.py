@@ -70,6 +70,19 @@ _SPECS: tuple[CommandSpec, ...] = (
         "status", ".status", "Show the session, model and run status here.",
         session_scoped=True,
     ),
+    CommandSpec(
+        "model", ".model [<name>]",
+        "Show the current model, or switch it (`.stop` any active run first).",
+        session_scoped=True,
+    ),
+    CommandSpec(
+        "models", ".models",
+        "List the available models for this channel's backend.",
+    ),
+    CommandSpec(
+        "running", ".running",
+        "List sessions with a run in flight right now.",
+    ),
 )
 
 REGISTRY: dict[str, CommandSpec] = {s.name: s for s in _SPECS}

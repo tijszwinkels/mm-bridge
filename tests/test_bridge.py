@@ -2148,6 +2148,167 @@ class CommandTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
 
 
+class CommandPhase2Tests(_BridgeTestCase):
+    """`.model`, `.models`, `.running` — phase 2 of the dot-command set."""
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    # ----- .model <name> (free text → session restart) -----
+
+    async def test_dot_model_switches_via_session_restart(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        # A new session was created with the requested (free-text) model.
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "claude-sonnet")
+        # Backend kept; model persisted to Channel Purpose.
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "claude")
+        self.assertIn("claude-sonnet", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_dot_model_refuses_while_run_active(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        # No restart happened.
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("run is active", joined)
+
+    async def test_bare_model_shows_current_and_hints_models(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("opus", joined)
+        self.assertIn(".models", joined)
+
+    # ----- .models (list, mark current) -----
+
+    async def test_dot_models_lists_configured_and_marks_current(self):
+        self.bridge.config.models = {"claude": ["opus", "sonnet", "haiku"]}
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "sonnet",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".models", "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("opus", joined)
+        self.assertIn("sonnet", joined)
+        self.assertIn("haiku", joined)
+        # Current model flagged.
+        self.assertRegex(joined, r"sonnet.*current")
+
+    async def test_dot_models_merges_harness_catalog(self):
+        # No config list; harness enumerates two models.
+        self.bridge.config.models = {}
+        self.bridge.harness.models_by_backend = {"claude": ["opus", "sonnet"]}
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": "/x", "name": "x"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".models", "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("opus", joined)
+        self.assertIn("sonnet", joined)
+
+    async def test_dot_models_empty_explains_free_text_still_works(self):
+        self.bridge.config.models = {}
+        self.bridge.harness.models_by_backend = {"claude": []}
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": None,
+            "project": {"path": "/x", "name": "x"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".models", "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertIn(".model", joined)
+
+    async def test_dot_models_works_without_session_using_default_backend(self):
+        self.bridge.config.models = {"claude": ["opus", "sonnet"]}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": ".models",
+            "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("opus", joined)
+
+    # ----- .running -----
+
+    async def test_dot_running_lists_active_sessions(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mapping.link(Anchor("c2"), "s2")
+        self.bridge.harness.sessions_meta = [
+            {"id": "s1", "backend": "claude", "title": "Alpha",
+             "project": {"path": "/a", "name": "a"}, "origin": "harness"},
+            {"id": "s2", "backend": "codex", "title": "Beta",
+             "project": {"path": "/b", "name": "b"}, "origin": "harness"},
+        ]
+        # Only s1 has an in-flight run.
+        self.bridge.active_run_by_session["s1"] = "run-1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".running", "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("Alpha", joined)
+        self.assertNotIn("Beta", joined)
+
+    async def test_dot_running_none_active(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".running", "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("no runs", joined)
+
+
 class FirstMessageConfigTests(_BridgeTestCase):
     """First user message after invite may re-configure the channel via tokens.
 

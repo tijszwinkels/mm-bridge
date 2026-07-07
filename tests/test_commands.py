@@ -149,3 +149,20 @@ def test_help_lists_every_registered_command():
 def test_pr1_commands_are_registered():
     for name in ("help", "stop", "autorespond", "status"):
         assert name in REGISTRY
+
+
+def test_phase2_commands_are_registered():
+    for name in ("model", "models", "running"):
+        assert name in REGISTRY
+
+
+def test_model_command_captures_free_text_arg():
+    cmd = parse(".model claude-sonnet-thinking")
+    assert cmd.name == "model"
+    assert cmd.arg == "claude-sonnet-thinking"
+
+
+def test_bare_model_has_no_arg():
+    cmd = parse(".model")
+    assert cmd.name == "model"
+    assert cmd.arg is None

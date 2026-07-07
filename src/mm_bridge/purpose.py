@@ -58,6 +58,19 @@ class PurposeConfig:
     warnings: list[str] = field(default_factory=list)
 
 
+def canonical_backend(name: str | None) -> str | None:
+    """Canonicalise a backend name: lowercase + resolve wire aliases.
+
+    ``"claude-code"`` / ``"claudecode"`` → ``"claude"``. Returns the input
+    unchanged when it's falsy (None / empty). Unknown names pass through
+    lowercased so callers can still use them (free-text tolerance).
+    """
+    if not name:
+        return name
+    lc = name.lower()
+    return _BACKEND_ALIASES.get(lc, lc)
+
+
 def split_config_section(text: str) -> tuple[str, str]:
     """Return ``(config, rest)`` split on the first standalone separator line.
 
