@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import attribution, directives, name_sync, purpose, resume_header
+from . import attribution, commands, directives, name_sync, purpose, resume_header
 from .agent_harness_client import (
     AgentHarnessClient,
     HarnessForkUnsupported,
@@ -805,6 +805,19 @@ class Bridge:
             return
 
         session_id = self.mapping.get_session(Anchor(channel_id))
+
+        # Dot-commands (`.stop`, `.help`, ...) are handled by the bridge
+        # itself. Dispatched here — after the channel→session lookup but
+        # before every forward path — so they bypass the mention-only gate
+        # and are never delivered to the agent. Global commands work even
+        # without a mapped session; session-scoped ones reply "no session".
+        parsed = commands.parse(message, mentions=self._command_mentions())
+        if parsed is not None:
+            await self._dispatch_command(
+                channel_id, session_id, post, parsed, thread_root=None,
+            )
+            return
+
         if not session_id:
             # v1's "create on first message" path is gone (§1.3). If a warming
             # session for this channel is still warming up, queue the message.
@@ -1824,6 +1837,19 @@ class Bridge:
         if (channel_id, root_id) in self.dead_threads:
             return
 
+        thread_session = self.mapping.get_session(Anchor(channel_id, root_id))
+
+        # Dot-commands inside a thread — same interception as the channel
+        # path. Dispatched before the leave/fork logic so they never trigger
+        # a fork or get forwarded; session-scoped ones resolve the thread
+        # session (may be None → "no session" reply).
+        parsed = commands.parse(message, mentions=self._command_mentions())
+        if parsed is not None:
+            await self._dispatch_command(
+                channel_id, thread_session, post, parsed, thread_root=root_id,
+            )
+            return
+
         # Leave command inside a thread only removes the thread mapping.
         if m := _LEAVE_CMD_RE.match(message):
             await self._run_leave_command(
@@ -1832,7 +1858,6 @@ class Bridge:
             )
             return
 
-        thread_session = self.mapping.get_session(Anchor(channel_id, root_id))
         if thread_session:
             if cm := _CATCH_UP_RE.match(message):
                 await self._run_catch_up(channel_id, thread_session, root_id, cm)
@@ -2220,6 +2245,142 @@ class Bridge:
             else "Leaving — invite me back any time for a fresh session."
         )
         await self._leave_channel(channel_id, session_id, farewell)
+
+    # ─────────────────────── Dot-command dispatch ─────────────────────────
+
+    def _command_mentions(self) -> tuple[str, ...]:
+        """Bot handles whose leading ``@mention`` ``commands.parse`` strips."""
+        return ("claude", self.mm.bot_username)
+
+    def _post_cmd_reply(
+        self, channel_id: str, text: str, thread_root: str | None,
+    ) -> None:
+        """Post a dot-command reply, swallowing MM errors (never fatal)."""
+        try:
+            self.mm.post(channel_id, text, root_id=thread_root)
+        except Exception:
+            logger.debug("Failed posting dot-command reply", exc_info=True)
+
+    async def _dispatch_command(
+        self,
+        channel_id: str,
+        session_id: str | None,
+        post: dict,
+        parsed: commands.ParsedCommand,
+        *,
+        thread_root: str | None,
+    ) -> None:
+        """Execute an intercepted dot-command. Never forwards to the agent.
+
+        Unknown dot-words and session-scoped commands in a session-less
+        channel get a helpful reply instead of silence.
+        """
+        spec = parsed.spec
+        if spec is None:
+            self._post_cmd_reply(
+                channel_id,
+                f":grey_question: Unknown command `.{parsed.name}` — try `.help`.",
+                thread_root,
+            )
+            return
+        if spec.session_scoped and not session_id:
+            self._post_cmd_reply(
+                channel_id,
+                ":information_source: No session in this channel.",
+                thread_root,
+            )
+            return
+
+        if spec.name == "help":
+            await self._cmd_help(channel_id, thread_root)
+        elif spec.name == "stop":
+            await self._run_stop_command(
+                channel_id, session_id, thread_root=thread_root,
+            )
+        elif spec.name == "autorespond":
+            await self._cmd_autorespond(channel_id, parsed.arg, thread_root)
+        elif spec.name == "status":
+            await self._cmd_status(channel_id, session_id, thread_root)
+        else:  # registered but not wired — defensive, shouldn't happen
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: `.{spec.name}` isn't available yet.",
+                thread_root,
+            )
+
+    async def _cmd_help(self, channel_id: str, thread_root: str | None) -> None:
+        self._post_cmd_reply(channel_id, commands.help_text(), thread_root)
+
+    async def _cmd_autorespond(
+        self, channel_id: str, arg: str | None, thread_root: str | None,
+    ) -> None:
+        """`.autorespond [on|off]` — bare toggles relative to current state.
+
+        Reuses ``_run_runtime_toggle`` by translating the intent into the
+        literal token it already understands (autorespond / noautorespond).
+        """
+        arg_lc = (arg or "").strip().lower()
+        if arg_lc == "on":
+            turn_on = True
+        elif arg_lc == "off":
+            turn_on = False
+        elif arg_lc == "":
+            cur = self.purpose_by_channel.get(channel_id)
+            mention_only = (
+                cur.mention_only if cur
+                else not self.config.default_autorespond
+            )
+            turn_on = mention_only  # currently mention-only → turn autorespond on
+        else:
+            self._post_cmd_reply(
+                channel_id,
+                ":grey_question: Usage: `.autorespond [on|off]`",
+                thread_root,
+            )
+            return
+        token = (
+            purpose.AUTORESPOND_TOKEN if turn_on else purpose.NOAUTORESPOND_TOKEN
+        )
+        await self._run_runtime_toggle(channel_id, token)
+
+    async def _cmd_status(
+        self, channel_id: str, session_id: str, thread_root: str | None,
+    ) -> None:
+        """`.status` — session, model, autorespond flag and run state."""
+        cfg = self.purpose_by_channel.get(channel_id)
+        try:
+            meta = await self.harness.get_session(session_id)
+        except Exception:
+            logger.debug("`.status` harness get_session failed", exc_info=True)
+            self._post_cmd_reply(
+                channel_id, ":warning: harness unreachable.", thread_root,
+            )
+            return
+        meta = meta or {}
+        backend = meta.get("backend") or (cfg.backend if cfg else "?")
+        model = meta.get("model") or (cfg.model if cfg else None) or "default"
+        cwd = (meta.get("project") or {}).get("path") or "?"
+        autorespond = "mention-only" if (cfg and cfg.mention_only) else "on"
+
+        run_id = self.current_run_id_by_session.get(session_id)
+        if run_id:
+            run_state = f"running (`{run_id}`)"
+        elif session_id in self.active_run_by_session:
+            run_state = "running"
+        else:
+            run_state = "idle"
+
+        lines = [
+            f"**Status** — session `{session_id[:12]}`",
+            f"• backend: `{backend}`  ·  model: `{model}`",
+            f"• cwd: `{cwd}`",
+            f"• autorespond: `{autorespond}`",
+            f"• run: {run_state}",
+        ]
+        hstatus = meta.get("status")
+        if hstatus:
+            lines.append(f"• harness session: `{hstatus}`")
+        self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
 
     async def _run_stop_command(
         self,

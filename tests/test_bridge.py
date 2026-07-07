@@ -1919,6 +1919,235 @@ class StopCommandTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.interrupted, [("fork-s", "run-fork")])
 
 
+class CommandTests(_BridgeTestCase):
+    """Dot-commands (`.stop`, `.help`, `.autorespond`, `.status`, ...) are
+    handled by the bridge itself — dispatched before `_forward_user_post`,
+    bypassing the mention-only gate, and never forwarded to the agent.
+    Mirrors StopCommandTests."""
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    # ----- .help (global — works with or without a session) -----
+
+    async def test_help_lists_commands_and_is_not_forwarded(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".help", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn(".stop", joined)
+        self.assertIn(".help", joined)
+
+    async def test_help_works_in_channel_without_session(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": ".help",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertIn(".stop", "\n".join(self._posted_texts()))
+
+    async def test_help_is_case_insensitive_and_strips_mention(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude .HELP",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+        self.assertIn(".stop", "\n".join(self._posted_texts()))
+
+    # ----- unknown dot-word intercepted, not forwarded -----
+
+    async def test_unknown_command_replies_and_is_not_forwarded(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".frobnicate now",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("Unknown command", joined)
+        self.assertIn(".help", joined)
+
+    # ----- .stop bypasses the mention-only gate -----
+
+    async def test_dot_stop_interrupts_without_mention_in_mention_only(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model=None, mention_only=True,
+        )
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".stop", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_dot_stop_with_claude_mention_also_works(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude .stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
+
+    async def test_dot_stop_without_session_replies_no_session(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": ".stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+        self.assertIn("No session", "\n".join(self._posted_texts()))
+
+    # ----- .autorespond on/off/bare -----
+
+    async def test_dot_autorespond_off_sets_mention_only(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond off",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        self.assertIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_dot_autorespond_on_clears_mention_only(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=True,
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, mention-only",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond on",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_dot_autorespond_bare_toggles(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        # Was autorespond (mention_only False) → bare toggle turns it off.
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+
+    # ----- .status -----
+
+    async def test_dot_status_reports_session_and_run(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": "/tmp/proj", "name": "proj"},
+            "origin": "harness", "status": "idle",
+        }]
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".status", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("s1", joined)
+        self.assertIn("claude", joined)
+        self.assertIn("run-s1", joined)
+
+    async def test_dot_status_without_session_replies_no_session(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": ".status",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertIn("No session", "\n".join(self._posted_texts()))
+
+    # ----- thread dispatch parity -----
+
+    async def test_dot_stop_in_thread_interrupts_thread_session(self):
+        self.bridge.mapping.link(Anchor("c1"), "parent-s")
+        self.bridge.mapping.link(Anchor("c1", "r1"), "fork-s")
+        self.bridge.current_run_id_by_session["fork-s"] = "run-fork"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".stop",
+            "user_id": "u1", "type": "", "root_id": "r1",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [("fork-s", "run-fork")])
+
+    async def test_dot_help_in_thread_replies_in_thread(self):
+        self.bridge.mapping.link(Anchor("c1"), "parent-s")
+        self.bridge.mapping.link(Anchor("c1", "r1"), "fork-s")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".help",
+            "user_id": "u1", "type": "", "root_id": "r1",
+        })
+
+        self.assertTrue(
+            any(p.root_id == "r1" and ".stop" in p.message
+                for p in self.bridge.mm.posted)
+        )
+        self.assertEqual(self.bridge.vd.forks, [])
+
+    # ----- backward compat: non-dot messages untouched -----
+
+    async def test_plain_message_still_forwarded(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello world",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "hello world")])
+
+    async def test_natural_language_stop_still_interrupts(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
+
+
 class FirstMessageConfigTests(_BridgeTestCase):
     """First user message after invite may re-configure the channel via tokens.
 
