@@ -55,6 +55,12 @@ class Config:
         "claude": "opus",
         "codex": "gpt-5.5",
     })
+    # Operator-maintained per-backend model catalog surfaced by the `.models`
+    # command. The harness ``GET /v1/backends/{b}/models`` returns ``[]`` for
+    # every backend today, so this static list (a ``[models]`` TOML table) is
+    # the v1 source; ``.models`` merges it with whatever the harness
+    # eventually enumerates. Keys match ``KNOWN_BACKENDS``. Empty by default.
+    models: dict[str, list[str]] = field(default_factory=dict)
     default_cwd: str = str(Path.home())
     default_autorespond: bool = False
 
@@ -165,6 +171,16 @@ class Config:
             return None
         return self.default_models.get(backend.lower())
 
+    def configured_models_for(self, backend: str | None) -> list[str]:
+        """Return the operator-configured model list for ``backend``.
+
+        Empty when no ``[models]`` table entry exists — callers merge this
+        with the (currently empty) harness catalog. Case-insensitive.
+        """
+        if not backend:
+            return []
+        return list(self.models.get(backend.lower(), []))
+
     # ----- internals -----
 
     def _apply_mm_url(self, raw: str) -> None:
@@ -250,6 +266,16 @@ class Config:
             self.default_models.update({
                 str(k).lower(): str(v) for k, v in dm_table.items() if v
             })
+
+        # Per-backend model catalog for `.models`. Replaces (not merges) —
+        # the operator owns the full list per backend.
+        models_table = data.get("models")
+        if isinstance(models_table, dict):
+            self.models = {
+                str(k).lower(): [str(v) for v in vals]
+                for k, vals in models_table.items()
+                if isinstance(vals, (list, tuple))
+            }
 
     def _apply_env(self) -> None:
         env = os.environ

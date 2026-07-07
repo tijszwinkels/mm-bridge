@@ -221,6 +221,48 @@ class DefaultModelsTests(unittest.TestCase):
         self.assertEqual(cfg.default_model_for("claude"), "sonnet")
 
 
+class ModelCatalogTests(unittest.TestCase):
+    """`[models]` TOML table — operator-maintained per-backend model lists
+    surfaced by the `.models` command (the harness catalog is empty today)."""
+
+    def test_no_models_table_yields_empty_list(self) -> None:
+        cfg = Config()
+        self.assertEqual(cfg.configured_models_for("claude"), [])
+        self.assertEqual(cfg.configured_models_for("codex"), [])
+
+    def test_toml_models_table_populates_catalog(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({
+            "models": {
+                "claude": ["opus", "sonnet", "haiku"],
+                "codex": ["gpt-5.5", "gpt-5.4-mini"],
+            },
+        })
+        self.assertEqual(
+            cfg.configured_models_for("claude"), ["opus", "sonnet", "haiku"],
+        )
+        self.assertEqual(
+            cfg.configured_models_for("codex"), ["gpt-5.5", "gpt-5.4-mini"],
+        )
+
+    def test_configured_models_for_is_case_insensitive(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"models": {"claude": ["opus"]}})
+        self.assertEqual(cfg.configured_models_for("Claude"), ["opus"])
+
+    def test_unknown_backend_and_none_yield_empty(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"models": {"claude": ["opus"]}})
+        self.assertEqual(cfg.configured_models_for("pi"), [])
+        self.assertEqual(cfg.configured_models_for(None), [])
+        self.assertEqual(cfg.configured_models_for(""), [])
+
+    def test_values_are_coerced_to_strings(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"models": {"claude": ["opus", 5]}})
+        self.assertEqual(cfg.configured_models_for("claude"), ["opus", "5"])
+
+
 class PublicUrlTests(unittest.TestCase):
     """``mm_public_url`` — optional user-facing base URL for permalinks.
 
