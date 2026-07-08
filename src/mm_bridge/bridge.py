@@ -831,7 +831,7 @@ class Bridge:
         # and are never delivered to the agent. Global commands work even
         # without a mapped session; session-scoped ones reply "no session".
         parsed = commands.parse(message, mentions=self._command_mentions())
-        if parsed is not None:
+        if parsed is not None and self._commands_allowed_here(channel_id, session_id, message):
             await self._dispatch_command(
                 channel_id, session_id, post, parsed, thread_root=None,
             )
@@ -1419,12 +1419,18 @@ class Bridge:
         channel_id: str,
         old_session_id: str,
         cfg: purpose.PurposeConfig,
-    ) -> None:
+    ) -> str | None:
         """Tear down the current session for `channel_id` and start a new one.
 
         We keep the MM channel and mapping slot; only the harness session is
         replaced. The old session is abandoned (no explicit backend delete).
+
+        Returns the new session id on success, or ``None`` if the restart
+        failed — in which case the channel's prior (still-live) session
+        mapping and config are restored so it isn't left session-less, and a
+        ``:warning:`` is posted. Callers must not claim success on ``None``.
         """
+        previous_cfg = self.purpose_by_channel.get(channel_id)
         self.mapping.unlink(Anchor(channel_id))
         self._end_tool_use_run(old_session_id)
         self.posters.forget(old_session_id)
@@ -1458,6 +1464,14 @@ class Bridge:
             )
         except Exception:
             logger.exception("Failed to restart agent-harness session for %s", channel_id)
+            # Restore the prior mapping/config so the channel keeps talking to
+            # its old (still-live) session instead of being orphaned — a lost
+            # session would silently drop every subsequent message.
+            self.mapping.link(Anchor(channel_id), old_session_id)
+            if previous_cfg is not None:
+                self.purpose_by_channel[channel_id] = previous_cfg
+            else:
+                self.purpose_by_channel.pop(channel_id, None)
             try:
                 self.mm.post_message(
                     channel_id,
@@ -1465,11 +1479,12 @@ class Bridge:
                 )
             except Exception:
                 pass
-            return
+            return None
         finally:
             queued = self.warming_up_sessions.pop(channel_id, None)
         if session_id and queued and queued.queued_messages:
             await self._flush_queued(channel_id, session_id, queued.queued_messages)
+        return session_id
 
     def _resolve_session_model(self, cfg: purpose.PurposeConfig) -> str | None:
         """Pick the model to send to ``harness.create_session``.
@@ -2271,6 +2286,27 @@ class Bridge:
         """Bot handles whose leading ``@mention`` ``commands.parse`` strips."""
         return ("claude", self.mm.bot_username)
 
+    def _message_mentions_bot(self, message: str) -> bool:
+        """True if ``message`` @-mentions this bot (matches engagement logic)."""
+        bot_mention = f"@{self.mm.bot_username}"
+        return bot_mention in message or "@claude" in message.lower()
+
+    def _commands_allowed_here(
+        self, channel_id: str, session_id: str | None, message: str,
+    ) -> bool:
+        """Whether a dot-command should be honored in this channel.
+
+        Always in channels with a mapped session, and always when auto-join is
+        disabled (the bot is only ever in channels it was explicitly invited
+        to). In auto-join "silent presence" channels that have no session yet,
+        require an explicit @mention — otherwise a bare dot-shaped message
+        (e.g. ``.gitignore ...``) could pull the lurking bot out of silence or
+        leak internal listings (`.sessions`/`.running`).
+        """
+        if session_id or not self.config.auto_join_public_channels:
+            return True
+        return self._message_mentions_bot(message)
+
     def _post_cmd_reply(
         self, channel_id: str, text: str, thread_root: str | None,
     ) -> None:
@@ -2479,7 +2515,14 @@ class Bridge:
             cwd=base.cwd,
             warnings=[],
         )
-        await self._restart_session_with_config(channel_id, session_id, new_cfg)
+        new_session = await self._restart_session_with_config(
+            channel_id, session_id, new_cfg,
+        )
+        if not new_session:
+            # The restart failed; `_restart_session_with_config` already posted
+            # a warning and restored the prior session. Don't claim success or
+            # persist the unreachable model.
+            return
         self._persist_purpose(channel_id, new_cfg)
         self._post_cmd_reply(
             channel_id,

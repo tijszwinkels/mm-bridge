@@ -2152,6 +2152,44 @@ class CommandTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-s1")])
 
+    # ----- auto-join "silent presence" is preserved -----
+
+    async def test_dot_command_without_mention_silent_in_autojoined_channel(self):
+        # In auto-join mode the bot lurks in public channels with no session.
+        # A dot-shaped message with no mention must not pull it out of silence
+        # or leak internal listings (`.sessions`).
+        self.bridge.config.auto_join_public_channels = True
+        self.bridge.harness.sessions_meta = [
+            {"id": "s9", "backend": "claude", "title": "SecretSession",
+             "project": {"path": "/x", "name": "x"}, "origin": "harness"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-lurk", "message": ".sessions",
+            "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertNotIn("Recent sessions", joined)
+        self.assertNotIn("SecretSession", joined)
+
+    async def test_dot_command_with_mention_works_in_autojoined_channel(self):
+        self.bridge.config.auto_join_public_channels = True
+        self.bridge.harness.sessions_meta = [
+            {"id": "s9", "backend": "claude", "title": "Sess9",
+             "project": {"path": "/x", "name": "x"}, "origin": "harness"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-lurk", "message": "@claude .sessions",
+            "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("Recent sessions", joined)
+        # Handled as a command, not forwarded / engaged: no session created.
+        self.assertEqual(self.bridge.harness.created, [])
+
 
 class CommandPhase2Tests(_BridgeTestCase):
     """`.model`, `.models`, `.running` — phase 2 of the dot-command set."""
@@ -2198,6 +2236,31 @@ class CommandPhase2Tests(_BridgeTestCase):
         self.assertEqual(self.bridge.harness.created, [])
         joined = "\n".join(self._posted_texts()).lower()
         self.assertIn("run is active", joined)
+
+    async def test_dot_model_restart_failure_keeps_old_session_no_false_success(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        async def boom(*a, **k):
+            raise RuntimeError("harness down")
+        self.bridge.harness.create_session = boom
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        # Old, still-live session is restored — the channel isn't orphaned.
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].model, "opus")
+        joined = "\n".join(self._posted_texts())
+        # A failure was surfaced and NO false "Model set" confirmation posted.
+        self.assertIn("Failed to restart", joined)
+        self.assertNotIn("Model set", joined)
 
     async def test_bare_model_shows_current_and_hints_models(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
