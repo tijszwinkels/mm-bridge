@@ -3940,6 +3940,15 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
             "session-start welcome must continue to fire",
         )
 
+    async def test_welcome_points_to_dot_help_and_dot_stop(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        body = self._welcomes()[0].message
+        self.assertIn("`.help`", body)
+        self.assertIn("`.stop`", body)
+
     async def test_auto_join_posts_join_welcome_with_silent_presence(self):
         self.config.auto_join_public_channels = True
         # Mark `c-new` as self-joined the same way the reconciler would,

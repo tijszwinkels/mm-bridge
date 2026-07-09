@@ -119,7 +119,8 @@ CHANNEL_JOIN_WELCOME_TEMPLATE = (
     "(comma-separated, first token is the backend — "
     "e.g. `{example}, autorespond`). Backends: {backends}.\n"
     "\n"
-    "Commands: `@{bot} catch up {catch_up_n}` · `@{bot} stop` · "
+    "Commands (no mention needed): `.help` for the full list, "
+    "`.stop` to interrupt. Also `@{bot} catch up {catch_up_n}` · "
     "`@{bot} leave`. "
     "More: [README](https://github.com/tijszwinkels/mm-bridge#readme)."
 )
