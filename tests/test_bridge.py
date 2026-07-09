@@ -4004,16 +4004,32 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
         welcomes = self._welcomes()
         self.assertEqual(len(welcomes), 1, "exactly one join welcome on /invite")
         # Body checkpoints — the elevator pitch (with the configured bot
-        # username), the first-message reconfig hint, and the backend list.
+        # username), the dot-command config hints, and the backend list.
         body = welcomes[0].message
         self.assertIn("@claude", body)  # bot_username from the fake
-        self.assertIn("first message", body)
+        self.assertIn("`.model", body)
+        self.assertIn("`.backend", body)
+        self.assertIn("Channel Purpose", body)
         self.assertIn("`claude`", body)  # backend list
+        # The removed first-message selector must NOT be advertised anymore.
+        self.assertNotIn("first message", body)
+        self.assertNotIn("Pick a backend", body)
         # The session-start welcome still fires too.
         self.assertTrue(
             any("Session started" in p.message for p in self.bridge.mm.posted),
             "session-start welcome must continue to fire",
         )
+
+    def test_session_start_welcome_points_to_dot_commands_not_first_message(self):
+        from mm_bridge.purpose import PurposeConfig
+        cfg = PurposeConfig(backend="claude", model="opus", mention_only=False)
+        body = self.bridge._format_welcome(cfg, "/tmp/proj")
+        # The removed first-message reconfig hint is gone...
+        self.assertNotIn("First message", body)
+        self.assertNotIn("reconfigure", body)
+        # ...replaced by the dot-command config hints.
+        self.assertIn(".model", body)
+        self.assertIn(".backend", body)
 
     async def test_welcome_points_to_dot_help_and_dot_stop(self):
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}

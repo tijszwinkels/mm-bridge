@@ -112,12 +112,13 @@ CHANNEL_JOIN_WELCOME_PROP_VALUE = "welcome"
 
 CHANNEL_JOIN_WELCOME_TEMPLATE = (
     ":wave: Hi, I'm **@{bot}** — an AI coding assistant. "
-    "Tag `@{bot}` to talk to me (or set `autorespond` so every message "
+    "Tag `@{bot}` to talk to me (or `.autorespond` so every message "
     "reaches me).{context}\n"
     "\n"
-    "Pick a backend/model by sending it as your **first message** "
-    "(comma-separated, first token is the backend — "
-    "e.g. `{example}, autorespond`). Backends: {backends}.\n"
+    "Configure anytime with dot-commands: `.model <name>` · "
+    "`.backend <name>` · `.autorespond`. Available backends: {backends}. "
+    "The **Channel Purpose** sets the defaults for new sessions and "
+    "`mm-bridge spawn`.\n"
     "\n"
     "Commands (no mention needed): `.help` for the full list, "
     "`.stop` to interrupt. Also `@{bot} catch up {catch_up_n}` · "
@@ -1544,9 +1545,8 @@ class Bridge:
         if cfg.mention_only:
             hint = f"_mention-only mode — @mention me to talk._\n{hint}"
         config_hint = (
-            "_First message can reconfigure: send e.g. `claude, sonnet, "
-            "autorespond` to switch. After that, the literal word "
-            "`autorespond` or `noautorespond` toggles auto-reply._"
+            "_Reconfigure anytime with `.model <name>` · `.backend <name>` · "
+            "`.autorespond`; `.help` for the full list._"
         )
         return f"{head}\n\n{hint}\n\n{config_hint}"
 
@@ -1569,15 +1569,6 @@ class Bridge:
             ", ".join(f"`{b}` (default `{m}`)" for b, m in configured)
             if configured else "none configured"
         )
-        # Pick the operator's primary backend for the inline example so
-        # we never advertise an unconfigured one (e.g. don't say `codex`
-        # if only `claude` has a default model). The template appends
-        # `, autorespond` after this, so keep ``example`` to the backend
-        # name only.
-        primary = self.config.default_backend
-        if primary not in self.config.default_models and configured:
-            primary = configured[0][0]
-        example = primary
 
         context = ""
         if cfg is not None:
@@ -1594,7 +1585,6 @@ class Bridge:
         return CHANNEL_JOIN_WELCOME_TEMPLATE.format(
             bot=self.mm.bot_username,
             backends=backends,
-            example=example,
             catch_up_n=self.config.catch_up_default_n,
             context=context,
         )
