@@ -393,9 +393,12 @@ class Bridge:
         # SSE start cursor, resolved in ``start()`` from the persisted
         # ``mapping.last_event_seq`` or a cold-start probe of the harness.
         self._event_cursor: int | None = None
-        # Channels waiting on their first user message; those messages are
-        # parsed as config tokens when possible.
-        self.awaiting_first_message: set[str] = set()
+        # Channels whose invited session greeted with a placeholder and are
+        # still awaiting their first *real* user message. That message is
+        # forwarded verbatim (config is never inferred from message content —
+        # dot-commands / Channel Purpose own that) but carries a one-line
+        # MM-context preamble (who's here, @-mention etiquette).
+        self._awaiting_first_forward: set[str] = set()
         # Channel purposes we just wrote ourselves, so the subsequent
         # `channel_updated` event doesn't trigger a spurious change notice.
         self._self_written_purpose: dict[str, str] = {}
@@ -862,18 +865,13 @@ class Bridge:
             )
             return
 
-        # First-message-after-invite: optionally reconfigure via plain tokens.
-        # The flag is consumed here so subsequent messages don't re-trigger
-        # config parsing. `is_first_user_message` carries forward so the
-        # forwarded message (if any) can carry the MM-context preamble.
+        # First message after an invite: forwarded verbatim, but flagged so it
+        # carries the MM-context preamble. The slot is consumed here so
+        # subsequent messages don't re-trigger it. (Content is never parsed as
+        # config — dot-commands and Channel Purpose are the only config paths.)
         is_first_user_message = False
-        if channel_id in self.awaiting_first_message:
-            self.awaiting_first_message.discard(channel_id)
-            applied = await self._try_apply_first_message_config(
-                channel_id, session_id, message,
-            )
-            if applied:
-                return
+        if channel_id in self._awaiting_first_forward:
+            self._awaiting_first_forward.discard(channel_id)
             is_first_user_message = True
 
         # Runtime toggle (literal `autorespond` / `noautorespond`, nothing else).
@@ -987,7 +985,7 @@ class Bridge:
         await self._start_invited_session(
             channel_id,
             initial_message=initial,
-            allow_first_message_config=False,
+            awaits_first_message=False,
             post_welcome=False,
             exclude_post_id=post.get("id"),
         )
@@ -1000,9 +998,11 @@ class Bridge:
     ) -> bool:
         """If `candidate` parses cleanly as purpose tokens, apply without starting a session.
 
-        Returns True when the message was consumed as config. Mirrors
-        `_try_apply_first_message_config` but never triggers a session
-        restart — there is no session yet.
+        Auto-join engagement only: when the bot's first engagement message in
+        a channel it joined itself is pure config tokens (`@claude claude,
+        sonnet`), record them as Channel Purpose and wait for the next message
+        to start the session. Returns True when consumed as config. There is no
+        session yet, so nothing is restarted.
         """
         parsed = purpose.parse(
             candidate,
@@ -1010,11 +1010,10 @@ class Bridge:
             default_model=None,
             available_models_for=lambda b: models_by_backend.get(b, []),
             default_autorespond=self.config.default_autorespond,
-            # Same reasoning as ``_try_apply_first_message_config``: the
-            # harness returns an empty model catalog, and without strict
+            # The harness returns an empty model catalog, and without strict
             # mode any first word ("Hi Claude!") would silently become
-            # ``model=hi claude!`` and the message would be swallowed
-            # before a session is even started.
+            # ``model=hi claude!`` and the message would be swallowed before a
+            # session is even started.
             strict_catalog=True,
         )
         if parsed.warnings:
@@ -1105,7 +1104,7 @@ class Bridge:
         channel_id: str,
         *,
         initial_message: str = INVITE_PLACEHOLDER,
-        allow_first_message_config: bool = True,
+        awaits_first_message: bool = True,
         post_welcome: bool = True,
         exclude_post_id: str | None = None,
     ) -> None:
@@ -1175,8 +1174,8 @@ class Bridge:
                 raise RuntimeError("agent-harness create_session response missing id")
             self.mapping.link(Anchor(channel_id), session_id)
             self._known_sessions.add(session_id)
-            if allow_first_message_config:
-                self.awaiting_first_message.add(channel_id)
+            if awaits_first_message:
+                self._awaiting_first_forward.add(channel_id)
             run = await self.harness.create_run(session_id, effective_initial)
             self._track_run_response(session_id, run)
             self._record_harness_send(session_id, effective_initial)
@@ -1231,76 +1230,7 @@ class Bridge:
         logger.info("Channel Purpose cwd override → %s", resolved)
         return str(resolved)
 
-    # ─────────────────── First-message config + runtime toggle ─────────────
-
-    async def _try_apply_first_message_config(
-        self,
-        channel_id: str,
-        session_id: str,
-        message: str,
-    ) -> bool:
-        """If `message` parses cleanly as Channel Purpose tokens, apply it.
-
-        Returns True when the message was consumed as config (caller should
-        not forward it) and False when it should be treated as a normal
-        message.
-
-        A "clean parse" means no warnings and the tokenised form is non-empty
-        — so e.g. ``hello world`` is not config, but ``claude, haiku``,
-        ``autorespond``, or ``cwd=/foo`` are.
-        """
-        candidate = message.strip()
-        if not candidate:
-            return False
-
-        models_by_backend: dict[str, list[str]] = {}
-        for b in purpose.KNOWN_BACKENDS:
-            try:
-                models_by_backend[b] = await self.harness.list_backend_models(b)
-            except Exception:
-                models_by_backend[b] = []
-
-        parsed = purpose.parse(
-            candidate,
-            self.config.default_backend,
-            default_model=None,
-            available_models_for=lambda b: models_by_backend.get(b, []),
-            default_autorespond=self.config.default_autorespond,
-            # The harness's claude-code backend currently returns an empty
-            # model catalog. Without strict mode any first word in a chat
-            # message ("Hi!") would be silently accepted as a model name
-            # and the message swallowed instead of forwarded as a turn.
-            strict_catalog=True,
-        )
-        # Unknown tokens → parser attaches warnings. Unless ALL tokens were
-        # known, bail out and treat the message as text.
-        if parsed.warnings:
-            return False
-        if not candidate.replace(",", " ").split():
-            return False
-
-        # Merge: start from the current purpose (if any) so flags stick
-        # unless the new tokens override them.
-        current = self.purpose_by_channel.get(channel_id)
-        merged = self._merge_configs(current, parsed)
-
-        current_cwd = current.cwd if current else None
-        needs_restart = bool(
-            current and (
-                merged.backend != current.backend
-                or merged.model != current.model
-                or merged.cwd != current_cwd
-            )
-        )
-
-        if needs_restart:
-            await self._restart_session_with_config(channel_id, session_id, merged)
-        else:
-            self.purpose_by_channel[channel_id] = merged
-
-        self._persist_purpose(channel_id, merged)
-        self._post_config_confirmation(channel_id, merged, restarted=needs_restart)
-        return True
+    # ─────────────────── Session reconfig + runtime toggle ─────────────────
 
     def _merge_configs(
         self,
@@ -1385,7 +1315,7 @@ class Bridge:
         await self._start_invited_session(
             channel_id,
             initial_message=message,
-            allow_first_message_config=False,
+            awaits_first_message=False,
             post_welcome=False,
             exclude_post_id=post.get("id"),
         )

@@ -2539,116 +2539,64 @@ class CommandPhase3Tests(_BridgeTestCase):
         self.assertIn("Usage", "\n".join(self._posted_texts()))
 
 
-class FirstMessageConfigTests(_BridgeTestCase):
-    """First user message after invite may re-configure the channel via tokens.
+class FirstMessageNoConfigTests(_BridgeTestCase):
+    """First-message backend/model selection was removed (2026-07-09).
 
-    If it parses cleanly as config, we apply + persist + confirm. If it changes
-    backend/model/cwd we restart the session; if only the mention flag changes,
-    we update in-place.
+    A first user message that *looks* like config tokens (`claude, sonnet`)
+    is now forwarded to the agent verbatim — dot-commands and Channel
+    Purpose are the only configuration paths. The channel still tracks a
+    "first forwarded message" slot so that message carries the MM-context
+    preamble; it just no longer parses content as config.
     """
 
-    async def _prime_channel(self, channel_id: str, purpose: str = "") -> None:
-        """Simulate a successful invite: session mapped, awaiting first message."""
+    async def _prime_channel(self, channel_id: str, purpose: str = "autorespond") -> str:
+        """Invite the bot (starts a session, marks the first-forward slot)."""
         self.bridge.mm.channels[channel_id] = {"id": channel_id, "purpose": purpose}
         await self.bridge._on_mm_user_added(channel_id, self.bridge.mm.bot_user_id)
         session_id = self.bridge.mapping.get_session(Anchor(channel_id))
         assert session_id is not None
-        self.bridge.awaiting_first_message.add(channel_id)
         self.bridge.vd.sent.clear()
+        self.bridge.vd.created.clear()
+        self.bridge.mm.posted.clear()
         return session_id
 
-    async def test_non_config_first_message_forwards_normally(self):
-        # Prime with autorespond so the mention-only filter is out of the way —
-        # this test is about the first-message-config gate, not the mention rule.
-        session_id = await self._prime_channel("c1", purpose="autorespond")
-        # Clear bot posts from the welcome message.
-        self.bridge.vd.created.clear()
-
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "hello world",
-            "user_id": "u1", "type": "",
-        })
-
-        # Forwarded — message body may be prefixed with a first-message
-        # preamble; we only assert the tail is correct here.
-        self.assertEqual(len(self.bridge.vd.sent), 1)
-        self.assertEqual(self.bridge.vd.sent[0][0], session_id)
-        self.assertTrue(self.bridge.vd.sent[0][1].endswith("hello world"))
-        self.assertNotIn("c1", self.bridge.awaiting_first_message)
-
-    async def test_flag_only_config_updates_in_place_no_session_restart(self):
+    async def test_config_token_first_message_is_forwarded_not_intercepted(self):
         session_id = await self._prime_channel("c1")
-        self.bridge.vd.created.clear()
-
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "autorespond",
-            "user_id": "u1", "type": "",
-        })
-
-        # Session is NOT restarted.
-        self.assertEqual(self.bridge.vd.created, [])
-        # Still mapped.
-        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), session_id)
-        # Config updated: mention_only now False.
-        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
-        # Persisted back to Channel Purpose.
-        self.assertIn("autorespond", self.bridge.mm.channels["c1"]["purpose"])
-        # Confirmation posted, message not forwarded.
-        self.assertEqual(self.bridge.vd.sent, [])
-        self.assertNotIn("c1", self.bridge.awaiting_first_message)
-
-    async def test_config_with_model_change_restarts_session(self):
-        session_id = await self._prime_channel("c1", purpose="claude, opus")
-        self.bridge.vd.created.clear()
+        # The invite marked the channel as awaiting its first forwarded message.
+        self.assertIn("c1", self.bridge._awaiting_first_forward)
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "claude, sonnet",
             "user_id": "u1", "type": "",
         })
 
-        # Old session unmapped, a new session created.
-        self.assertEqual(len(self.bridge.vd.created), 1)
-        self.assertEqual(self.bridge.vd.created[0]["model"], "sonnet")
-        # Original session no longer linked.
-        self.assertNotEqual(self.bridge.mapping.get_session(Anchor("c1")), session_id)
-        # Persisted.
-        self.assertIn("sonnet", self.bridge.mm.channels["c1"]["purpose"])
-
-    async def test_bot_mention_prefix_treats_as_normal_message(self):
-        """Commands like `@claude stop` or a plain '@claude hi' must NOT parse
-        as config — they contain the bot mention which isn't a known token."""
-        session_id = await self._prime_channel("c1")
-        self.bridge.vd.created.clear()
-
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "@claude hi",
-            "user_id": "u1", "type": "",
-        })
-
-        # Forwarded (with mention stripped). A first-message preamble may
-        # prefix the body; assert only that the tail is "hi".
+        # Forwarded to the agent — NOT swallowed as config.
         self.assertEqual(len(self.bridge.vd.sent), 1)
         self.assertEqual(self.bridge.vd.sent[0][0], session_id)
-        self.assertTrue(self.bridge.vd.sent[0][1].endswith("hi"))
+        self.assertTrue(self.bridge.vd.sent[0][1].endswith("claude, sonnet"))
+        # No session restart and no "Config applied" confirmation.
+        self.assertEqual(self.bridge.vd.created, [])
+        self.assertFalse(
+            any("Config applied" in p.message for p in self.bridge.mm.posted),
+            "first message must not be consumed as config",
+        )
+        # First-forward slot consumed.
+        self.assertNotIn("c1", self.bridge._awaiting_first_forward)
 
-    async def test_only_first_message_is_checked_for_config(self):
-        """Once the channel is no longer awaiting, tokens-that-look-like-config
-        should be forwarded verbatim — not swallowed."""
-        session_id = await self._prime_channel("c1", purpose="autorespond")
-        self.bridge.vd.created.clear()
+    async def test_second_config_looking_message_also_forwards(self):
+        session_id = await self._prime_channel("c1")
 
-        # First message: normal → removes awaiting flag.
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "hello", "user_id": "u1", "type": "",
         })
-        # Second message: looks like config but must forward.
         await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "claude, sonnet",
+            "channel_id": "c1", "message": "codex, gpt-5.5",
             "user_id": "u1", "type": "",
         })
 
         self.assertEqual(len(self.bridge.vd.sent), 2)
-        self.assertEqual(self.bridge.vd.sent[1][1], "claude, sonnet")
+        # The second message is forwarded verbatim (no preamble on it).
+        self.assertEqual(self.bridge.vd.sent[1][1], "codex, gpt-5.5")
 
 
 class MergeConfigsTests(_BridgeTestCase):
@@ -3456,8 +3404,8 @@ class AutoJoinTests(_BridgeTestCase):
         self.assertNotIn("c1", self.bridge.warming_up_sessions)
         self.assertNotIn(
             "c1",
-            self.bridge.awaiting_first_message,
-            "engagement sessions must not re-enter the first-message config gate",
+            self.bridge._awaiting_first_forward,
+            "engagement sessions already consumed their first message",
         )
         # No welcome message for engagement — the response is the welcome.
         self.assertEqual(self.bridge.mm.posted, [])
@@ -3583,7 +3531,7 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         display_name: str,
         members: list[dict],
     ) -> str:
-        """Set up a mapped channel with `awaiting_first_message` set and the
+        """Set up a mapped channel with `_awaiting_first_forward` set and the
         given member roster. Returns the session_id."""
         self.bridge.mm.channels[channel_id] = {
             "id": channel_id, "purpose": "", "display_name": display_name,
@@ -3600,7 +3548,7 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         ]
         session_id = "s-primed"
         self.bridge.mapping.link(Anchor(channel_id), session_id)
-        self.bridge.awaiting_first_message.add(channel_id)
+        self.bridge._awaiting_first_forward.add(channel_id)
         return session_id
 
     async def test_single_user_preamble_prepended(self) -> None:
@@ -3698,9 +3646,9 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         self.assertIn("Running inside Mattermost channel", self.bridge.vd.sent[0][1])
         self.assertNotIn("Running inside Mattermost channel", self.bridge.vd.sent[1][1])
 
-    async def test_config_token_first_message_does_not_forward_preamble(self) -> None:
-        """First-message purpose tokens are consumed as config — nothing goes
-        to VD, so there's no preamble either."""
+    async def test_runtime_toggle_first_message_does_not_forward_preamble(self) -> None:
+        """A literal `autorespond` first message is a runtime toggle — it's
+        handled in-channel and not forwarded, so no preamble is emitted."""
         await self._prime_channel_with_members(
             "c1",
             display_name="Bug Bash",
