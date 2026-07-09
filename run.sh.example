@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Template launcher. Copy to `run.sh` (gitignored — it's per-host), make it
+# executable (`chmod +x run.sh`), and adjust for your machine.
+set -euo pipefail
+cd "$(dirname "$0")"
+# Launch through `uv run` so a plain `uv sync` install works without the console
+# script being on PATH. Prepend ~/.local/bin so `uv` itself resolves under
+# systemd's non-interactive shell (which skips ~/.bashrc).
+export PATH="$HOME/.local/bin:$PATH"
+set -a; source .env; set +a
+exec uv run mm-bridge serve

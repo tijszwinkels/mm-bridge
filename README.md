@@ -42,20 +42,11 @@ The bridge reads, in order of precedence: **class defaults < TOML file < environ
 Default path: `~/.config/mm-bridge/config.toml` (override with `MM_BRIDGE_CONFIG=/path/to/config.toml`).
 
 ```toml
-# Mattermost server the daemon talks to.
-[mattermost]
-url = "localhost"
-port = 8065
-scheme = "http"
-team = "workspace"
-
-# Optional user-facing base URL used when the daemon embeds permalinks
-# in channel headers / messages. Handy when the daemon reaches MM at
-# localhost but humans reach it via a Tailscale hostname.
-public_url = "http://pillar.tail72f2bc.ts.net:8065"
-
-[agent_harness]
-url = "http://localhost:8877"
+# ── Top-level session defaults ──────────────────────────────────────────────
+# These keys are read from the TOP LEVEL of the file, so they MUST appear before
+# the [mattermost] / [agent_harness] section headers further down. In TOML every
+# key after a `[section]` header belongs to that section — put these under one
+# and they're silently ignored (you fall back to the built-in defaults).
 
 # Session defaults applied when a new session is created.
 default_backend   = "claude"   # or "codex"
@@ -105,6 +96,22 @@ sidecar_dir = "~/.mm-bridge/sessions"
 initial_catch_up_n = 50
 catch_up_default_n = 50
 catch_up_max_n     = 500
+
+# ── Sections (must come last, after all the top-level keys above) ────────────
+# Mattermost server the daemon talks to.
+[mattermost]
+url = "localhost"
+port = 8065
+scheme = "http"
+team = "workspace"
+
+# Optional user-facing base URL used when the daemon embeds permalinks
+# in channel headers / messages. Handy when the daemon reaches MM at
+# localhost but humans reach it via a Tailscale hostname.
+public_url = "http://pillar.tail72f2bc.ts.net:8065"
+
+[agent_harness]
+url = "http://localhost:8877"
 ```
 
 ### Environment
