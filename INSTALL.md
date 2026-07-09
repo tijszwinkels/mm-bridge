@@ -400,10 +400,54 @@ sessions (attach with `screen -r <name>` to read logs; detach with `Ctrl-a d`).
 
 ---
 
-## Step 7 — Claude Code SessionStart hook (in-session helpers)
+## Step 7 — Make the `mm-bridge` CLI + its instructions available to sessions
 
-So a Claude Code session on this host can self-identify as "live in Mattermost" and use
-`mm-bridge invite / spawn / channel`, install `~/.claude/hooks/export-session-id.sh`:
+A coding-agent session can drive the bridge from *inside* a channel — read scrollback
+(`mm-bridge read`), pull in a human (`invite`), spawn a sibling session (`spawn`), post
+cross-channel, etc. **This is where a fresh host silently differs from the reference host,**
+and it's easy to miss because nothing errors — the model just never uses the CLI. It needs
+three things that don't exist by default:
+
+### 7a. The `mm-bridge` CLI on PATH
+
+`uv sync` only puts the console script in the repo's `.venv`, so a session's shell can't
+find it. Install it onto the user's PATH (matches the reference host's `~/.local/bin/mm-bridge`):
+
+```bash
+cd ~/projects/mm-bridge          # <install_dir>/mm-bridge
+uv tool install .                # → ~/.local/bin/mm-bridge  (ensure ~/.local/bin is on PATH)
+mm-bridge --help                 # sanity
+```
+
+The harness `run.sh` already prepends `~/.local/bin`, so agent sessions it spawns inherit
+the CLI on PATH. (Re-run `uv tool install --reinstall .` after pulling repo updates.)
+
+### 7b. Teach the agents the CLI exists — inject the cheat-sheet
+
+**The CLI is useless if the model doesn't know it's there.** On the reference host, every
+Claude Code session gets the bridge's usage guide because the user's **global** instructions
+import it. Reproduce that — add the import to `~/.claude/CLAUDE.md` (create the file if it
+doesn't exist):
+
+```
+@~/projects/mm-bridge/CLAUDE-include.md
+```
+
+(Use your actual `<install_dir>` path.) `CLAUDE-include.md` ships in the repo and documents
+`read` / `channels` / `post` / `invite` / `spawn`, the in-channel dot-commands, and how to
+`source .env` for `MM_BOT_TOKEN`. **Without this import a session has no idea
+`mm-bridge read --channel <id>` even exists** — the exact failure seen on the remote.
+
+> **Codex backend?** Claude reads `~/.claude/CLAUDE.md`; Codex reads `AGENTS.md`. Put the
+> same guidance where your Codex sessions load global instructions (e.g.
+> `~/.codex/AGENTS.md`). Confirm the exact path/import mechanism for your Codex version —
+> it differs from Claude's `@import`, so you may need to inline the content rather than
+> `@`-import it.
+
+### 7c. SessionStart hook (Claude Code) — session self-identification
+
+So a session can resolve *which* channel it's bound to (needed by `mm-bridge channel` /
+`invite` / `spawn`), install `~/.claude/hooks/export-session-id.sh`:
 
 ```bash
 #!/usr/bin/env bash
@@ -417,8 +461,9 @@ printf 'export CLAUDE_SESSION_ID=%q\n' "$sid" >> "$CLAUDE_ENV_FILE"
 `chmod +x` it and register it as a `SessionStart` hook in `~/.claude/settings.json`.
 (Codex needs no hook — the bridge discovers its session via `/proc` and the rollout file.)
 
-**✅ Checkpoint:** in a Claude Code session bound to a channel, `mm-bridge channel` prints
-a channel id instead of "not in MM channel".
+**✅ Checkpoint:** `mm-bridge --help` runs from a plain shell; `~/.claude/CLAUDE.md`
+contains the `@…/CLAUDE-include.md` import; and in a Claude Code session bound to a channel,
+`mm-bridge channel` prints a channel id (not "not in MM channel").
 
 ---
 
@@ -446,6 +491,9 @@ harness as reachable.
 | Services don't start after reboot | `loginctl enable-linger "$USER"` not set. |
 | `<openFile>` uploads nothing | Path is outside `allowed_attachment_roots`. |
 | `mm-bridge` says "not in MM channel" | SessionStart hook missing (claude) or invoked in the startup race before the sidecar exists. |
+| Bot works but never uses the CLI (won't read scrollback, `invite`, `spawn`) | The session doesn't know the CLI exists / can't find it. Import `CLAUDE-include.md` into `~/.claude/CLAUDE.md` (Step 7b) and put `mm-bridge` on PATH via `uv tool install .` (Step 7a). |
+| `mm-bridge: command not found` inside a session | CLI not on the session's PATH — `uv tool install .` (Step 7a); confirm `~/.local/bin` is on PATH. |
+| `Error: MM_BOT_TOKEN environment variable is required` (CLI) | Session shell didn't load the token — `set -a; source <install_dir>/mm-bridge/.env; set +a` (documented in `CLAUDE-include.md`). |
 
 ---
 
