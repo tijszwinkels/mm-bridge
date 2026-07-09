@@ -166,3 +166,16 @@ def test_bare_model_has_no_arg():
     cmd = parse(".model")
     assert cmd.name == "model"
     assert cmd.arg is None
+
+
+def test_backend_command_is_registered_and_parses():
+    assert "backend" in REGISTRY
+    cmd = parse(".backend codex")
+    assert cmd.name == "backend"
+    assert cmd.arg == "codex"
+
+
+def test_bare_backend_has_no_arg():
+    cmd = parse(".backend")
+    assert cmd.name == "backend"
+    assert cmd.arg is None

@@ -186,13 +186,14 @@ gets an "unknown command — try `.help`" reply rather than reaching the agent.
 | `.autorespond [on\|off]` | Reply to every message, or only when @mentioned (bare = toggle). Persisted in the Channel Purpose. |
 | `.status` | Session id, backend, model, cwd, autorespond flag, run state, harness status. |
 | `.model [<name>]` | Show the current model, or switch it. Names are free text — a bad one fails loudly with the backend error. Switching recreates the session, so `.stop` any active run first. |
+| `.backend [<name>]` | Show the current backend, or switch it. Validated against the known backends (`claude`, `codex`, …) — a typo is rejected inline. Switching recreates the session and **resets the model to that backend's default** (models are backend-specific), so `.stop` any active run first. |
 | `.models` | List the available models for this channel's backend (from the `[models]` config table + the harness catalog), marking the current one. |
 | `.running` | Sessions with a run in flight right now. |
 | `.sessions [N]` | The N most recent sessions across all agents — including terminal (TUI) sessions not yet on Mattermost. Each shows its channel or an `.invite` hint. |
 | `.invite <session-id>` | Get added to a session's Mattermost channel, creating it first for unmapped/terminal sessions. Posting into a resumed terminal session **forks** it (see the channel's bootstrap note). |
 
-Session-scoped commands (`.stop`, `.status`, `.model`) reply "No session in
-this channel" when the channel has none; the rest work regardless.
+Session-scoped commands (`.stop`, `.status`, `.model`, `.backend`) reply "No
+session in this channel" when the channel has none; the rest work regardless.
 
 ## Inside-a-session directives
 

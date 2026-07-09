@@ -2289,6 +2289,8 @@ class Bridge:
             await self._cmd_status(channel_id, session_id, thread_root)
         elif spec.name == "model":
             await self._cmd_model(channel_id, session_id, parsed.arg, thread_root)
+        elif spec.name == "backend":
+            await self._cmd_backend(channel_id, session_id, parsed.arg, thread_root)
         elif spec.name == "models":
             await self._cmd_models(channel_id, session_id, thread_root)
         elif spec.name == "running":
@@ -2458,6 +2460,101 @@ class Bridge:
         self._post_cmd_reply(
             channel_id,
             f":gear: Model set to `{arg}` — session restarted. "
+            "If the backend rejects it, the error will appear above.",
+            thread_root,
+        )
+
+    async def _cmd_backend(
+        self,
+        channel_id: str,
+        session_id: str,
+        arg: str | None,
+        thread_root: str | None,
+    ) -> None:
+        """`.backend [<name>]` — show the current backend, or switch it.
+
+        Unlike models, backends ARE enumerable, so a name is validated against
+        ``purpose.KNOWN_BACKENDS`` (aliases like ``claude-code`` canonicalise
+        first) and a typo is rejected inline. Switching recreates the session
+        (same as `.model`), so it's refused while a run is active. The carried
+        model is dropped on the swap — models are backend-specific, so the new
+        backend's per-backend default applies (via ``_merge_configs``).
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        try:
+            meta = await self.harness.get_session(session_id) or {}
+        except Exception:
+            logger.debug("`.backend` harness get_session failed", exc_info=True)
+            meta = {}
+        current_backend = purpose.canonical_backend(
+            meta.get("backend") or (cfg.backend if cfg else None)
+        ) or self.config.default_backend
+
+        known_list = ", ".join(f"`{b}`" for b in sorted(purpose.KNOWN_BACKENDS))
+
+        # Bare `.backend` → report the current backend + the known set.
+        if not arg:
+            self._post_cmd_reply(
+                channel_id,
+                f":electric_plug: Current backend: `{current_backend}`. "
+                f"Switch with `.backend <name>`. Known: {known_list}.",
+                thread_root,
+            )
+            return
+
+        requested = purpose.canonical_backend(arg.strip())
+        if requested not in purpose.KNOWN_BACKENDS:
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Unknown backend `{arg.strip()}`. Known: {known_list}.",
+                thread_root,
+            )
+            return
+
+        if requested == current_backend:
+            self._post_cmd_reply(
+                channel_id,
+                f":information_source: Already on backend `{requested}`.",
+                thread_root,
+            )
+            return
+
+        # Switching mid-run would orphan the active run — refuse.
+        if self._session_has_active_run(session_id):
+            self._post_cmd_reply(
+                channel_id,
+                ":warning: A run is active — `.stop` it first, then `.backend <name>`.",
+                thread_root,
+            )
+            return
+
+        base = cfg or purpose.PurposeConfig(
+            backend=current_backend,
+            model=None,
+            mention_only=not self.config.default_autorespond,
+        )
+        # Layer the new backend over the current config via ``_merge_configs``
+        # so the carried model is dropped (a claude model can't run on codex).
+        target = purpose.PurposeConfig(
+            backend=requested,
+            model=None,
+            mention_only=base.mention_only,
+            cwd=base.cwd,
+            warnings=[],
+        )
+        new_cfg = self._merge_configs(base, target)
+        new_session = await self._restart_session_with_config(
+            channel_id, session_id, new_cfg,
+        )
+        if not new_session:
+            # The restart failed; `_restart_session_with_config` already posted
+            # a warning and restored the prior session. Don't claim success.
+            return
+        self._persist_purpose(channel_id, new_cfg)
+        self._post_cmd_reply(
+            channel_id,
+            f":gear: Backend set to `{requested}` — session restarted "
+            f"(model reset to the `{requested}` default). "
             "If the backend rejects it, the error will appear above.",
             thread_root,
         )

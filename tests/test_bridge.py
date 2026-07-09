@@ -2377,6 +2377,133 @@ class CommandPhase2Tests(_BridgeTestCase):
         self.assertIn("no runs", joined)
 
 
+class CommandBackendTests(_BridgeTestCase):
+    """`.backend [<name>]` — mirrors `.model`, but validates against
+    KNOWN_BACKENDS (backends ARE enumerable) and drops the carried model on
+    a switch (models are backend-specific)."""
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    async def test_dot_backend_switches_and_drops_carried_model(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        # A new session was created on the requested backend...
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        # ...with the carried claude model DROPPED → per-backend codex default.
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "gpt-5.5")
+        # Persisted purpose names the new backend, not the old model.
+        self.assertIn("codex", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertNotIn("opus", self.bridge.mm.channels["c1"]["purpose"])
+        # In-memory config reflects the drop.
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].backend, "codex")
+        self.assertIsNone(self.bridge.purpose_by_channel["c1"].model)
+
+    async def test_dot_backend_alias_is_canonicalized(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="codex", model="gpt-5.5", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "codex"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend claude-code",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "claude")
+
+    async def test_dot_backend_unknown_rejected_inline_no_restart(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend frobnicate",
+            "user_id": "u1", "type": "",
+        })
+
+        # No restart; an inline rejection naming the known backends.
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("unknown backend", joined)
+        self.assertIn("claude", joined)
+
+    async def test_dot_backend_refuses_while_run_active(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("run is active", joined)
+
+    async def test_dot_backend_same_backend_is_noop(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend claude",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("already on", joined)
+
+    async def test_bare_backend_shows_current_and_known(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("claude", joined)
+        # Lists the other known backends too.
+        self.assertIn("codex", joined)
+
+    async def test_dot_backend_no_session_replies_no_session(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("no session", joined)
+
+
 class CommandPhase3Tests(_BridgeTestCase):
     """`.sessions`, `.invite` — phase 3 (channel creation + invite)."""
 

@@ -76,6 +76,11 @@ _SPECS: tuple[CommandSpec, ...] = (
         session_scoped=True,
     ),
     CommandSpec(
+        "backend", ".backend [<name>]",
+        "Show the current backend, or switch it (resets the model; `.stop` first).",
+        session_scoped=True,
+    ),
+    CommandSpec(
         "models", ".models",
         "List the available models for this channel's backend.",
     ),
