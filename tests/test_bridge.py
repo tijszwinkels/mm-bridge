@@ -2219,6 +2219,25 @@ class CommandPhase2Tests(_BridgeTestCase):
         self.assertEqual(self.bridge.harness.created[-1]["backend"], "claude")
         self.assertIn("claude-sonnet", self.bridge.mm.channels["c1"]["purpose"])
 
+    async def test_dot_model_restart_is_quiet_no_greeting_run(self):
+        from mm_bridge.bridge import INVITE_PLACEHOLDER
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        # New session created, but the restart does not burn a greeting run.
+        self.assertTrue(self.bridge.harness.created)
+        sent_messages = [m for (_sid, m) in self.bridge.harness.sent]
+        self.assertNotIn(INVITE_PLACEHOLDER, sent_messages)
+
     async def test_dot_model_refuses_while_run_active(self):
         from mm_bridge.purpose import PurposeConfig
         self.bridge.mapping.link(Anchor("c1"), "s1")
@@ -2502,6 +2521,26 @@ class CommandBackendTests(_BridgeTestCase):
         self.assertEqual(self.bridge.harness.created, [])
         joined = "\n".join(self._posted_texts()).lower()
         self.assertIn("no session", joined)
+
+    async def test_dot_backend_restart_is_quiet_no_greeting_run(self):
+        from mm_bridge.bridge import INVITE_PLACEHOLDER
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        # Session recreated on the new backend, but NO greeting/warming run
+        # fired — the confirmation post is the only channel output.
+        self.assertTrue(self.bridge.harness.created)
+        sent_messages = [m for (_sid, m) in self.bridge.harness.sent]
+        self.assertNotIn(INVITE_PLACEHOLDER, sent_messages)
 
 
 class CommandPhase3Tests(_BridgeTestCase):
@@ -2855,6 +2894,80 @@ class PurposeUpdateNoticeTests(_BridgeTestCase):
         self.assertTrue(
             any("takes effect only for new sessions" in p.message
                 for p in self.bridge.mm.posted),
+        )
+
+    async def test_channel_removal_clears_per_channel_config_state(self):
+        """Removing the bot must drain the channel's pending self-write set and
+        first-forward flag — otherwise a mid-restart removal leaks entries."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge._note_self_wrote_purpose("c1", "claude, opus")
+        self.bridge._awaiting_first_forward.add("c1")
+
+        await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
+
+        self.assertNotIn("c1", self.bridge._self_written_purpose)
+        self.assertNotIn("c1", self.bridge._awaiting_first_forward)
+
+    async def test_multiple_self_writes_all_suppressed(self):
+        """A `.model`/`.backend` restart writes the Purpose twice (resume
+        block during restart + config afterwards). Both `channel_updated`
+        events must be recognised as self-written — a single-slot tracker
+        remembered only the last write and let the first one notify."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "", "purpose": "claude, opus",
+        }
+        first = "claude, opus\n\n---\n\nResume:\n```\ncd /x && claude --resume s1\n```"
+        second = "claude, sonnet\n\n---\n\nResume:\n```\ncd /x && claude --resume s2\n```"
+        self.bridge._note_self_wrote_purpose("c1", first)
+        self.bridge._note_self_wrote_purpose("c1", second)
+
+        await self.bridge._on_mm_channel_updated({
+            "id": "c1", "display_name": "", "purpose": first,
+        })
+        await self.bridge._on_mm_channel_updated({
+            "id": "c1", "display_name": "", "purpose": second,
+        })
+
+        notices = [
+            p for p in self.bridge.mm.posted
+            if "takes effect only for new sessions" in p.message
+        ]
+        self.assertEqual(notices, [], "all self-written purpose writes must be silent")
+
+    async def test_dot_model_restart_emits_no_purpose_notice(self):
+        """End-to-end: a `.model` switch replays its purpose writes as
+        `channel_updated` events; none may spawn the change notice (the
+        change already took effect via restart)."""
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "", "purpose": "claude, opus",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        writes = [p for (cid, p) in self.bridge.mm.purposes if cid == "c1"]
+        self.assertGreaterEqual(len(writes), 1)
+        for w in writes:
+            await self.bridge._on_mm_channel_updated({
+                "id": "c1", "display_name": "", "purpose": w,
+            })
+
+        notices = [
+            p for p in self.bridge.mm.posted
+            if "takes effect only for new sessions" in p.message
+        ]
+        self.assertEqual(
+            notices, [],
+            f"a self-initiated .model switch must not notify; writes={writes}",
         )
 
 

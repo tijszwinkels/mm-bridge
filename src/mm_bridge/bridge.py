@@ -402,7 +402,10 @@ class Bridge:
         self._awaiting_first_forward: set[str] = set()
         # Channel purposes we just wrote ourselves, so the subsequent
         # `channel_updated` event doesn't trigger a spurious change notice.
-        self._self_written_purpose: dict[str, str] = {}
+        # A SET per channel, not a single value: a `.model`/`.backend` restart
+        # writes the Purpose twice (resume block during restart, then config),
+        # and a single slot would forget the first write and let it notify.
+        self._self_written_purpose: dict[str, set[str]] = {}
         # Channels we joined ourselves (auto-join). The resulting
         # `user_added` event must not trigger a new VD session — presence
         # should be silent until a user engages.
@@ -1056,6 +1059,10 @@ class Bridge:
         session_id = self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
         self.warming_up_sessions.pop(channel_id, None)
+        # Drain per-channel config state so a removal mid-restart (before the
+        # self-write's `channel_updated` event arrives) doesn't leak an entry.
+        self._self_written_purpose.pop(channel_id, None)
+        self._awaiting_first_forward.discard(channel_id)
         self._forget_channel_silent_drops(channel_id)
         if session_id:
             self._end_tool_use_run(session_id)
@@ -1083,10 +1090,15 @@ class Bridge:
             return
 
         # Purpose change (only emit notice if actually changed AND we didn't
-        # write it ourselves).
+        # write it ourselves). A single self-write may fan out into more than
+        # one `channel_updated` event, so match against the pending SET and
+        # drain the matched entry rather than a lone slot.
         if prev and prev.get("purpose") != new_purpose:
-            self_written = self._self_written_purpose.pop(channel_id, None)
-            if self_written is not None and self_written == new_purpose:
+            pending = self._self_written_purpose.get(channel_id)
+            if pending is not None and new_purpose in pending:
+                pending.discard(new_purpose)
+                if not pending:
+                    self._self_written_purpose.pop(channel_id, None)
                 return
             try:
                 self.mm.post_message(
@@ -1356,6 +1368,9 @@ class Bridge:
 
         We keep the MM channel and mapping slot; only the harness session is
         replaced. The old session is abandoned (no explicit backend delete).
+        The new session starts QUIET — no greeting run — because the only
+        callers (`.model` / `.backend`) post their own confirmation; the next
+        user message is the new session's first turn.
 
         Returns the new session id on success, or ``None`` if the restart
         failed — in which case the channel's prior (still-live) session
@@ -1388,9 +1403,11 @@ class Bridge:
                 raise RuntimeError("agent-harness create_session response missing id")
             self.mapping.link(Anchor(channel_id), session_id)
             self._known_sessions.add(session_id)
-            run = await self.harness.create_run(session_id, INVITE_PLACEHOLDER)
-            self._track_run_response(session_id, run)
-            self._record_harness_send(session_id, INVITE_PLACEHOLDER)
+            # No greeting/warming run: a restart is triggered by `.model` /
+            # `.backend`, which post their own confirmation. Firing the
+            # INVITE_PLACEHOLDER prompt here would burn a run and post a
+            # spurious "Hi! I'm set up…" greeting. The next real user message
+            # becomes the new session's first run.
             await self._update_resume_purpose(
                 channel_id, session_id, cfg.backend, effective_cwd,
             )
@@ -1511,7 +1528,7 @@ class Bridge:
             )
 
     def _note_self_wrote_purpose(self, channel_id: str, purpose_text: str) -> None:
-        self._self_written_purpose[channel_id] = purpose_text
+        self._self_written_purpose.setdefault(channel_id, set()).add(purpose_text)
 
     def _post_config_confirmation(
         self,
