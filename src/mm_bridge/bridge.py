@@ -775,17 +775,21 @@ class Bridge:
         # Bridge CLI subcommands stamp `props.from_bridge_cli` on posts
         # they author themselves. Marker taxonomy and dispatch:
         #
-        #   * ``"post"`` — an explicit ``mm-bridge post`` call. Always
-        #     forwarded to the recipient session as a user turn,
-        #     regardless of the stamped ``from_bridge_cli_channel``.
-        #     This is the agentcom path: a sender in channel X tells
-        #     the recipient in channel Y "hi". RC1 (a poisoned sender
-        #     session resolver) used to mis-stamp the destination
-        #     channel as the origin and the recipient would silently
-        #     drop the post — that's the regression we're closing here.
-        #     Self-echoes of the sender's own outbound post are dedup'd
-        #     upstream by post id (`mm_client.py`'s `is_own_post`); we
-        #     don't need a separate channel-equality guard at this layer.
+        #   * ``"post"`` — an explicit ``mm-bridge post`` call. Forwarded
+        #     to the recipient session as a user turn UNLESS it originates
+        #     from that same session (a self-post: a session posting a
+        #     status update into its own channel/thread). We compare the
+        #     stamped ``from_bridge_cli_session`` against the session the
+        #     target anchor maps to: equal → drop (else the session replies
+        #     to its own posts — the loop-back bug); different (or absent)
+        #     → forward. This is the agentcom path: a sender in channel X
+        #     tells the recipient in channel Y "hi", and the differing
+        #     session ids keep it flowing. RC1 (a poisoned sender session
+        #     resolver) used to mis-stamp the destination channel as the
+        #     origin and the recipient would silently drop the post via a
+        #     channel-equality guard — hence we key on session id, not
+        #     channel. The daemon's OWN outbound posts are separately
+        #     dedup'd upstream by post id (`mm_client.py`'s `is_own_post`).
         #   * ``"cross-post-mirror"`` — the informational mirror that
         #     ``mm-bridge post --channel <other>`` lands in the
         #     SENDER's own channel for transcript visibility. Drop
@@ -805,9 +809,20 @@ class Bridge:
             marker = props.get("from_bridge_cli")
             origin_channel = props.get("from_bridge_cli_channel")
             if marker == "post":
-                # Explicit agentcom — always forward. Falls through to
-                # the normal dispatch below.
-                pass
+                # Agentcom vs self-post: drop only when this post came from
+                # the same session the target anchor maps to (a session's own
+                # status update looping back). Otherwise fall through and
+                # forward.
+                origin_session = props.get("from_bridge_cli_session")
+                if origin_session and self._cli_post_targets_own_session(
+                    post, origin_session,
+                ):
+                    logger.debug(
+                        "Dropping self-post loop-back: session %s posted into "
+                        "its own channel %s via `mm-bridge post`",
+                        origin_session[:8], post["channel_id"],
+                    )
+                    return
             elif origin_channel is None or origin_channel == post["channel_id"]:
                 # Mirror / spawn-artifact landing in the recorded
                 # channel — drop so the linked session doesn't read it
@@ -902,6 +917,24 @@ class Bridge:
             channel_id, session_id, post, message, thread_root=None,
             first_message=is_first_user_message,
         )
+
+    def _cli_post_targets_own_session(self, post: dict, origin_session: str) -> bool:
+        """True when a ``mm-bridge post`` (``from_bridge_cli="post"``) landed
+        in the anchor its OWN originating session maps to.
+
+        The recipient is resolved exactly as the forward path would pick it:
+        a threaded post targets ``Anchor(channel, root_id)``, a channel post
+        targets ``Anchor(channel)``. When that recipient equals the stamped
+        origin session, the post is a self-status-update looping back and must
+        not be re-injected as a user turn. Cross-session (agentcom) posts have
+        a different recipient and return False (→ forwarded).
+        """
+        root_id = post.get("root_id") or None
+        anchor = (
+            Anchor(post["channel_id"], root_id) if root_id
+            else Anchor(post["channel_id"])
+        )
+        return self.mapping.get_session(anchor) == origin_session
 
     async def _on_mm_user_added(self, channel_id: str, user_id: str) -> None:
         if user_id != self.mm.bot_user_id:

@@ -1136,6 +1136,78 @@ class ForwardingTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.sent, [])
 
+    async def test_cli_post_from_same_session_is_suppressed(self):
+        """Self-post loop-back guard: a `mm-bridge post` authored by the very
+        session the target channel maps to (e.g. a status update into its own
+        channel) must NOT be forwarded back to that session as a user turn —
+        that loop made the agent reply to its own status posts. The CLI stamps
+        the originating session in `from_bridge_cli_session`."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "MILESTONE: step 2 done",
+            "user_id": self.bridge.mm.bot_user_id, "type": "",
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "c1",
+                "from_bridge_cli_session": "s1",  # == the channel's session
+            },
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_cli_post_from_other_session_still_forwarded(self):
+        """Agentcom must keep working: a `mm-bridge post --channel` from a
+        DIFFERENT session posting into this channel is forwarded — only
+        same-session self-posts are suppressed."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "Aster (from c-other): ping",
+            "user_id": self.bridge.mm.bot_user_id, "type": "",
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "c-other",
+                "from_bridge_cli_session": "s-other",  # != the channel's session
+            },
+        })
+
+        self.assertEqual(
+            self.bridge.vd.sent, [("s1", "Aster (from c-other): ping")],
+        )
+
+    async def test_cli_post_same_session_in_thread_is_suppressed(self):
+        """The self-post guard also covers a thread-fork session posting into
+        its own thread (`mm-bridge post --thread`)."""
+        self.bridge.mapping.link(Anchor("c1", "root1"), "s-fork")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "MILESTONE from the fork",
+            "root_id": "root1",
+            "user_id": self.bridge.mm.bot_user_id, "type": "",
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "c1",
+                "from_bridge_cli_session": "s-fork",
+            },
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_cli_post_without_origin_session_still_forwarded(self):
+        """A `post` marker with no `from_bridge_cli_session` (origin couldn't
+        be resolved) falls through and forwards — conservative delivery, same
+        as before the guard."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "unresolved origin",
+            "user_id": self.bridge.mm.bot_user_id, "type": "",
+            "props": {"from_bridge_cli": "post", "from_bridge_cli_channel": "c1"},
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "unresolved origin")])
+
     async def test_posted_with_marker_and_no_channel_field_is_skipped(self):
         """Backwards compat: posts that carry the marker but no
         ``from_bridge_cli_channel`` (older CLI in flight, or any future
