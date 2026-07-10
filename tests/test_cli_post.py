@@ -132,17 +132,17 @@ class PostCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(mm.posted[0]["channel_id"], "sidecar-chan")
         self.assertIsNone(mm.posted[0]["root_id"])
-        # ``mm-bridge post`` always stamps ``from_bridge_cli="post"``
-        # plus the sender's channel and session ids. The dispatcher
-        # treats ``"post"`` as explicit agentcom and forwards it
-        # unconditionally; the self-echo dedup happens upstream at
-        # ``mm_client.py``'s ``is_own_post`` filter (post-id-based),
-        # so we don't need a channel-equality drop at the bridge
-        # predicate layer for this marker.
+        # ``mm-bridge post`` stamps ``from_bridge_cli="post"`` plus the
+        # sender's channel/session ids and the caller's INTENT. With no
+        # ``--channel``/``--thread`` this is the default post-into-my-own-
+        # channel path → ``from_bridge_cli_target="self"``. The dispatcher
+        # drops such a post only when it loops back to its own author session
+        # (a status update); explicit-target posts always forward.
         self.assertEqual(
             mm.posted[0]["props"],
             {
                 "from_bridge_cli": "post",
+                "from_bridge_cli_target": "self",
                 "from_bridge_cli_channel": "sidecar-chan",
                 "from_bridge_cli_session": "my-sess",
             },
@@ -182,6 +182,9 @@ class PostCommandTests(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(mm.posted[0]["root_id"], "other")
+        # An explicit --thread is a directed target → "explicit" (always
+        # forwarded), even without --channel.
+        self.assertEqual(mm.posted[0]["props"]["from_bridge_cli_target"], "explicit")
 
     def test_thread_arg_with_channel_arg(self) -> None:
         mm = FakeMM()
@@ -433,15 +436,14 @@ class CrossChannelMirrorTests(unittest.TestCase):
         self.assertIsNone(mirror["root_id"])
 
     def test_cross_channel_original_carries_sender_channel_id(self) -> None:
-        """Cross-channel agentcom: when ``--channel <other>`` is given
-        from inside a bridge session, the original post carries the
-        ``"post"`` marker plus the SENDER's own channel and session
-        ids. The dispatcher forwards ``"post"`` markers unconditionally
-        — this is the agentcom path. Today's bug (post id
-        ``tc8ssq5j7jdr3y18qgu9t5nmuw``) was the bridge predicate
-        dropping these via channel equality after RC1 leaked the
-        parent's session id and the sender mis-resolved its own channel
-        as the destination."""
+        """Cross-channel agentcom: when ``--channel <other>`` is given from
+        inside a bridge session, the original post carries the ``"post"``
+        marker, ``from_bridge_cli_target="explicit"``, and the SENDER's own
+        channel and session ids. The dispatcher ALWAYS forwards explicit-target
+        posts — this is the agentcom path. Today's bug (post id
+        ``tc8ssq5j7jdr3y18qgu9t5nmuw``) was the bridge predicate dropping these
+        via channel equality after RC1 leaked the parent's session id; keying
+        on the explicit intent makes that class of silent drop impossible."""
         sidecar.write(self.sdir, "my-sess", "self-chan")
         mm = FakeMM(channels={"other-chan": {"name": "other-slug"}})
         rc, _, _ = self._invoke(
@@ -453,6 +455,7 @@ class CrossChannelMirrorTests(unittest.TestCase):
             mm.posted[0]["props"],
             {
                 "from_bridge_cli": "post",
+                "from_bridge_cli_target": "explicit",
                 "from_bridge_cli_channel": "self-chan",
                 "from_bridge_cli_session": "my-sess",
             },
@@ -470,11 +473,13 @@ class CrossChannelMirrorTests(unittest.TestCase):
             mm, ["mm-bridge", "post", "--channel", "target-chan", "hi"],
         )
         self.assertEqual(rc, 0)
-        # Original post props — outbound to recipient channel.
+        # Original post props — outbound to recipient channel (explicit
+        # ``--channel`` → target="explicit", always forwarded).
         self.assertEqual(
             mm.posted[0]["props"],
             {
                 "from_bridge_cli": "post",
+                "from_bridge_cli_target": "explicit",
                 "from_bridge_cli_channel": "self-chan",
                 "from_bridge_cli_session": "my-sess",
             },

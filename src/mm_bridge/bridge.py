@@ -775,21 +775,24 @@ class Bridge:
         # Bridge CLI subcommands stamp `props.from_bridge_cli` on posts
         # they author themselves. Marker taxonomy and dispatch:
         #
-        #   * ``"post"`` — an explicit ``mm-bridge post`` call. Forwarded
-        #     to the recipient session as a user turn UNLESS it originates
-        #     from that same session (a self-post: a session posting a
-        #     status update into its own channel/thread). We compare the
-        #     stamped ``from_bridge_cli_session`` against the session the
-        #     target anchor maps to: equal → drop (else the session replies
-        #     to its own posts — the loop-back bug); different (or absent)
-        #     → forward. This is the agentcom path: a sender in channel X
-        #     tells the recipient in channel Y "hi", and the differing
-        #     session ids keep it flowing. RC1 (a poisoned sender session
-        #     resolver) used to mis-stamp the destination channel as the
-        #     origin and the recipient would silently drop the post via a
-        #     channel-equality guard — hence we key on session id, not
-        #     channel. The daemon's OWN outbound posts are separately
-        #     dedup'd upstream by post id (`mm_client.py`'s `is_own_post`).
+        #   * ``"post"`` — an explicit ``mm-bridge post`` call. Keyed on the
+        #     stamped INTENT (``from_bridge_cli_target``), not just the session
+        #     id: "self" = the default post-into-my-own-channel path; "explicit"
+        #     = ``--channel``/``--thread`` was given. We drop ONLY a "self" post
+        #     whose ``from_bridge_cli_session`` also equals the session the
+        #     target anchor maps to (belt and braces) — that's a status update
+        #     looping back to its author. Everything else forwards: "explicit"
+        #     always (that's agentcom — a sender in channel X telling channel Y
+        #     "hi"), a "self" post landing on a different session (anomalous),
+        #     and posts with no target tag (old CLI, forwards-compat).
+        #     Keying on intent — not session id alone — is deliberate: a
+        #     poisoned resolver (the RC1 incident) that leaks a parent session
+        #     id can then NEVER cause an explicit agentcom post to be silently
+        #     dropped, because agentcom always carries ``--channel`` → "explicit".
+        #     The one accepted gap: ``--channel <your own channel>`` is
+        #     "explicit" and forwards (a deliberate override, harmless). The
+        #     daemon's OWN outbound posts are separately dedup'd upstream by
+        #     post id (`mm_client.py`'s `is_own_post`).
         #   * ``"cross-post-mirror"`` — the informational mirror that
         #     ``mm-bridge post --channel <other>`` lands in the
         #     SENDER's own channel for transcript visibility. Drop
@@ -809,13 +812,13 @@ class Bridge:
             marker = props.get("from_bridge_cli")
             origin_channel = props.get("from_bridge_cli_channel")
             if marker == "post":
-                # Agentcom vs self-post: drop only when this post came from
-                # the same session the target anchor maps to (a session's own
-                # status update looping back). Otherwise fall through and
-                # forward.
+                # Drop only a default (target=self) post that loops back to its
+                # own author session; explicit / mismatched / untagged → forward.
                 origin_session = props.get("from_bridge_cli_session")
-                if origin_session and self._cli_post_targets_own_session(
-                    post, origin_session,
+                if (
+                    props.get("from_bridge_cli_target") == "self"
+                    and origin_session
+                    and self._cli_post_targets_own_session(post, origin_session)
                 ):
                     logger.debug(
                         "Dropping self-post loop-back: session %s posted into "

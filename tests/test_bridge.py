@@ -1136,12 +1136,17 @@ class ForwardingTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.sent, [])
 
-    async def test_cli_post_from_same_session_is_suppressed(self):
-        """Self-post loop-back guard: a `mm-bridge post` authored by the very
-        session the target channel maps to (e.g. a status update into its own
-        channel) must NOT be forwarded back to that session as a user turn —
-        that loop made the agent reply to its own status posts. The CLI stamps
-        the originating session in `from_bridge_cli_session`."""
+    # ---- self-post loop-back guard (intent-keyed) ----
+    # `mm-bridge post` stamps `from_bridge_cli_target`: "self" for the default
+    # post-into-my-own-channel path, "explicit" when --channel/--thread was
+    # given. Only a "self" post whose origin session == the target anchor's
+    # session is dropped (belt and braces). Explicit posts ALWAYS forward, so
+    # agentcom can never be silently dropped — even if a poisoned resolver
+    # leaks a parent session id (the RC1 class of bug).
+
+    async def test_cli_self_post_same_session_is_suppressed(self):
+        """target=self + origin == channel's session → status update looping
+        back → dropped (the bug this closes)."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
@@ -1149,36 +1154,17 @@ class ForwardingTests(_BridgeTestCase):
             "user_id": self.bridge.mm.bot_user_id, "type": "",
             "props": {
                 "from_bridge_cli": "post",
+                "from_bridge_cli_target": "self",
                 "from_bridge_cli_channel": "c1",
-                "from_bridge_cli_session": "s1",  # == the channel's session
+                "from_bridge_cli_session": "s1",
             },
         })
 
         self.assertEqual(self.bridge.vd.sent, [])
 
-    async def test_cli_post_from_other_session_still_forwarded(self):
-        """Agentcom must keep working: a `mm-bridge post --channel` from a
-        DIFFERENT session posting into this channel is forwarded — only
-        same-session self-posts are suppressed."""
-        self.bridge.mapping.link(Anchor("c1"), "s1")
-
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "Aster (from c-other): ping",
-            "user_id": self.bridge.mm.bot_user_id, "type": "",
-            "props": {
-                "from_bridge_cli": "post",
-                "from_bridge_cli_channel": "c-other",
-                "from_bridge_cli_session": "s-other",  # != the channel's session
-            },
-        })
-
-        self.assertEqual(
-            self.bridge.vd.sent, [("s1", "Aster (from c-other): ping")],
-        )
-
-    async def test_cli_post_same_session_in_thread_is_suppressed(self):
-        """The self-post guard also covers a thread-fork session posting into
-        its own thread (`mm-bridge post --thread`)."""
+    async def test_cli_self_post_same_session_in_thread_is_suppressed(self):
+        """target=self also covers a thread-fork session posting into its own
+        thread via the default (no-flag) path."""
         self.bridge.mapping.link(Anchor("c1", "root1"), "s-fork")
 
         await self.bridge._on_mm_posted({
@@ -1187,6 +1173,7 @@ class ForwardingTests(_BridgeTestCase):
             "user_id": self.bridge.mm.bot_user_id, "type": "",
             "props": {
                 "from_bridge_cli": "post",
+                "from_bridge_cli_target": "self",
                 "from_bridge_cli_channel": "c1",
                 "from_bridge_cli_session": "s-fork",
             },
@@ -1194,19 +1181,83 @@ class ForwardingTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.sent, [])
 
-    async def test_cli_post_without_origin_session_still_forwarded(self):
-        """A `post` marker with no `from_bridge_cli_session` (origin couldn't
-        be resolved) falls through and forwards — conservative delivery, same
-        as before the guard."""
+    async def test_cli_self_post_other_session_is_forwarded(self):
+        """A `self`-tagged post whose origin session differs from the target
+        anchor's session is anomalous — forward conservatively (belt and
+        braces: never drop something that isn't clearly a self-echo)."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "unresolved origin",
+            "channel_id": "c1", "message": "odd self stamp",
             "user_id": self.bridge.mm.bot_user_id, "type": "",
-            "props": {"from_bridge_cli": "post", "from_bridge_cli_channel": "c1"},
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_target": "self",
+                "from_bridge_cli_channel": "c1",
+                "from_bridge_cli_session": "s-other",
+            },
         })
 
-        self.assertEqual(self.bridge.vd.sent, [("s1", "unresolved origin")])
+        self.assertEqual(self.bridge.vd.sent, [("s1", "odd self stamp")])
+
+    async def test_cli_explicit_post_other_session_is_forwarded(self):
+        """Normal agentcom: `mm-bridge post --channel` (target=explicit) from a
+        different session forwards."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "Aster (from c-other): ping",
+            "user_id": self.bridge.mm.bot_user_id, "type": "",
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_target": "explicit",
+                "from_bridge_cli_channel": "c-other",
+                "from_bridge_cli_session": "s-other",
+            },
+        })
+
+        self.assertEqual(
+            self.bridge.vd.sent, [("s1", "Aster (from c-other): ping")],
+        )
+
+    async def test_cli_explicit_post_same_session_is_forwarded(self):
+        """Accepted gap: `--channel <your own channel>` (explicit) from the
+        channel's own session is forwarded — a deliberate override, and the
+        robustness win: an explicit agentcom post is NEVER silently dropped,
+        even with a poisoned session resolver."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "explicit into own channel",
+            "user_id": self.bridge.mm.bot_user_id, "type": "",
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_target": "explicit",
+                "from_bridge_cli_channel": "c1",
+                "from_bridge_cli_session": "s1",
+            },
+        })
+
+        self.assertEqual(
+            self.bridge.vd.sent, [("s1", "explicit into own channel")],
+        )
+
+    async def test_cli_post_without_target_tag_is_forwarded(self):
+        """Old CLI (no `from_bridge_cli_target`) → forward conservatively; only
+        an explicit `self` tag ever triggers suppression."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "legacy post",
+            "user_id": self.bridge.mm.bot_user_id, "type": "",
+            "props": {
+                "from_bridge_cli": "post",
+                "from_bridge_cli_channel": "c1",
+                "from_bridge_cli_session": "s1",  # same session, but no target tag
+            },
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "legacy post")])
 
     async def test_posted_with_marker_and_no_channel_field_is_skipped(self):
         """Backwards compat: posts that carry the marker but no
