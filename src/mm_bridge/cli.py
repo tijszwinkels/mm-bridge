@@ -582,7 +582,8 @@ def cmd_post(args: argparse.Namespace) -> int:
     #   * "explicit" — ``--channel``/``--thread`` was given. The daemon ALWAYS
     #                  forwards these, so agentcom can never be silently dropped
     #                  (even if the session resolver is poisoned). The one
-    #                  accepted gap: ``--channel <your own channel>`` forwards.
+    #                  accepted gap: an explicit ``--channel <your own channel>``
+    #                  / ``--thread <your own root>`` forwards.
     # ``cross-post-mirror`` (below) is the only sender-side artifact the
     # recipient suppresses on channel-equality. From a non-session shell there
     # is no echo concern, so emit no marker at all.

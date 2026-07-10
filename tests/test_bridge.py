@@ -1042,12 +1042,12 @@ class ForwardingTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_posted_with_marker_and_matching_channel_is_skipped(self):
-        """Own-channel echo: a CLI-authored post (e.g. ``mm-bridge spawn``'s
-        parent-channel announcement, or ``mm-bridge post`` without
-        ``--channel``) records its origin channel. When that channel
-        matches the channel the post landed in, the dispatcher drops it
-        — the linked session would otherwise read its own bridge
-        artifact back as if a human had typed it."""
+        """Channel-equality drop for the artifact markers (``spawn-announcement``
+        / ``spawn-kickoff`` / ``cross-post-mirror``): when the recorded origin
+        channel matches the channel the post landed in, the dispatcher drops it
+        so the linked session doesn't read its own bridge artifact back as a
+        user turn. (The ``post`` marker is handled separately — intent-keyed —
+        see the self-post matrix below.)"""
         self.bridge.mapping.link(Anchor("c1"), "s1")
 
         await self.bridge._on_mm_posted({
@@ -1082,18 +1082,15 @@ class ForwardingTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent, [("s-target", "Hello from sibling")])
 
     async def test_bridge_forwards_agentcom_post_even_with_channel_equality(self):
-        """Spec test 7 — explicit regression for today's incident.
-
-        Today (post id ``tc8ssq5j7jdr3y18qgu9t5nmuw``): RC1 caused the
-        sender's resolver to return the parent agent's session id, so
-        the sender mis-stamped its own ``from_bridge_cli_channel`` as
-        the destination channel. The old predicate then dropped the
-        post via channel-equality, silently breaking agentcom. After
-        the fix, any post with ``from_bridge_cli="post"`` is treated
-        as explicit agentcom and forwarded regardless of the stamped
-        origin channel — the upstream self-echo filter
-        (``mm_client.py``'s ``is_own_post`` by post id) takes care of
-        the daemon's own outbound dedup."""
+        """Regression for the RC1 incident (post id
+        ``tc8ssq5j7jdr3y18qgu9t5nmuw``): a poisoned resolver mis-stamped the
+        sender's ``from_bridge_cli_channel`` as the destination, and the old
+        channel-equality predicate dropped the post, silently breaking
+        agentcom. Under the intent-keyed rule this exact wire state forwards:
+        suppression requires ``from_bridge_cli_target=="self"`` AND a matching
+        session, and this post carries neither (no target tag → forward; and
+        the session doesn't match either). Real agentcom additionally carries
+        ``target="explicit"`` for defense-in-depth."""
         self.bridge.mapping.link(Anchor("c-destination"), "s-destination")
 
         await self.bridge._on_mm_posted({

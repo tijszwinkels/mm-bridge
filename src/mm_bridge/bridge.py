@@ -789,8 +789,9 @@ class Bridge:
         #     poisoned resolver (the RC1 incident) that leaks a parent session
         #     id can then NEVER cause an explicit agentcom post to be silently
         #     dropped, because agentcom always carries ``--channel`` → "explicit".
-        #     The one accepted gap: ``--channel <your own channel>`` is
-        #     "explicit" and forwards (a deliberate override, harmless). The
+        #     The one accepted gap: an explicit ``--channel <your own
+        #     channel>`` / ``--thread <your own root>`` is "explicit" and
+        #     forwards (a deliberate override, harmless). The
         #     daemon's OWN outbound posts are separately dedup'd upstream by
         #     post id (`mm_client.py`'s `is_own_post`).
         #   * ``"cross-post-mirror"`` — the informational mirror that

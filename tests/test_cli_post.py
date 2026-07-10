@@ -200,15 +200,18 @@ class PostCommandTests(unittest.TestCase):
     # ---------- message / stdin ----------
 
     def test_stdin_message_with_dash(self) -> None:
+        # From inside a session, a default (no --channel) stdin-body post is the
+        # milestone shape. Confirm the body is read AND the intent tag is
+        # stamped "self" regardless of the message coming via stdin vs argv.
+        sidecar.write(self.sdir, "my-sess", "self-chan")
         mm = FakeMM()
         rc, _, _ = self._invoke(
-            mm,
-            ["mm-bridge", "post", "--channel", "c1", "-"],
-            session_id=None,
-            stdin="piped body\n",
+            mm, ["mm-bridge", "post", "-"], stdin="piped body\n",
         )
         self.assertEqual(rc, 0)
+        self.assertEqual(mm.posted[0]["channel_id"], "self-chan")
         self.assertEqual(mm.posted[0]["message"], "piped body")
+        self.assertEqual(mm.posted[0]["props"]["from_bridge_cli_target"], "self")
 
     def test_empty_body_no_file_exits_2(self) -> None:
         mm = FakeMM()
@@ -559,6 +562,9 @@ class CrossChannelMirrorTests(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(len(mm.posted), 1)
+        # Explicit `--channel <own channel>` is the accepted gap: still tagged
+        # "explicit" (→ the bridge forwards it), NOT "self".
+        self.assertEqual(mm.posted[0]["props"]["from_bridge_cli_target"], "explicit")
 
     def test_no_mirror_when_no_channel_flag(self) -> None:
         sidecar.write(self.sdir, "my-sess", "self-chan")
