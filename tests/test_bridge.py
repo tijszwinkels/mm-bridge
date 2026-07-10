@@ -2263,6 +2263,87 @@ class CommandBackendTests(_BridgeTestCase):
         self.assertNotIn(INVITE_PLACEHOLDER, sent_messages)
 
 
+class ThreadConfigSwitchTests(_BridgeTestCase):
+    """`.model <name>` / `.backend <name>` must be REFUSED inside a thread
+    fork: `_restart_session_with_config` only relinks `Anchor(channel)`, so a
+    switch inside a thread would replace the CHANNEL's session while the thread
+    keeps its own — a silent mismatch with a false 'restarted' confirmation.
+    Bare (read-only) `.model` / `.backend` still work in threads."""
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    def _setup_forked_thread(self) -> None:
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s-chan")
+        self.bridge.mapping.link(Anchor("c1", "root1"), "s-fork")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+    async def test_dot_backend_switch_in_thread_refused(self):
+        self._setup_forked_thread()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        # No restart; both mappings untouched.
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-chan")
+        self.assertEqual(
+            self.bridge.mapping.get_session(Anchor("c1", "root1")), "s-fork",
+        )
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("thread", joined)
+        self.assertIn("channel", joined)
+
+    async def test_dot_model_switch_in_thread_refused(self):
+        self._setup_forked_thread()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-chan")
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("thread", joined)
+
+    async def test_bare_model_in_thread_still_reports(self):
+        self._setup_forked_thread()
+        self.bridge.harness.sessions_meta = [{
+            "id": "s-fork", "backend": "claude", "model": "opus",
+            "project": {"path": "/x", "name": "x"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("Current model", "\n".join(self._posted_texts()))
+
+    async def test_bare_backend_in_thread_still_reports(self):
+        self._setup_forked_thread()
+        self.bridge.harness.sessions_meta = [{
+            "id": "s-fork", "backend": "claude", "model": "opus",
+            "project": {"path": "/x", "name": "x"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("Current backend", "\n".join(self._posted_texts()))
+
+
 class CommandPhase3Tests(_BridgeTestCase):
     """`.sessions`, `.invite` — phase 3 (channel creation + invite)."""
 

@@ -194,6 +194,9 @@ gets an "unknown command — try `.help`" reply rather than reaching the agent.
 
 Session-scoped commands (`.stop`, `.status`, `.model`, `.backend`) reply "No
 session in this channel" when the channel has none; the rest work regardless.
+Inside a **thread fork**, bare `.model` / `.backend` (read-only) work, but a
+*switch* (`.model <name>` / `.backend <name>`) is refused — a restart would
+replace the channel's session, not the thread's. Switch from the channel.
 
 ## Inside-a-session directives
 

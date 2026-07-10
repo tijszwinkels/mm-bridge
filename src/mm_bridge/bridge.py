@@ -2350,6 +2350,28 @@ class Bridge:
             or bool(self.current_run_id_by_session.get(session_id))
         )
 
+    def _config_switch_blocked_in_thread(
+        self, channel_id: str, thread_root: str | None, usage: str,
+    ) -> bool:
+        """Refuse a `.model`/`.backend` SWITCH issued inside a thread fork.
+
+        ``_restart_session_with_config`` only unlinks/relinks
+        ``Anchor(channel_id)``, so a switch inside a thread would replace the
+        CHANNEL's session while the thread keeps its own — a silent mismatch
+        that also posts a false "session restarted" confirmation. Bare
+        (read-only) `.model`/`.backend` are unaffected. Returns True (and posts
+        the refusal) when in a thread, so callers ``return`` early.
+        """
+        if not thread_root:
+            return False
+        self._post_cmd_reply(
+            channel_id,
+            f":warning: Thread forks keep their own config — run `{usage}` in "
+            "the channel, not in a thread.",
+            thread_root,
+        )
+        return True
+
     async def _cmd_model(
         self,
         channel_id: str,
@@ -2388,6 +2410,10 @@ class Bridge:
                 f"Switch with `.model <name>`; see options with `.models`.",
                 thread_root,
             )
+            return
+
+        # A switch inside a thread would restart the wrong (channel) session.
+        if self._config_switch_blocked_in_thread(channel_id, thread_root, ".model <name>"):
             return
 
         # Switching mid-run would orphan the active run — refuse.
@@ -2463,6 +2489,10 @@ class Bridge:
                 f"Switch with `.backend <name>`. Known: {known_list}.",
                 thread_root,
             )
+            return
+
+        # A switch inside a thread would restart the wrong (channel) session.
+        if self._config_switch_blocked_in_thread(channel_id, thread_root, ".backend <name>"):
             return
 
         requested = purpose.canonical_backend(arg.strip())
