@@ -6,299 +6,19 @@ import asyncio
 import tempfile
 import time
 import unittest
-from dataclasses import dataclass, field
 from pathlib import Path
 
-from mm_bridge.agent_harness_client import HarnessForkUnsupported
 from mm_bridge.bridge import Bridge
 from mm_bridge.config import Anchor, Config
 
-
-# ───────────────────── Fakes ──────────────────────────────────────────────
-
-
-@dataclass
-class _Post:
-    channel_id: str
-    message: str
-    file_ids: list[str] | None = None
-    root_id: str | None = None
-    props: dict | None = None
-
-
-@dataclass
-class FakeMattermostClient:
-    bot_user_id: str = "bot-user"
-    bot_username: str = "claude"
-    team_id: str = "team-1"
-    channels: dict = field(default_factory=dict)
-    posted: list[_Post] = field(default_factory=list)
-    edits: list[tuple[str, str]] = field(default_factory=list)
-    deletes: list[tuple[str, bool]] = field(default_factory=list)  # (post_id, permanent)
-    renames: list[tuple[str, str]] = field(default_factory=list)
-    removed: list[str] = field(default_factory=list)
-    invited: list[tuple[str, str]] = field(default_factory=list)
-    typing: list[tuple[str, str | None]] = field(default_factory=list)
-    uploaded: list[tuple[str, str]] = field(default_factory=list)
-    headers: list[tuple[str, str]] = field(default_factory=list)
-    purposes: list[tuple[str, str]] = field(default_factory=list)
-    users: dict = field(default_factory=dict)
-    posts_by_channel: dict = field(default_factory=dict)
-    posts_by_id: dict = field(default_factory=dict)
-    files_by_id: dict = field(default_factory=dict)
-    download_failures: set = field(default_factory=set)
-    # Auto-join support:
-    bot_channel_ids: set = field(default_factory=set)
-    public_channels: list = field(default_factory=list)
-    joined: list = field(default_factory=list)
-    # First-message preamble support:
-    channel_members: dict = field(default_factory=dict)
-    # Permanent-delete failure simulation:
-    permanent_delete_disabled: bool = False
-    # Channel-create failure simulation (used by retry-semantics tests):
-    fail_create_channel: bool = False
-    _post_counter: int = 0
-    # Mirror of MattermostClient's own-post tracking — populated
-    # whenever the fake creates or edits a post.
-    own_post_ids: set = field(default_factory=set)
-
-    def _next_post_id(self) -> str:
-        self._post_counter += 1
-        return f"p{self._post_counter}"
-
-    def login(self) -> None:
-        pass
-
-    async def listen_websocket(self, handlers) -> None:
-        # Not driven in unit tests.
-        return
-
-    def is_own_post(self, post_id: str) -> bool:
-        return bool(post_id) and post_id in self.own_post_ids
-
-    def post_message(self, channel_id: str, message: str) -> dict:
-        pid = self._next_post_id()
-        self.posted.append(_Post(channel_id, message))
-        self.own_post_ids.add(pid)
-        return {"id": pid}
-
-    def post(self, channel_id: str, message: str, *, file_ids=None, root_id=None, props=None):
-        pid = self._next_post_id()
-        self.posted.append(_Post(channel_id, message, file_ids, root_id, props))
-        self.own_post_ids.add(pid)
-        return {"id": pid}
-
-    def update_post(self, post_id: str, message: str) -> dict:
-        self.edits.append((post_id, message))
-        self.own_post_ids.add(post_id)
-        return {"id": post_id}
-
-    def delete_post(self, post_id: str, *, permanent: bool = False) -> None:
-        if permanent and self.permanent_delete_disabled:
-            raise RuntimeError(
-                "Cannot delete post, ServiceSettings.EnableAPIPostDeletion is not enabled."
-            )
-        self.deletes.append((post_id, permanent))
-
-    def create_channel(self, name: str, display_name: str, purpose: str = "") -> dict:
-        if self.fail_create_channel:
-            raise RuntimeError("simulated MM create_channel failure")
-        cid = f"c-{name}"
-        self.channels[cid] = {
-            "id": cid, "name": name, "display_name": display_name, "purpose": purpose,
-        }
-        return {"id": cid}
-
-    def rename_channel(self, channel_id: str, display_name: str) -> None:
-        self.renames.append((channel_id, display_name))
-
-    def set_channel_header(self, channel_id: str, header: str) -> None:
-        self.headers.append((channel_id, header))
-        self.channels.setdefault(channel_id, {"id": channel_id})["header"] = header
-
-    def set_channel_purpose(self, channel_id: str, purpose: str) -> None:
-        self.purposes.append((channel_id, purpose))
-        self.channels.setdefault(channel_id, {"id": channel_id})["purpose"] = purpose
-
-    def get_channel(self, channel_id: str) -> dict:
-        return self.channels.get(channel_id, {"id": channel_id, "purpose": ""})
-
-    def remove_self_from_channel(self, channel_id: str) -> None:
-        self.removed.append(channel_id)
-
-    def invite_user(self, channel_id: str, user_id: str) -> dict:
-        self.invited.append((channel_id, user_id))
-        return {"channel_id": channel_id, "user_id": user_id}
-
-    def get_user(self, user_id: str) -> dict:
-        return self.users.get(user_id, {"id": user_id, "username": f"u-{user_id[:4]}"})
-
-    def publish_user_typing(self, channel_id: str, parent_id=None) -> None:
-        self.typing.append((channel_id, parent_id))
-
-    def upload_file(self, channel_id: str, path) -> str:
-        fid = f"f-{len(self.uploaded)}"
-        self.uploaded.append((channel_id, str(path)))
-        return fid
-
-    def download_file(self, file_id: str) -> bytes:
-        if file_id in self.download_failures:
-            raise RuntimeError(f"simulated download failure for {file_id}")
-        return self.files_by_id.get(file_id, b"")
-
-    def get_max_file_size(self) -> int:
-        return 50 * 1024 * 1024
-
-    def get_posts(self, channel_id: str, limit: int) -> list[dict]:
-        return self.posts_by_channel.get(channel_id, [])[:limit]
-
-    def get_post(self, post_id: str) -> dict:
-        return self.posts_by_id.get(post_id, {"message": ""})
-
-    def get_bot_channel_ids(self) -> set:
-        return set(self.bot_channel_ids)
-
-    def list_public_team_channels(self) -> list:
-        return list(self.public_channels)
-
-    def join_channel(self, channel_id: str) -> None:
-        self.joined.append(channel_id)
-        self.bot_channel_ids.add(channel_id)
-
-    def join_all_public_team_channels(self) -> list:
-        newly = [
-            ch["id"] for ch in self.public_channels
-            if ch["id"] not in self.bot_channel_ids
-        ]
-        for cid in newly:
-            self.join_channel(cid)
-        return newly
-
-    def get_channel_members(self, channel_id: str) -> list:
-        return list(self.channel_members.get(channel_id, []))
-
-
-@dataclass
-class FakeAgentHarnessClient:
-    created: list[dict] = field(default_factory=list)
-    sent: list[tuple[str, str]] = field(default_factory=list)
-    forks: list[tuple[str, str]] = field(default_factory=list)
-    titles: list[tuple[str, str | None]] = field(default_factory=list)
-    interrupted: list[str] = field(default_factory=list)
-    next_session_id: str = "session-next"
-    session_create_count: int = 0
-    fork_response: dict | None = None
-    sessions_meta: list[dict] = field(default_factory=list)
-    # Run rows served by get_run / list_session_runs, mirroring the harness
-    # GET runs endpoints. ``run_probe_error`` simulates a dead harness.
-    runs_meta: dict = field(default_factory=dict)  # (session_id, run_id) → row
-    session_runs_meta: dict = field(default_factory=dict)  # session_id → [rows]
-    run_probe_error: Exception | None = None
-    models_by_backend: dict = field(default_factory=lambda: {
-        "claude": ["opus", "sonnet"],
-        "codex": ["gpt-5.4"],
-        "pi": ["pi-v1"],
-        "opencode": [],
-    })
-
-    async def close(self) -> None:
-        pass
-
-    async def health(self) -> dict:
-        return {"ok": True}
-
-    async def create_session(
-        self,
-        *,
-        backend,
-        model=None,
-        cwd,
-        title=None,
-    ) -> dict:
-        self.created.append({
-            "cwd": cwd, "backend": backend, "model": model, "title": title,
-        })
-        self.session_create_count += 1
-        session_id = self.next_session_id
-        if self.session_create_count > 1:
-            session_id = f"{self.next_session_id}-{self.session_create_count}"
-        return {
-            "id": session_id,
-            "backend": backend,
-            "model": model,
-            "project": {"path": cwd, "name": Path(cwd).name},
-            "title": title,
-            "origin": "harness",
-        }
-
-    async def create_run(self, session_id, message) -> dict:
-        self.sent.append((session_id, message))
-        return {"session_id": session_id, "run_id": f"run-{len(self.sent)}"}
-
-    async def send_message(self, session_id, message) -> dict:
-        return await self.create_run(session_id, message)
-
-    async def fork_session(self, session_id, *, message=None, title=None) -> dict:
-        message = message or ""
-        self.forks.append((session_id, message))
-        if self.fork_response is not None:
-            if self.fork_response.get("status") == "fork_unavailable":
-                raise HarnessForkUnsupported(self.fork_response.get("reason", "unsupported"))
-            return self.fork_response
-        return {
-            "session": {"id": f"fork-{len(self.forks)}"},
-            "run": {"id": f"fork-run-{len(self.forks)}"},
-        }
-
-    async def list_sessions(self) -> list[dict]:
-        return self.sessions_meta
-
-    async def get_session(self, session_id):
-        for s in self.sessions_meta:
-            if s.get("id") == session_id:
-                if "project" not in s and s.get("projectPath"):
-                    return {**s, "project": {"path": s.get("projectPath")}}
-                return s
-        return None
-
-    async def get_session_meta(self, session_id):
-        return await self.get_session(session_id) or {}
-
-    async def get_run(self, session_id, run_id):
-        if self.run_probe_error is not None:
-            raise self.run_probe_error
-        return self.runs_meta.get((session_id, run_id))
-
-    async def list_session_runs(self, session_id):
-        if self.run_probe_error is not None:
-            raise self.run_probe_error
-        return self.session_runs_meta.get(session_id, [])
-
-    async def set_session_title(self, session_id, title) -> None:
-        self.titles.append((session_id, title))
-
-    async def interrupt_run(self, session_id, run_id) -> dict:
-        self.interrupted.append((session_id, run_id))
-        return {"status": "interrupted", "session_id": session_id, "run_id": run_id}
-
-    async def interrupt_session(self, session_id) -> dict:
-        await self.interrupt_run(session_id, "legacy-run")
-        return {"status": "interrupted", "session_id": session_id}
-
-    async def probe_current_sequence(self, **_kwargs) -> int:
-        # High default keeps warm-restart tests free of a no-op reset.
-        # Reset-detection tests override this attribute on the instance.
-        return 10**9
-
-    async def list_backend_models(self, backend) -> list[str]:
-        return self.models_by_backend.get(backend, [])
-
-    async def list_models(self, backend, *, force_refresh: bool = False) -> list[str]:
-        return await self.list_backend_models(backend)
-
-    async def stream_events(self, on_event) -> None:
-        return
-
+# The fake MM / agent-harness clients, the active ``EventEchoingMattermostClient``
+# double, and ``make_bridge`` live in ``doubles.py`` so any test module can reuse
+# them (see Item 2 of the drop-first-message-config work).
+from doubles import (
+    EventEchoingMattermostClient,
+    FakeAgentHarnessClient,
+    FakeMattermostClient,
+)
 
 # ───────────────────── Test fixtures ──────────────────────────────────────
 
@@ -2219,6 +1939,25 @@ class CommandPhase2Tests(_BridgeTestCase):
         self.assertEqual(self.bridge.harness.created[-1]["backend"], "claude")
         self.assertIn("claude-sonnet", self.bridge.mm.channels["c1"]["purpose"])
 
+    async def test_dot_model_restart_is_quiet_no_greeting_run(self):
+        from mm_bridge.bridge import INVITE_PLACEHOLDER
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        # New session created, but the restart does not burn a greeting run.
+        self.assertTrue(self.bridge.harness.created)
+        sent_messages = [m for (_sid, m) in self.bridge.harness.sent]
+        self.assertNotIn(INVITE_PLACEHOLDER, sent_messages)
+
     async def test_dot_model_refuses_while_run_active(self):
         from mm_bridge.purpose import PurposeConfig
         self.bridge.mapping.link(Anchor("c1"), "s1")
@@ -2375,6 +2114,240 @@ class CommandPhase2Tests(_BridgeTestCase):
 
         joined = "\n".join(self._posted_texts()).lower()
         self.assertIn("no runs", joined)
+
+
+class CommandBackendTests(_BridgeTestCase):
+    """`.backend [<name>]` — mirrors `.model`, but validates against
+    KNOWN_BACKENDS (backends ARE enumerable) and drops the carried model on
+    a switch (models are backend-specific)."""
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    async def test_dot_backend_switches_and_drops_carried_model(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        # A new session was created on the requested backend...
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        # ...with the carried claude model DROPPED → per-backend codex default.
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "gpt-5.5")
+        # Persisted purpose names the new backend, not the old model.
+        self.assertIn("codex", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertNotIn("opus", self.bridge.mm.channels["c1"]["purpose"])
+        # In-memory config reflects the drop.
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].backend, "codex")
+        self.assertIsNone(self.bridge.purpose_by_channel["c1"].model)
+
+    async def test_dot_backend_alias_is_canonicalized(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="codex", model="gpt-5.5", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "codex"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend claude-code",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "claude")
+
+    async def test_dot_backend_unknown_rejected_inline_no_restart(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend frobnicate",
+            "user_id": "u1", "type": "",
+        })
+
+        # No restart; an inline rejection naming the known backends.
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("unknown backend", joined)
+        self.assertIn("claude", joined)
+
+    async def test_dot_backend_refuses_while_run_active(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("run is active", joined)
+
+    async def test_dot_backend_same_backend_is_noop(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend claude",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("already on", joined)
+
+    async def test_bare_backend_shows_current_and_known(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("claude", joined)
+        # Lists the other known backends too.
+        self.assertIn("codex", joined)
+
+    async def test_dot_backend_no_session_replies_no_session(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("no session", joined)
+
+    async def test_dot_backend_restart_is_quiet_no_greeting_run(self):
+        from mm_bridge.bridge import INVITE_PLACEHOLDER
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        # Session recreated on the new backend, but NO greeting/warming run
+        # fired — the confirmation post is the only channel output.
+        self.assertTrue(self.bridge.harness.created)
+        sent_messages = [m for (_sid, m) in self.bridge.harness.sent]
+        self.assertNotIn(INVITE_PLACEHOLDER, sent_messages)
+
+
+class ThreadConfigSwitchTests(_BridgeTestCase):
+    """`.model <name>` / `.backend <name>` must be REFUSED inside a thread
+    fork: `_restart_session_with_config` only relinks `Anchor(channel)`, so a
+    switch inside a thread would replace the CHANNEL's session while the thread
+    keeps its own — a silent mismatch with a false 'restarted' confirmation.
+    Bare (read-only) `.model` / `.backend` still work in threads."""
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    def _setup_forked_thread(self) -> None:
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s-chan")
+        self.bridge.mapping.link(Anchor("c1", "root1"), "s-fork")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+    async def test_dot_backend_switch_in_thread_refused(self):
+        self._setup_forked_thread()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        # No restart; both mappings untouched.
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-chan")
+        self.assertEqual(
+            self.bridge.mapping.get_session(Anchor("c1", "root1")), "s-fork",
+        )
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("thread", joined)
+        self.assertIn("channel", joined)
+
+    async def test_dot_model_switch_in_thread_refused(self):
+        self._setup_forked_thread()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-chan")
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("thread", joined)
+
+    async def test_bare_model_in_thread_still_reports(self):
+        self._setup_forked_thread()  # channel config is claude/opus
+        # Give the fork DISTINCT metadata so we can tell whether bare `.model`
+        # reports the fork's model (correct) or leaked the channel's (opus).
+        self.bridge.harness.sessions_meta = [{
+            "id": "s-fork", "backend": "codex", "model": "gpt-5.5",
+            "project": {"path": "/x", "name": "x"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("Current model: `gpt-5.5`", joined)  # the FORK's model
+        self.assertNotIn("opus", joined)  # not the channel session's
+
+    async def test_bare_backend_in_thread_still_reports(self):
+        self._setup_forked_thread()  # channel config is claude/opus
+        # Distinct fork backend so a leak of the channel session (claude) is
+        # caught — bare `.backend` must report the fork's `codex`.
+        self.bridge.harness.sessions_meta = [{
+            "id": "s-fork", "backend": "codex", "model": "gpt-5.5",
+            "project": {"path": "/x", "name": "x"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("Current backend: `codex`", "\n".join(self._posted_texts()))
 
 
 class CommandPhase3Tests(_BridgeTestCase):
@@ -2539,116 +2512,64 @@ class CommandPhase3Tests(_BridgeTestCase):
         self.assertIn("Usage", "\n".join(self._posted_texts()))
 
 
-class FirstMessageConfigTests(_BridgeTestCase):
-    """First user message after invite may re-configure the channel via tokens.
+class FirstMessageNoConfigTests(_BridgeTestCase):
+    """First-message backend/model selection was removed (2026-07-09).
 
-    If it parses cleanly as config, we apply + persist + confirm. If it changes
-    backend/model/cwd we restart the session; if only the mention flag changes,
-    we update in-place.
+    A first user message that *looks* like config tokens (`claude, sonnet`)
+    is now forwarded to the agent verbatim — dot-commands and Channel
+    Purpose are the only configuration paths. The channel still tracks a
+    "first forwarded message" slot so that message carries the MM-context
+    preamble; it just no longer parses content as config.
     """
 
-    async def _prime_channel(self, channel_id: str, purpose: str = "") -> None:
-        """Simulate a successful invite: session mapped, awaiting first message."""
+    async def _prime_channel(self, channel_id: str, purpose: str = "autorespond") -> str:
+        """Invite the bot (starts a session, marks the first-forward slot)."""
         self.bridge.mm.channels[channel_id] = {"id": channel_id, "purpose": purpose}
         await self.bridge._on_mm_user_added(channel_id, self.bridge.mm.bot_user_id)
         session_id = self.bridge.mapping.get_session(Anchor(channel_id))
         assert session_id is not None
-        self.bridge.awaiting_first_message.add(channel_id)
         self.bridge.vd.sent.clear()
+        self.bridge.vd.created.clear()
+        self.bridge.mm.posted.clear()
         return session_id
 
-    async def test_non_config_first_message_forwards_normally(self):
-        # Prime with autorespond so the mention-only filter is out of the way —
-        # this test is about the first-message-config gate, not the mention rule.
-        session_id = await self._prime_channel("c1", purpose="autorespond")
-        # Clear bot posts from the welcome message.
-        self.bridge.vd.created.clear()
-
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "hello world",
-            "user_id": "u1", "type": "",
-        })
-
-        # Forwarded — message body may be prefixed with a first-message
-        # preamble; we only assert the tail is correct here.
-        self.assertEqual(len(self.bridge.vd.sent), 1)
-        self.assertEqual(self.bridge.vd.sent[0][0], session_id)
-        self.assertTrue(self.bridge.vd.sent[0][1].endswith("hello world"))
-        self.assertNotIn("c1", self.bridge.awaiting_first_message)
-
-    async def test_flag_only_config_updates_in_place_no_session_restart(self):
+    async def test_config_token_first_message_is_forwarded_not_intercepted(self):
         session_id = await self._prime_channel("c1")
-        self.bridge.vd.created.clear()
-
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "autorespond",
-            "user_id": "u1", "type": "",
-        })
-
-        # Session is NOT restarted.
-        self.assertEqual(self.bridge.vd.created, [])
-        # Still mapped.
-        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), session_id)
-        # Config updated: mention_only now False.
-        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
-        # Persisted back to Channel Purpose.
-        self.assertIn("autorespond", self.bridge.mm.channels["c1"]["purpose"])
-        # Confirmation posted, message not forwarded.
-        self.assertEqual(self.bridge.vd.sent, [])
-        self.assertNotIn("c1", self.bridge.awaiting_first_message)
-
-    async def test_config_with_model_change_restarts_session(self):
-        session_id = await self._prime_channel("c1", purpose="claude, opus")
-        self.bridge.vd.created.clear()
+        # The invite marked the channel as awaiting its first forwarded message.
+        self.assertIn("c1", self.bridge._awaiting_first_forward)
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "claude, sonnet",
             "user_id": "u1", "type": "",
         })
 
-        # Old session unmapped, a new session created.
-        self.assertEqual(len(self.bridge.vd.created), 1)
-        self.assertEqual(self.bridge.vd.created[0]["model"], "sonnet")
-        # Original session no longer linked.
-        self.assertNotEqual(self.bridge.mapping.get_session(Anchor("c1")), session_id)
-        # Persisted.
-        self.assertIn("sonnet", self.bridge.mm.channels["c1"]["purpose"])
-
-    async def test_bot_mention_prefix_treats_as_normal_message(self):
-        """Commands like `@claude stop` or a plain '@claude hi' must NOT parse
-        as config — they contain the bot mention which isn't a known token."""
-        session_id = await self._prime_channel("c1")
-        self.bridge.vd.created.clear()
-
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "@claude hi",
-            "user_id": "u1", "type": "",
-        })
-
-        # Forwarded (with mention stripped). A first-message preamble may
-        # prefix the body; assert only that the tail is "hi".
+        # Forwarded to the agent — NOT swallowed as config.
         self.assertEqual(len(self.bridge.vd.sent), 1)
         self.assertEqual(self.bridge.vd.sent[0][0], session_id)
-        self.assertTrue(self.bridge.vd.sent[0][1].endswith("hi"))
+        self.assertTrue(self.bridge.vd.sent[0][1].endswith("claude, sonnet"))
+        # No session restart and no "Config applied" confirmation.
+        self.assertEqual(self.bridge.vd.created, [])
+        self.assertFalse(
+            any("Config applied" in p.message for p in self.bridge.mm.posted),
+            "first message must not be consumed as config",
+        )
+        # First-forward slot consumed.
+        self.assertNotIn("c1", self.bridge._awaiting_first_forward)
 
-    async def test_only_first_message_is_checked_for_config(self):
-        """Once the channel is no longer awaiting, tokens-that-look-like-config
-        should be forwarded verbatim — not swallowed."""
-        session_id = await self._prime_channel("c1", purpose="autorespond")
-        self.bridge.vd.created.clear()
+    async def test_second_config_looking_message_also_forwards(self):
+        session_id = await self._prime_channel("c1")
 
-        # First message: normal → removes awaiting flag.
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "hello", "user_id": "u1", "type": "",
         })
-        # Second message: looks like config but must forward.
         await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "claude, sonnet",
+            "channel_id": "c1", "message": "codex, gpt-5.5",
             "user_id": "u1", "type": "",
         })
 
         self.assertEqual(len(self.bridge.vd.sent), 2)
-        self.assertEqual(self.bridge.vd.sent[1][1], "claude, sonnet")
+        # The second message is forwarded verbatim (no preamble on it).
+        self.assertEqual(self.bridge.vd.sent[1][1], "codex, gpt-5.5")
 
 
 class MergeConfigsTests(_BridgeTestCase):
@@ -2693,49 +2614,43 @@ class MergeConfigsTests(_BridgeTestCase):
         self.assertEqual(merged.model, "opus")
 
 
-class RuntimeToggleTests(_BridgeTestCase):
-    """After the first message, only the literal words `autorespond` and
-    `noautorespond` toggle the mention_only flag — nothing else."""
+class MessageContentNotConfigTests(_BridgeTestCase):
+    """The bare `autorespond`/`noautorespond` message-content toggle was
+    removed (2026-07-10): message content is never config — `.autorespond` is
+    the only path. Such words are now forwarded to the agent verbatim and the
+    mention flag is left untouched."""
 
-    async def test_literal_noautorespond_toggles_mention_only_on(self):
-        self.bridge.mapping.link(Anchor("c1"), "s1")
+    def _autorespond_channel(self) -> None:
         from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model="opus", mention_only=False,
         )
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
 
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "noautorespond",
-            "user_id": "u1", "type": "",
-        })
-
-        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
-        # Persisted + not forwarded.
-        self.assertIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
-        self.assertEqual(self.bridge.vd.sent, [])
-
-    async def test_literal_autorespond_toggles_mention_only_off(self):
-        self.bridge.mapping.link(Anchor("c1"), "s1")
-        from mm_bridge.purpose import PurposeConfig
-        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
-            backend="claude", model="opus", mention_only=True,
-        )
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1", "purpose": "claude, opus, mention-only",
-        }
+    async def test_bare_autorespond_message_is_forwarded(self):
+        self._autorespond_channel()
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "autorespond",
             "user_id": "u1", "type": "",
         })
 
+        self.assertEqual(self.bridge.vd.sent, [("s1", "autorespond")])
         self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
-        self.assertNotIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
-        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_bare_noautorespond_message_is_forwarded(self):
+        self._autorespond_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "noautorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "noautorespond")])
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
 
     async def test_autorespond_with_trailing_text_is_regular_message(self):
-        """`autorespond now` must NOT toggle — only the literal word alone does."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
@@ -2748,26 +2663,58 @@ class RuntimeToggleTests(_BridgeTestCase):
 
 
 class PurposeUpdateNoticeTests(_BridgeTestCase):
+    """Self-written purpose changes must not spawn the "purpose changed"
+    notice; genuine external (human) edits still do.
+
+    These exercise the real WS round-trip via
+    :class:`EventEchoingMattermostClient` — the double echoes every purpose
+    write the bridge makes back as a ``channel_updated`` event, so the dedup
+    is verified end-to-end (``deliver_ws_events``) rather than by the test
+    author hand-scripting the event payloads.
+    """
+
+    async def asyncSetUp(self):  # type: ignore[override]
+        await super().asyncSetUp()
+        from mm_bridge.typing_indicator import TypingIndicator
+        self.bridge.mm = EventEchoingMattermostClient()
+        self.bridge.typing = TypingIndicator(self.bridge.mm, refresh_s=0.01)
+
+    def _notices(self) -> list:
+        return [
+            p for p in self.bridge.mm.posted
+            if "takes effect only for new sessions" in p.message
+        ]
+
     async def test_self_triggered_purpose_change_suppresses_notice(self):
-        """When the bridge writes the purpose (e.g. after a runtime toggle),
-        the incoming `channel_updated` event must not spawn a user notice."""
+        """A bridge-initiated purpose write (here: an autorespond toggle)
+        echoes back through the double as a channel_updated event and must
+        NOT spawn a user notice."""
+        from mm_bridge.purpose import PurposeConfig
         self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
         self.bridge.last_channel_state["c1"] = {
             "display_name": "", "purpose": "claude, opus",
         }
-        self.bridge._note_self_wrote_purpose("c1", "claude, opus, mention-only")
 
-        await self.bridge._on_mm_channel_updated({
-            "id": "c1", "display_name": "", "purpose": "claude, opus, mention-only",
+        # Real self-write: the literal toggle persists the purpose.
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "noautorespond",
+            "user_id": "u1", "type": "",
         })
+        await self.bridge.mm.deliver_ws_events(self.bridge)
 
-        self.assertFalse(
-            any("takes effect only for new sessions" in p.message
-                for p in self.bridge.mm.posted),
+        self.assertEqual(
+            self._notices(), [],
             "self-written purpose must not trigger the change notice",
         )
 
     async def test_external_purpose_change_still_posts_notice(self):
+        """A human editing the Purpose in the MM UI is NOT a bridge self-write
+        (the double never queued it), so the notice still fires. This one
+        drives the WS handler directly — that's what an external edit is."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.last_channel_state["c1"] = {
             "display_name": "", "purpose": "claude, opus",
@@ -2777,9 +2724,68 @@ class PurposeUpdateNoticeTests(_BridgeTestCase):
             "id": "c1", "display_name": "", "purpose": "claude, opus, mention-only",
         })
 
-        self.assertTrue(
-            any("takes effect only for new sessions" in p.message
-                for p in self.bridge.mm.posted),
+        self.assertEqual(len(self._notices()), 1)
+
+    async def test_channel_removal_clears_per_channel_config_state(self):
+        """Removing the bot must drain the channel's pending self-write set and
+        first-forward flag — otherwise a mid-restart removal leaks entries."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge._note_self_wrote_purpose("c1", "claude, opus")
+        self.bridge._awaiting_first_forward.add("c1")
+
+        await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
+
+        self.assertNotIn("c1", self.bridge._self_written_purpose)
+        self.assertNotIn("c1", self.bridge._awaiting_first_forward)
+
+    async def test_multiple_self_writes_all_suppressed(self):
+        """Two self-writes in quick succession (as a `.model`/`.backend`
+        restart makes: resume block + config) both echo back through the
+        double and must both be suppressed — a single-slot tracker remembered
+        only the last write and let the first one notify."""
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "", "purpose": "claude, opus",
+        }
+        first = "claude, opus\n\n---\n\nResume:\n```\ncd /x && claude --resume s1\n```"
+        second = "claude, sonnet\n\n---\n\nResume:\n```\ncd /x && claude --resume s2\n```"
+        for pur in (first, second):
+            self.bridge._note_self_wrote_purpose("c1", pur)
+            self.bridge.mm.set_channel_purpose("c1", pur)  # double queues a WS echo
+
+        await self.bridge.mm.deliver_ws_events(self.bridge)
+
+        self.assertEqual(
+            self._notices(), [], "all self-written purpose writes must be silent",
+        )
+
+    async def test_dot_model_restart_emits_no_purpose_notice(self):
+        """End-to-end: a `.model` switch's purpose writes echo back through the
+        double as channel_updated events; none may spawn the change notice
+        (the change already took effect via restart)."""
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "", "purpose": "claude, opus",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+        # The double replays every purpose write the switch made, in order.
+        self.assertGreaterEqual(
+            len([p for (c, p) in self.bridge.mm.purposes if c == "c1"]), 1,
+        )
+        await self.bridge.mm.deliver_ws_events(self.bridge)
+
+        self.assertEqual(
+            self._notices(), [],
+            "a self-initiated .model switch must not notify",
         )
 
 
@@ -3456,8 +3462,8 @@ class AutoJoinTests(_BridgeTestCase):
         self.assertNotIn("c1", self.bridge.warming_up_sessions)
         self.assertNotIn(
             "c1",
-            self.bridge.awaiting_first_message,
-            "engagement sessions must not re-enter the first-message config gate",
+            self.bridge._awaiting_first_forward,
+            "engagement sessions already consumed their first message",
         )
         # No welcome message for engagement — the response is the welcome.
         self.assertEqual(self.bridge.mm.posted, [])
@@ -3486,8 +3492,11 @@ class AutoJoinTests(_BridgeTestCase):
             self.bridge.vd.sent[0][1], "no mention at all",
         )
 
-    async def test_mention_with_pure_config_applies_without_session(self):
-        """`@claude autorespond` on an auto-joined channel should configure, not engage."""
+    async def test_mention_with_config_tokens_starts_session_and_forwards(self):
+        """Config-via-message on auto-join is gone (2026-07-09): `@claude
+        autorespond` no longer configures the channel without a session — it
+        starts one and is forwarded verbatim, exactly like the invite path.
+        Configuration is dot-commands / Channel Purpose only."""
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
         await self.bridge._on_mm_posted({
@@ -3495,18 +3504,18 @@ class AutoJoinTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        # No VD session created — message was pure config.
-        self.assertEqual(self.bridge.vd.created, [])
-        self.assertNotIn("c1", self.bridge.warming_up_sessions)
-        # Purpose cached + persisted.
-        self.assertIn("c1", self.bridge.purpose_by_channel)
-        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
-        # Confirmation posted.
-        self.assertEqual(len(self.bridge.mm.posted), 1)
-        self.assertIn("Config applied", self.bridge.mm.posted[0].message)
+        # A session was created and the message forwarded verbatim.
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.sent[0][1], "autorespond")
+        # NOT consumed as config — no "Config applied" notice.
+        self.assertFalse(
+            any("Config applied" in p.message for p in self.bridge.mm.posted),
+            "engagement message must not be swallowed as config",
+        )
 
-    async def test_mention_with_config_alias_spelling(self):
-        """Accept `autoresponse` / `noautoresponse` spelling variants."""
+    async def test_mention_with_config_alias_also_forwards(self):
+        """A config-alias word (`noautoresponse`) is likewise forwarded, not
+        applied as config."""
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
         await self.bridge._on_mm_posted({
@@ -3514,9 +3523,11 @@ class AutoJoinTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.created, [])
-        self.assertIn("c1", self.bridge.purpose_by_channel)
-        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.sent[0][1], "noautoresponse")
+        self.assertFalse(
+            any("Config applied" in p.message for p in self.bridge.mm.posted),
+        )
 
     async def test_mention_with_chat_still_engages(self):
         """Chat text with unknown tokens should still start a session."""
@@ -3531,11 +3542,11 @@ class AutoJoinTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent[0][1], "hello there")
 
     async def test_engagement_chat_engages_with_empty_model_catalog(self):
-        """Production harness returns ``data: []`` for the model catalog.
-        Without ``strict_catalog`` the engagement pre-session config
-        parser would silently consume "Hi Claude!" as ``model=hi claude!``
-        and never start a session. Regression for the 2026-05-12 new-channel
-        bug where every user message just rewrote the channel purpose."""
+        """The first engagement message always starts a session and is
+        forwarded verbatim — never parsed as config. Regression for the
+        2026-05-12 new-channel bug where message content was rewritten into
+        the channel purpose instead of starting a session (the pre-session
+        config parser that caused it was removed 2026-07-09)."""
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
         # Mirror live agent-harness behaviour: empty model lists.
         self.bridge.harness.models_by_backend = {
@@ -3583,7 +3594,7 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         display_name: str,
         members: list[dict],
     ) -> str:
-        """Set up a mapped channel with `awaiting_first_message` set and the
+        """Set up a mapped channel with `_awaiting_first_forward` set and the
         given member roster. Returns the session_id."""
         self.bridge.mm.channels[channel_id] = {
             "id": channel_id, "purpose": "", "display_name": display_name,
@@ -3600,7 +3611,7 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         ]
         session_id = "s-primed"
         self.bridge.mapping.link(Anchor(channel_id), session_id)
-        self.bridge.awaiting_first_message.add(channel_id)
+        self.bridge._awaiting_first_forward.add(channel_id)
         return session_id
 
     async def test_single_user_preamble_prepended(self) -> None:
@@ -3698,9 +3709,10 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         self.assertIn("Running inside Mattermost channel", self.bridge.vd.sent[0][1])
         self.assertNotIn("Running inside Mattermost channel", self.bridge.vd.sent[1][1])
 
-    async def test_config_token_first_message_does_not_forward_preamble(self) -> None:
-        """First-message purpose tokens are consumed as config — nothing goes
-        to VD, so there's no preamble either."""
+    async def test_config_word_first_message_forwards_with_preamble(self) -> None:
+        """A bare `autorespond` first message is no longer special (the
+        message-content toggle was removed) — it's forwarded verbatim and
+        carries the MM-context preamble like any other first message."""
         await self._prime_channel_with_members(
             "c1",
             display_name="Bug Bash",
@@ -3714,7 +3726,10 @@ class FirstMessagePreambleTests(_BridgeTestCase):
             "user_id": "u-alice", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.sent, [])
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        sent = self.bridge.vd.sent[0][1]
+        self.assertIn("Running inside Mattermost channel", sent)
+        self.assertTrue(sent.endswith("autorespond"))
 
     async def test_preamble_format_helper_single_user(self) -> None:
         from mm_bridge.bridge import _format_first_message_preamble
@@ -3929,16 +3944,32 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
         welcomes = self._welcomes()
         self.assertEqual(len(welcomes), 1, "exactly one join welcome on /invite")
         # Body checkpoints — the elevator pitch (with the configured bot
-        # username), the first-message reconfig hint, and the backend list.
+        # username), the dot-command config hints, and the backend list.
         body = welcomes[0].message
         self.assertIn("@claude", body)  # bot_username from the fake
-        self.assertIn("first message", body)
+        self.assertIn("`.model", body)
+        self.assertIn("`.backend", body)
+        self.assertIn("Channel Purpose", body)
         self.assertIn("`claude`", body)  # backend list
+        # The removed first-message selector must NOT be advertised anymore.
+        self.assertNotIn("first message", body)
+        self.assertNotIn("Pick a backend", body)
         # The session-start welcome still fires too.
         self.assertTrue(
             any("Session started" in p.message for p in self.bridge.mm.posted),
             "session-start welcome must continue to fire",
         )
+
+    def test_session_start_welcome_points_to_dot_commands_not_first_message(self):
+        from mm_bridge.purpose import PurposeConfig
+        cfg = PurposeConfig(backend="claude", model="opus", mention_only=False)
+        body = self.bridge._format_welcome(cfg, "/tmp/proj")
+        # The removed first-message reconfig hint is gone...
+        self.assertNotIn("First message", body)
+        self.assertNotIn("reconfigure", body)
+        # ...replaced by the dot-command config hints.
+        self.assertIn(".model", body)
+        self.assertIn(".backend", body)
 
     async def test_welcome_points_to_dot_help_and_dot_stop(self):
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
