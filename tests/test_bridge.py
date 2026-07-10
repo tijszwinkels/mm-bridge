@@ -3674,8 +3674,11 @@ class AutoJoinTests(_BridgeTestCase):
             self.bridge.vd.sent[0][1], "no mention at all",
         )
 
-    async def test_mention_with_pure_config_applies_without_session(self):
-        """`@claude autorespond` on an auto-joined channel should configure, not engage."""
+    async def test_mention_with_config_tokens_starts_session_and_forwards(self):
+        """Config-via-message on auto-join is gone (2026-07-09): `@claude
+        autorespond` no longer configures the channel without a session — it
+        starts one and is forwarded verbatim, exactly like the invite path.
+        Configuration is dot-commands / Channel Purpose only."""
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
         await self.bridge._on_mm_posted({
@@ -3683,18 +3686,18 @@ class AutoJoinTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        # No VD session created — message was pure config.
-        self.assertEqual(self.bridge.vd.created, [])
-        self.assertNotIn("c1", self.bridge.warming_up_sessions)
-        # Purpose cached + persisted.
-        self.assertIn("c1", self.bridge.purpose_by_channel)
-        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
-        # Confirmation posted.
-        self.assertEqual(len(self.bridge.mm.posted), 1)
-        self.assertIn("Config applied", self.bridge.mm.posted[0].message)
+        # A session was created and the message forwarded verbatim.
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.sent[0][1], "autorespond")
+        # NOT consumed as config — no "Config applied" notice.
+        self.assertFalse(
+            any("Config applied" in p.message for p in self.bridge.mm.posted),
+            "engagement message must not be swallowed as config",
+        )
 
-    async def test_mention_with_config_alias_spelling(self):
-        """Accept `autoresponse` / `noautoresponse` spelling variants."""
+    async def test_mention_with_config_alias_also_forwards(self):
+        """A config-alias word (`noautoresponse`) is likewise forwarded, not
+        applied as config."""
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
         await self.bridge._on_mm_posted({
@@ -3702,9 +3705,11 @@ class AutoJoinTests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.created, [])
-        self.assertIn("c1", self.bridge.purpose_by_channel)
-        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.sent[0][1], "noautoresponse")
+        self.assertFalse(
+            any("Config applied" in p.message for p in self.bridge.mm.posted),
+        )
 
     async def test_mention_with_chat_still_engages(self):
         """Chat text with unknown tokens should still start a session."""
@@ -3719,11 +3724,11 @@ class AutoJoinTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.sent[0][1], "hello there")
 
     async def test_engagement_chat_engages_with_empty_model_catalog(self):
-        """Production harness returns ``data: []`` for the model catalog.
-        Without ``strict_catalog`` the engagement pre-session config
-        parser would silently consume "Hi Claude!" as ``model=hi claude!``
-        and never start a session. Regression for the 2026-05-12 new-channel
-        bug where every user message just rewrote the channel purpose."""
+        """The first engagement message always starts a session and is
+        forwarded verbatim — never parsed as config. Regression for the
+        2026-05-12 new-channel bug where message content was rewritten into
+        the channel purpose instead of starting a session (the pre-session
+        config parser that caused it was removed 2026-07-09)."""
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
         # Mirror live agent-harness behaviour: empty model lists.
         self.bridge.harness.models_by_backend = {

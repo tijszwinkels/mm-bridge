@@ -942,8 +942,8 @@ class Bridge:
           - autorespond   → any non-empty message qualifies
 
         The engagement message itself becomes the session's first VD message
-        (stripped of bot mention). Skips the first-message-config gate — the
-        user is clearly talking, not configuring.
+        (stripped of bot mention) and is forwarded verbatim — never parsed as
+        config (dot-commands / Channel Purpose are the only config paths).
         """
         try:
             ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
@@ -975,15 +975,9 @@ class Bridge:
         if not cleaned and not post.get("file_ids"):
             return
 
-        # If the very first engagement message is pure purpose tokens
-        # (e.g. `@claude autorespond`, `@claude claude, sonnet`), apply
-        # it as channel config without starting a session. The next
-        # engagement message will start the session with these settings.
-        if cleaned and self._try_apply_pre_session_config(
-            channel_id, cleaned, models_by_backend,
-        ):
-            return
-
+        # The first engagement message starts the session and is forwarded
+        # verbatim — never parsed as config (dot-commands / Channel Purpose
+        # are the only config paths). This mirrors the invite path.
         initial = cleaned or INVITE_PLACEHOLDER
 
         await self._start_invited_session(
@@ -993,44 +987,6 @@ class Bridge:
             post_welcome=False,
             exclude_post_id=post.get("id"),
         )
-
-    def _try_apply_pre_session_config(
-        self,
-        channel_id: str,
-        candidate: str,
-        models_by_backend: dict[str, list[str]],
-    ) -> bool:
-        """If `candidate` parses cleanly as purpose tokens, apply without starting a session.
-
-        Auto-join engagement only: when the bot's first engagement message in
-        a channel it joined itself is pure config tokens (`@claude claude,
-        sonnet`), record them as Channel Purpose and wait for the next message
-        to start the session. Returns True when consumed as config. There is no
-        session yet, so nothing is restarted.
-        """
-        parsed = purpose.parse(
-            candidate,
-            self.config.default_backend,
-            default_model=None,
-            available_models_for=lambda b: models_by_backend.get(b, []),
-            default_autorespond=self.config.default_autorespond,
-            # The harness returns an empty model catalog, and without strict
-            # mode any first word ("Hi Claude!") would silently become
-            # ``model=hi claude!`` and the message would be swallowed before a
-            # session is even started.
-            strict_catalog=True,
-        )
-        if parsed.warnings:
-            return False
-        if not candidate.replace(",", " ").split():
-            return False
-
-        current = self.purpose_by_channel.get(channel_id)
-        merged = self._merge_configs(current, parsed)
-        self.purpose_by_channel[channel_id] = merged
-        self._persist_purpose(channel_id, merged)
-        self._post_config_confirmation(channel_id, merged, restarted=False)
-        return True
 
     async def _on_mm_channel_created(self, channel_id: str) -> None:
         """New channel appeared — join it if auto-join is enabled.
