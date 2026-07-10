@@ -189,6 +189,40 @@ class DashedAliasTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_canonical_id_resolves_dashed_alias_to_ses_id(self) -> None:
+        """write() of a ses_<32hex> id creates a dashed-UUID alias symlink;
+        canonical_id(dashed) must follow it to the ses_ id (the harness id the
+        bridge stores in its anchor mapping)."""
+        harness_id = "ses_00112233445566778899aabbccddeeff"
+        dashed = "00112233-4455-6677-8899-aabbccddeeff"
+        sidecar.write(self.dir, harness_id, "c1")
+        self.assertEqual(sidecar.canonical_id(self.dir, dashed), harness_id)
+
+    def test_canonical_id_real_file_returned_verbatim(self) -> None:
+        """Codex / spawned shape: a real file at the id (no alias) IS the
+        harness id → returned verbatim."""
+        sidecar.write(self.dir, "codex_abc", "c1")
+        self.assertEqual(sidecar.canonical_id(self.dir, "codex_abc"), "codex_abc")
+
+    def test_canonical_id_ses_id_returned_verbatim(self) -> None:
+        harness_id = "ses_00112233445566778899aabbccddeeff"
+        sidecar.write(self.dir, harness_id, "c1")
+        self.assertEqual(sidecar.canonical_id(self.dir, harness_id), harness_id)
+
+    def test_canonical_id_dashed_without_alias_reconstructs_ses(self) -> None:
+        """If the alias symlink is absent but the real ses_<hex> file exists
+        (best-effort alias write failed), canonical_id still reconstructs it —
+        matching read()'s dashed→canonical fallback."""
+        harness_id = "ses_00112233445566778899aabbccddeeff"
+        dashed = "00112233-4455-6677-8899-aabbccddeeff"
+        sidecar.write(self.dir, harness_id, "c1")
+        (self.dir / dashed).unlink()  # drop the alias
+        self.assertEqual(sidecar.canonical_id(self.dir, dashed), harness_id)
+
+    def test_canonical_id_unresolvable_returns_none(self) -> None:
+        self.assertIsNone(sidecar.canonical_id(self.dir, "nope-nothing-here"))
+        self.assertIsNone(sidecar.canonical_id(self.dir, ""))
+
     def test_dashed_alias_helper(self) -> None:
         """The pure helper accepts canonical ses_<32hex> only."""
         cases = [

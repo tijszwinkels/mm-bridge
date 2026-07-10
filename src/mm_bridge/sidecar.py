@@ -187,6 +187,50 @@ def read(directory: Path, session_id: str) -> tuple[str, str | None] | None:
     return channel_id, root_id
 
 
+def canonical_id(directory: Path, session_id: str) -> str | None:
+    """Return the canonical on-disk session id for `session_id`, or ``None``.
+
+    The "canonical" id is the real sidecar filename — which is the HARNESS
+    session id the bridge stores in its anchor mapping. A caller that needs to
+    compare a locally-resolved session id against that mapping (e.g. self-post
+    loop-back suppression) must canonicalise first: a claude sub-session looks
+    itself up by the dashed ``CLAUDE_SESSION_ID`` UUID, which ``write()`` only
+    records as a *symlink alias* pointing at the canonical ``ses_<32hex>`` file.
+
+    Resolution mirrors ``read()``:
+      * a dashed-UUID alias (symlink) → its ``ses_<hex>`` target;
+      * a real file at the literal id → already canonical (``ses_`` / ``codex_``
+        / any harness id written directly);
+      * a dashed UUID with no alias but a real ``ses_<32hex>`` file present →
+        that ``ses_`` id (matches ``read()``'s dashed→canonical fallback).
+    Returns ``None`` when nothing resolves, so callers can omit the marker.
+    """
+    if not session_id:
+        return None
+    path = directory / session_id
+    if path.is_symlink():
+        try:
+            target = os.readlink(str(path))
+        except OSError:
+            target = None
+        if target:
+            return os.path.basename(target)
+        # Unreadable symlink: fall through to reconstruction. Do NOT let the
+        # is_file() branch below run — it follows the link and would return the
+        # ALIAS name (the dashed UUID), the exact wrong value we're avoiding.
+    else:
+        try:
+            if path.is_file():
+                return session_id
+        except OSError:
+            pass
+    if not session_id.startswith("ses_"):
+        candidate = f"ses_{session_id.replace('-', '')}"
+        if (directory / candidate).is_file():
+            return candidate
+    return None
+
+
 def _read_text_or_none(path: Path, session_id: str) -> str | None:
     """Read *path* as UTF-8 text, returning ``None`` on missing/unreadable.
 
