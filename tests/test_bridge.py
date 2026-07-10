@@ -2608,49 +2608,43 @@ class MergeConfigsTests(_BridgeTestCase):
         self.assertEqual(merged.model, "opus")
 
 
-class RuntimeToggleTests(_BridgeTestCase):
-    """After the first message, only the literal words `autorespond` and
-    `noautorespond` toggle the mention_only flag — nothing else."""
+class MessageContentNotConfigTests(_BridgeTestCase):
+    """The bare `autorespond`/`noautorespond` message-content toggle was
+    removed (2026-07-10): message content is never config — `.autorespond` is
+    the only path. Such words are now forwarded to the agent verbatim and the
+    mention flag is left untouched."""
 
-    async def test_literal_noautorespond_toggles_mention_only_on(self):
-        self.bridge.mapping.link(Anchor("c1"), "s1")
+    def _autorespond_channel(self) -> None:
         from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="claude", model="opus", mention_only=False,
         )
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
 
-        await self.bridge._on_mm_posted({
-            "channel_id": "c1", "message": "noautorespond",
-            "user_id": "u1", "type": "",
-        })
-
-        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
-        # Persisted + not forwarded.
-        self.assertIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
-        self.assertEqual(self.bridge.vd.sent, [])
-
-    async def test_literal_autorespond_toggles_mention_only_off(self):
-        self.bridge.mapping.link(Anchor("c1"), "s1")
-        from mm_bridge.purpose import PurposeConfig
-        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
-            backend="claude", model="opus", mention_only=True,
-        )
-        self.bridge.mm.channels["c1"] = {
-            "id": "c1", "purpose": "claude, opus, mention-only",
-        }
+    async def test_bare_autorespond_message_is_forwarded(self):
+        self._autorespond_channel()
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "autorespond",
             "user_id": "u1", "type": "",
         })
 
+        self.assertEqual(self.bridge.vd.sent, [("s1", "autorespond")])
         self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
-        self.assertNotIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
-        self.assertEqual(self.bridge.vd.sent, [])
+
+    async def test_bare_noautorespond_message_is_forwarded(self):
+        self._autorespond_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "noautorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.sent, [("s1", "noautorespond")])
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
 
     async def test_autorespond_with_trailing_text_is_regular_message(self):
-        """`autorespond now` must NOT toggle — only the literal word alone does."""
         self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
@@ -3709,9 +3703,10 @@ class FirstMessagePreambleTests(_BridgeTestCase):
         self.assertIn("Running inside Mattermost channel", self.bridge.vd.sent[0][1])
         self.assertNotIn("Running inside Mattermost channel", self.bridge.vd.sent[1][1])
 
-    async def test_runtime_toggle_first_message_does_not_forward_preamble(self) -> None:
-        """A literal `autorespond` first message is a runtime toggle — it's
-        handled in-channel and not forwarded, so no preamble is emitted."""
+    async def test_config_word_first_message_forwards_with_preamble(self) -> None:
+        """A bare `autorespond` first message is no longer special (the
+        message-content toggle was removed) — it's forwarded verbatim and
+        carries the MM-context preamble like any other first message."""
         await self._prime_channel_with_members(
             "c1",
             display_name="Bug Bash",
@@ -3725,7 +3720,10 @@ class FirstMessagePreambleTests(_BridgeTestCase):
             "user_id": "u-alice", "type": "",
         })
 
-        self.assertEqual(self.bridge.vd.sent, [])
+        self.assertEqual(len(self.bridge.vd.sent), 1)
+        sent = self.bridge.vd.sent[0][1]
+        self.assertIn("Running inside Mattermost channel", sent)
+        self.assertTrue(sent.endswith("autorespond"))
 
     async def test_preamble_format_helper_single_user(self) -> None:
         from mm_bridge.bridge import _format_first_message_preamble

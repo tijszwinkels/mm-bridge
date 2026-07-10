@@ -129,9 +129,6 @@ CHANNEL_JOIN_WELCOME_TEMPLATE = (
 _CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _LEAVE_CMD_RE = re.compile(r"^@claude\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
 _STOP_CMD_RE = re.compile(r"^(?P<mention>@claude\s+)?stop\s*$", re.IGNORECASE)
-_RUNTIME_TOGGLE_RE = re.compile(
-    r"^(autorespond|noautorespond|autoresponse|noautoresponse)$", re.IGNORECASE,
-)
 
 
 @dataclass
@@ -878,10 +875,9 @@ class Bridge:
             self._awaiting_first_forward.discard(channel_id)
             is_first_user_message = True
 
-        # Runtime toggle (literal `autorespond` / `noautorespond`, nothing else).
-        if _RUNTIME_TOGGLE_RE.match(message):
-            await self._run_runtime_toggle(channel_id, message)
-            return
+        # (The bare `autorespond` / `noautorespond` message-content toggle was
+        # removed — message content is never config. `.autorespond` is the
+        # supported path; such words now forward to the agent verbatim.)
 
         # Command: @claude catch up
         if m := _CATCH_UP_RE.match(message):
@@ -1415,13 +1411,14 @@ class Bridge:
                 models[b] = []
         return models
 
-    async def _run_runtime_toggle(self, channel_id: str, message: str) -> None:
-        """Handle a literal `autorespond` / `noautorespond` message.
+    async def _run_runtime_toggle(self, channel_id: str, token: str) -> None:
+        """Flip the channel's mention_only flag from an autorespond token.
 
-        Flips the channel's mention_only flag and persists to Channel Purpose.
-        Does not forward the token.
+        The sole caller is ``_cmd_autorespond`` (the `.autorespond` command),
+        which passes the literal ``autorespond`` / ``noautorespond`` token.
+        Flips mention_only and persists to Channel Purpose.
         """
-        turn_on_autorespond = message.strip().lower() in purpose.AUTORESPOND_ALIASES
+        turn_on_autorespond = token.strip().lower() in purpose.AUTORESPOND_ALIASES
         current = self.purpose_by_channel.get(channel_id) or purpose.PurposeConfig(
             backend=self.config.default_backend,
             # Don't bake a model token into the persisted Purpose — the
