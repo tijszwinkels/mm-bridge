@@ -174,11 +174,13 @@ def parse(
             responding to every message. When False, they default to
             mention-only (explicit `autorespond` needed to turn it off).
         strict_catalog: when True, disable the "empty model catalog →
-            accept any token as a model name" fallback. Callers parsing
-            *chat messages* (vs. an operator-set Channel Purpose) use this
-            to keep ordinary words like "Hi!" from being interpreted as
-            unknown-but-acceptable model names just because the harness
-            doesn't enumerate models.
+            accept any token as a model name" fallback, so ordinary words
+            like "Hi!" aren't interpreted as unknown-but-acceptable model
+            names just because the harness doesn't enumerate models. NOTE:
+            the bridge no longer parses chat-message content as config (the
+            first-message / pre-session selectors were removed 2026-07), so
+            this option currently has no production caller; it's retained as
+            a parser capability and exercised directly by test_purpose.py.
 
     Never raises. Unknown tokens are collected into PurposeConfig.warnings.
     """
@@ -278,7 +280,7 @@ def parse(
     # already extracted in Step 2a). With an empty catalog (US-5.3) any
     # otherwise-unrecognised token is taken as a model name verbatim so the
     # bridge can pass it to ``POST /v1/sessions`` unchanged — unless the
-    # caller asked for strict_catalog (e.g. first-message-config parsing).
+    # caller asked for strict_catalog (see the parameter docstring).
     catalog_empty = not backend_models and not strict_catalog
     for token in rest:
         token_lc = token.lower()

@@ -1483,23 +1483,6 @@ class Bridge:
     def _note_self_wrote_purpose(self, channel_id: str, purpose_text: str) -> None:
         self._self_written_purpose.setdefault(channel_id, set()).add(purpose_text)
 
-    def _post_config_confirmation(
-        self,
-        channel_id: str,
-        cfg: purpose.PurposeConfig,
-        *,
-        restarted: bool,
-    ) -> None:
-        head = f"backend: `{cfg.backend}`, model: `{cfg.model or 'default'}`"
-        flag = "mention-only" if cfg.mention_only else "autorespond"
-        cwd_note = f", cwd: `{cfg.cwd}`" if cfg.cwd else ""
-        suffix = " (session restarted)" if restarted else ""
-        note = f":gear: _Config applied — {head}, {flag}{cwd_note}._{suffix}"
-        try:
-            self.mm.post_message(channel_id, note)
-        except Exception:
-            logger.debug("failed posting config confirmation", exc_info=True)
-
     def _format_welcome(self, cfg: purpose.PurposeConfig, cwd: str) -> str:
         parts = [
             f"*Session started — backend: `{cfg.backend}`",

@@ -184,11 +184,12 @@ thread is forwarded.
   409 from the OpenAPI's documented codes), the bridge posts a dead-thread
   notice the same way it does today.
 
-### US-4.10: Channel-Purpose-driven session restart works
+### US-4.10: Dot-command-driven session restart works
 
-**Given** a channel has a session, **when** the user posts purpose tokens that
-mutate backend / model / cwd (the `_try_apply_first_message_config` path),
-**then** the bridge tears down the current session, calls
+**Given** a channel has a session, **when** the user switches backend / model
+via the `.backend <name>` / `.model <name>` dot-commands (the
+`_restart_session_with_config` path — message content is no longer parsed as
+config), **then** the bridge tears down the current session, calls
 `POST /v1/sessions` + `POST /v1/sessions/{id}/runs` with the new config, and
 links the channel to the new session id from the 201 response.
 
