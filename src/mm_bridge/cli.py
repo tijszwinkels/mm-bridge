@@ -441,24 +441,31 @@ def _resolve_post_anchor(
 
 
 def _resolve_self_identity(cfg: Config) -> tuple[str, str] | None:
-    """Return ``(session_id, channel_id)`` of the current bridge session.
+    """Return ``(harness_session_id, channel_id)`` of the current bridge session.
 
     Used to stamp ``props.from_bridge_cli_channel`` AND
-    ``props.from_bridge_cli_session`` on CLI-authored posts. The
-    channel id is the one whose linked session must NOT see the post
-    as a user turn in the cross-post-mirror case (own-channel echo);
-    the session id is recorded for telemetry and for the bridge's
-    incoming-post predicate to distinguish "explicit agentcom from a
-    sibling session" from "own-process self-echo". When the CLI is
-    invoked from outside any bridge session, returns ``None`` and the
-    caller omits the marker entirely — there is no echo to suppress.
+    ``props.from_bridge_cli_session`` on CLI-authored posts. The bridge's
+    incoming-post predicate compares ``from_bridge_cli_session`` against the
+    session its anchor mapping stores, so the stamped id MUST be the canonical
+    HARNESS id (``ses_<hex>``) — NOT the dashed ``CLAUDE_SESSION_ID`` UUID a
+    claude sub-session resolves itself by. The dashed UUID is only a symlink
+    alias, so stamping it verbatim made the bridge compare across namespaces
+    and the self-post suppression never fired (the 2026-07-10 live-smoke miss).
+    ``sidecar.canonical_id`` follows the alias to the ``ses_`` id.
+
+    Returns ``None`` (caller omits the marker → bridge forwards, conservative)
+    when the CLI is outside any bridge session, or the id can't be resolved to
+    a harness id.
     """
     try:
         sid = _current_session_id(cfg.sidecar_dir)
         channel_id = _resolve_anchor_from_session(cfg.sidecar_dir, sid).channel_id
     except NotInMattermostChannel:
         return None
-    return sid, channel_id
+    harness_sid = sidecar.canonical_id(Path(cfg.sidecar_dir), sid)
+    if harness_sid is None:
+        return None
+    return harness_sid, channel_id
 
 
 def _resolve_effective_root(

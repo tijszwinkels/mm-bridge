@@ -148,6 +148,41 @@ class PostCommandTests(unittest.TestCase):
             },
         )
 
+    def test_default_post_stamps_harness_id_through_dashed_alias(self) -> None:
+        """The production shape (2026-07-10 regression): the harness wrote the
+        canonical ``ses_<32hex>`` sidecar plus a dashed-UUID alias symlink, and
+        the claude session looks itself up by ``CLAUDE_SESSION_ID`` (the dashed
+        UUID). The stamped ``from_bridge_cli_session`` MUST be the ``ses_`` id
+        (what the bridge maps), resolved through the alias — not the dashed
+        UUID, which would compare across namespaces and never suppress."""
+        harness_id = "ses_00112233445566778899aabbccddeeff"
+        dashed = "00112233-4455-6677-8899-aabbccddeeff"
+        sidecar.write(self.sdir, harness_id, "self-chan")
+        self.assertTrue((self.sdir / dashed).is_symlink(), "alias fixture missing")
+
+        mm = FakeMM()
+        rc, _, _ = self._invoke(mm, ["mm-bridge", "post", "hi"], session_id=dashed)
+        self.assertEqual(rc, 0)
+        self.assertEqual(mm.posted[0]["channel_id"], "self-chan")
+        self.assertEqual(
+            mm.posted[0]["props"]["from_bridge_cli_session"], harness_id,
+        )
+        self.assertEqual(mm.posted[0]["props"]["from_bridge_cli_target"], "self")
+
+    def test_default_post_stamps_real_file_id_verbatim(self) -> None:
+        """Codex / spawned shape: the sidecar is a real file at the session id
+        (no dashed alias). ``canonical_id`` returns it verbatim — it already IS
+        the harness id the bridge maps."""
+        sidecar.write(self.sdir, "codex_abc123def456", "self-chan")
+        mm = FakeMM()
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "hi"], session_id="codex_abc123def456",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            mm.posted[0]["props"]["from_bridge_cli_session"], "codex_abc123def456",
+        )
+
     def test_no_channel_and_no_sidecar_exits_2(self) -> None:
         mm = FakeMM()
         rc, _, err = self._invoke(
