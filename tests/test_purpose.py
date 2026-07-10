@@ -564,16 +564,18 @@ def test_parse_accepts_claude_code_with_space_alias():
 
 
 # ---------------------------------------------------------------------------
-# strict_catalog: chat-message parsing must not silently consume plain words
+# strict_catalog: with an empty catalog, don't silently accept plain words as
+# model names. (A parser capability — the bridge no longer parses chat content
+# as config, so nothing passes strict_catalog=True in production; these tests
+# exercise the option directly. See purpose.parse's `strict_catalog` docstring.)
 # ---------------------------------------------------------------------------
 
 
 def test_strict_catalog_rejects_unknown_first_token_when_catalog_empty():
-    """The first-message-config code path parses a chat message that might
-    or might not be config. The harness's empty-catalog response means a
-    word like ``Hi!`` would otherwise be silently accepted as a model
-    name. ``strict_catalog`` disables that fallback so the message bubbles
-    out with a warning and the caller treats it as plain chat."""
+    """With ``strict_catalog=True`` and an empty catalog, an unknown first
+    token like ``Hi!`` is NOT accepted as a model name — the "empty catalog →
+    accept any token" fallback is disabled and the token bubbles out as a
+    warning instead of silently overwriting the model."""
     cfg = parse(
         "Hi!", "claude", "opus", lambda _b: [], strict_catalog=True,
     )
@@ -584,9 +586,8 @@ def test_strict_catalog_rejects_unknown_first_token_when_catalog_empty():
 
 def test_strict_catalog_still_accepts_explicit_backend_alias():
     """Strict mode only tightens the catalog-empty fallback. Explicit
-    backend keywords like ``claude`` still parse cleanly so a chat
-    message that genuinely *is* config (``claude, autorespond``) is
-    still recognised."""
+    backend keywords like ``claude`` still parse cleanly, so a genuine
+    config string (``claude, autorespond``) is still recognised."""
     cfg = parse(
         "claude", "claude", "opus", lambda _b: [], strict_catalog=True,
     )
@@ -597,7 +598,7 @@ def test_strict_catalog_still_accepts_explicit_backend_alias():
 def test_strict_catalog_rejects_unknown_later_token_too():
     """A known backend followed by an unknown token should warn under
     strict mode even when the catalog is empty (no silent model
-    assignment from chat words)."""
+    assignment from an unrecognised token)."""
     cfg = parse(
         "claude, banana", "claude", "opus", lambda _b: [],
         strict_catalog=True,

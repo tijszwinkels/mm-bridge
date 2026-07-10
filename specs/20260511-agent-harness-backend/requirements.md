@@ -190,8 +190,10 @@ thread is forwarded.
 via the `.backend <name>` / `.model <name>` dot-commands (the
 `_restart_session_with_config` path — message content is no longer parsed as
 config), **then** the bridge tears down the current session, calls
-`POST /v1/sessions` + `POST /v1/sessions/{id}/runs` with the new config, and
-links the channel to the new session id from the 201 response.
+`POST /v1/sessions` with the new config, and links the channel to the new
+session id from the 201 response. The restart is **quiet** — it does NOT fire
+a greeting run (`POST /v1/sessions/{id}/runs`); the next user message becomes
+the new session's first run.
 
 ### US-4.11: Bridge survives harness restart
 

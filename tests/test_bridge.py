@@ -2314,9 +2314,11 @@ class ThreadConfigSwitchTests(_BridgeTestCase):
         self.assertIn("thread", joined)
 
     async def test_bare_model_in_thread_still_reports(self):
-        self._setup_forked_thread()
+        self._setup_forked_thread()  # channel config is claude/opus
+        # Give the fork DISTINCT metadata so we can tell whether bare `.model`
+        # reports the fork's model (correct) or leaked the channel's (opus).
         self.bridge.harness.sessions_meta = [{
-            "id": "s-fork", "backend": "claude", "model": "opus",
+            "id": "s-fork", "backend": "codex", "model": "gpt-5.5",
             "project": {"path": "/x", "name": "x"}, "origin": "harness",
         }]
 
@@ -2326,12 +2328,16 @@ class ThreadConfigSwitchTests(_BridgeTestCase):
         })
 
         self.assertEqual(self.bridge.harness.created, [])
-        self.assertIn("Current model", "\n".join(self._posted_texts()))
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("Current model: `gpt-5.5`", joined)  # the FORK's model
+        self.assertNotIn("opus", joined)  # not the channel session's
 
     async def test_bare_backend_in_thread_still_reports(self):
-        self._setup_forked_thread()
+        self._setup_forked_thread()  # channel config is claude/opus
+        # Distinct fork backend so a leak of the channel session (claude) is
+        # caught — bare `.backend` must report the fork's `codex`.
         self.bridge.harness.sessions_meta = [{
-            "id": "s-fork", "backend": "claude", "model": "opus",
+            "id": "s-fork", "backend": "codex", "model": "gpt-5.5",
             "project": {"path": "/x", "name": "x"}, "origin": "harness",
         }]
 
@@ -2341,7 +2347,7 @@ class ThreadConfigSwitchTests(_BridgeTestCase):
         })
 
         self.assertEqual(self.bridge.harness.created, [])
-        self.assertIn("Current backend", "\n".join(self._posted_texts()))
+        self.assertIn("Current backend: `codex`", "\n".join(self._posted_texts()))
 
 
 class CommandPhase3Tests(_BridgeTestCase):
