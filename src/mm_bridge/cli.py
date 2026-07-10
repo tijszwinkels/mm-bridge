@@ -571,25 +571,30 @@ def cmd_post(args: argparse.Namespace) -> int:
             )
             return 3
 
-    # Marker only matters when the CLI is running inside a bridge
-    # session: the daemon's per-process own-post tracker can't suppress
-    # the WS echo for posts that the CLI authored, so we tag those
-    # posts with the SENDER's channel AND session ids. The dispatcher
-    # uses ``from_bridge_cli="post"`` as the "explicit agentcom" signal
-    # and forwards the post regardless of the recorded channel; only
-    # the explicit cross-post mirror (``from_bridge_cli="cross-post-mirror"``)
-    # is suppressed by the recipient. The session id is recorded for
-    # telemetry and so the bridge can distinguish "explicit agentcom
-    # from a sibling session" from "own-process self-echo" when a
-    # misresolved sender mis-stamps the channel field. From a
-    # non-session shell there is no echo concern, so emit no marker at
-    # all.
+    # Marker only matters when the CLI is running inside a bridge session: the
+    # daemon's per-process own-post tracker can't suppress the WS echo for posts
+    # that the CLI authored, so we tag those posts with the SENDER's channel and
+    # session ids AND the caller's INTENT (``from_bridge_cli_target``):
+    #   * "self"     — the default post-into-my-own-channel path (no
+    #                  ``--channel``/``--thread``). The daemon drops it iff it
+    #                  loops back to its own author session — that's a status
+    #                  update the session must not read as a user turn.
+    #   * "explicit" — ``--channel``/``--thread`` was given. The daemon ALWAYS
+    #                  forwards these, so agentcom can never be silently dropped
+    #                  (even if the session resolver is poisoned). The one
+    #                  accepted gap: an explicit ``--channel <your own channel>``
+    #                  / ``--thread <your own root>`` forwards.
+    # ``cross-post-mirror`` (below) is the only sender-side artifact the
+    # recipient suppresses on channel-equality. From a non-session shell there
+    # is no echo concern, so emit no marker at all.
     identity = _resolve_self_identity(cfg)
     post_props: dict | None = None
     if identity is not None:
         self_session_id, self_channel_id = identity
+        target_kind = "explicit" if (args.channel or args.thread) else "self"
         post_props = {
             "from_bridge_cli": "post",
+            "from_bridge_cli_target": target_kind,
             "from_bridge_cli_channel": self_channel_id,
             "from_bridge_cli_session": self_session_id,
         }
