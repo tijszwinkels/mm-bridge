@@ -170,6 +170,16 @@ Creates a fresh sibling channel with its own agent-harness session and kicks off
 - `--invite <user>` — invite a user to the new channel.
 - `--no-forward-prompt` — don't post the kickoff message in the parent channel.
 
+Pass `-` as the `<prompt>` to read it from stdin — the way to dispatch a long structured brief without shell-quoting it:
+
+```sh
+mm-bridge spawn --title "Refactor" - <<'EOF'
+Multi-line brief…
+EOF
+```
+
+The full stdin prompt is delivered to the sub-session verbatim; only the quoted preview posted to the parent/child channels is truncated (past ~4000 chars) so it stays under Mattermost's post-size limit. An empty or terminal (non-piped) stdin is rejected with an explicit error instead of dispatching a blank brief or hanging.
+
 The parent channel gets a `:thread: Spawned **Title** in ~slug~` announcement (threaded under the originating thread when spawning from a thread-fork). The new channel's header is set to `Parent: ~parent-slug~`, with a `[thread](permalink)` suffix when spawned from a thread-fork.
 
 ## In-channel dot-commands
