@@ -127,8 +127,24 @@ class QuotePromptTruncationTests(unittest.TestCase):
             self.assertLess(len(out), 16383)
             self.assertIn("truncated", out.lower())
 
-    def test_prompt_at_cap_not_truncated(self) -> None:
-        exactly = "y" * spawn.SPAWN_QUOTE_MAX_CHARS
+    def test_many_short_lines_stay_under_post_limit(self) -> None:
+        # The reason the cap is on the RENDERED quote, not the raw prompt:
+        # a brief that's mostly short lines (a file list, narrow code) has
+        # its size roughly doubled by the ``> `` prefixes. A raw-input cap
+        # couldn't bound the post; the rendered cap does.
+        listy = "\n".join(["item"] * 10000)
+        for fmt in (
+            lambda p: spawn.format_spawn_kickoff("p", p),
+            lambda p: spawn.format_spawn_announcement("T", "c", p),
+        ):
+            out = fmt(listy)
+            self.assertLess(len(out), 16383)
+            self.assertIn("truncated", out.lower())
+
+    def test_rendered_quote_at_cap_not_truncated(self) -> None:
+        # A single line whose RENDERED form ("> " + body) is exactly the cap
+        # sits on the boundary and must not be truncated.
+        exactly = "y" * (spawn.SPAWN_QUOTE_MAX_CHARS - len("> "))
         out = spawn.format_spawn_kickoff("p", exactly)
         self.assertNotIn("truncated", out.lower())
 

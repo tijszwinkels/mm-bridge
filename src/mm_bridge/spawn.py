@@ -12,37 +12,43 @@ from collections.abc import Mapping
 
 MM_DISPLAY_NAME_MAX = 64
 
-# Cap on the forwarded-quote *preview* rendered into the kickoff /
-# announcement posts. A heredoc-piped prompt can be arbitrarily long
-# (``mm-bridge spawn - <<'EOF'``); the full text is delivered to the
-# sub-session via the harness, but the visual quote must stay well under
-# Mattermost's default ``MaxPostSize`` (16383 chars) or the post fails.
-# 4000 is a deliberate readability/safety call — a channel quote longer
-# than that is noise, and it leaves generous headroom for the header and
-# ``> `` line prefixes.
-SPAWN_QUOTE_MAX_CHARS = 4000
+# Cap on the *rendered* forwarded-quote preview posted to the kickoff /
+# announcement channels. Coding-agent briefs — now pipeable via
+# ``mm-bridge spawn - <<'EOF'`` — get large, so this is generous. It caps
+# the RENDERED blockquote (not the raw prompt) so the whole post stays
+# under Mattermost's default ``MaxPostSize`` (16383 chars) regardless of
+# the prompt's line shape: a brief that's mostly short lines would double
+# in size from the ``> `` prefixes, and a raw-input cap couldn't bound
+# that. The header and truncation marker add only ~120 chars on top,
+# leaving comfortable headroom. The full prompt is always delivered to
+# the sub-session via the harness, untouched — only this preview is
+# clipped.
+SPAWN_QUOTE_MAX_CHARS = 12000
 
 
 def _quote_prompt(prompt: str) -> str:
     """Render *prompt* as a Markdown blockquote for a channel preview.
 
-    Over-long prompts are truncated to :data:`SPAWN_QUOTE_MAX_CHARS` with a
-    marker line, so the preview post never exceeds Mattermost's size limit.
-    The truncation is cosmetic — it affects ONLY this quote, never the
-    prompt delivered to the sub-session. Callers guarantee *prompt* is
-    non-blank (blank prompts skip the quote entirely).
+    The rendered quote is capped at :data:`SPAWN_QUOTE_MAX_CHARS` (trimmed
+    to the last whole line) with a marker line, so the preview post never
+    exceeds Mattermost's size limit regardless of the prompt's line shape.
+    Truncation is cosmetic — it clips only this quote, never the prompt
+    delivered to the sub-session. Callers guarantee *prompt* is non-blank
+    (blank prompts skip the quote entirely).
     """
-    text = prompt
-    truncated = len(text) > SPAWN_QUOTE_MAX_CHARS
-    if truncated:
-        text = text[:SPAWN_QUOTE_MAX_CHARS]
-    quoted = "\n".join(f"> {line}" for line in text.splitlines())
-    if truncated:
-        quoted += (
-            f"\n>\n> _… quote truncated for preview ({len(prompt)} chars); "
-            f"full prompt delivered to the sub-session._"
-        )
-    return quoted
+    quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
+    if len(quoted) <= SPAWN_QUOTE_MAX_CHARS:
+        return quoted
+    clipped = quoted[:SPAWN_QUOTE_MAX_CHARS]
+    # Prefer a clean cut at the last complete quoted line; fall back to the
+    # hard character cut when the first line alone already overflows.
+    last_nl = clipped.rfind("\n")
+    if last_nl > 0:
+        clipped = clipped[:last_nl]
+    return (
+        f"{clipped}\n>\n> _… quote truncated for preview ({len(prompt)} "
+        f"chars); full prompt delivered to the sub-session._"
+    )
 
 
 def build_spawn_child_env(
