@@ -12,6 +12,44 @@ from collections.abc import Mapping
 
 MM_DISPLAY_NAME_MAX = 64
 
+# Cap on the *rendered* forwarded-quote preview posted to the kickoff /
+# announcement channels. Coding-agent briefs — now pipeable via
+# ``mm-bridge spawn - <<'EOF'`` — get large, so this is generous. It caps
+# the RENDERED blockquote (not the raw prompt) so the whole post stays
+# under Mattermost's default ``MaxPostSize`` (16383 chars) regardless of
+# the prompt's line shape: a brief that's mostly short lines would double
+# in size from the ``> `` prefixes, and a raw-input cap couldn't bound
+# that. The header and truncation marker add only ~120 chars on top,
+# leaving comfortable headroom. The full prompt is always delivered to
+# the sub-session via the harness, untouched — only this preview is
+# clipped.
+SPAWN_QUOTE_MAX_CHARS = 12000
+
+
+def _quote_prompt(prompt: str) -> str:
+    """Render *prompt* as a Markdown blockquote for a channel preview.
+
+    The rendered quote is capped at :data:`SPAWN_QUOTE_MAX_CHARS` (trimmed
+    to the last whole line) with a marker line, so the preview post never
+    exceeds Mattermost's size limit regardless of the prompt's line shape.
+    Truncation is cosmetic — it clips only this quote, never the prompt
+    delivered to the sub-session. Callers guarantee *prompt* is non-blank
+    (blank prompts skip the quote entirely).
+    """
+    quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
+    if len(quoted) <= SPAWN_QUOTE_MAX_CHARS:
+        return quoted
+    clipped = quoted[:SPAWN_QUOTE_MAX_CHARS]
+    # Prefer a clean cut at the last complete quoted line; fall back to the
+    # hard character cut when the first line alone already overflows.
+    last_nl = clipped.rfind("\n")
+    if last_nl > 0:
+        clipped = clipped[:last_nl]
+    return (
+        f"{clipped}\n>\n> _… quote truncated for preview ({len(prompt)} "
+        f"chars); full prompt delivered to the sub-session._"
+    )
+
 
 def build_spawn_child_env(
     parent_env: Mapping[str, str],
@@ -123,8 +161,7 @@ def format_spawn_announcement(
     header = f":thread: Spawned **{title}** in ~{new_channel_name}~"
     if not prompt.strip():
         return header
-    quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
-    return f"{header}\n\n{quoted}"
+    return f"{header}\n\n{_quote_prompt(prompt)}"
 
 
 def format_spawn_kickoff(parent_channel_name: str, prompt: str) -> str:
@@ -137,8 +174,7 @@ def format_spawn_kickoff(parent_channel_name: str, prompt: str) -> str:
     header = f":thread: Spawned from ~{parent_channel_name}~"
     if not prompt.strip():
         return header
-    quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
-    return f"{header}\n\n{quoted}"
+    return f"{header}\n\n{_quote_prompt(prompt)}"
 
 
 def derive_display_name(title: str | None, fallback: str) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from dataclasses import dataclass, field
@@ -646,12 +647,13 @@ class SpawnCommandTests(unittest.TestCase):
             return {"status": "started"}
         return _stub
 
-    def _invoke(self, argv):
+    def _invoke(self, argv, *, stdin: str = ""):
         with patch("sys.argv", argv), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
              patch.dict(
                 "os.environ", {"CLAUDE_SESSION_ID": "parent-sess"},
              ), \
+             patch("sys.stdin", io.StringIO(stdin)), \
              patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
              patch(
                  "mm_bridge.cli._harness_create_session",
@@ -688,6 +690,87 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertIn("> fix the bug", parent_body)
         # Spawning from a channel-level session: announcement is not threaded.
         self.assertIsNone(posts_by_chan["parent-chan"]["root_id"])
+
+    def test_spawn_prompt_from_stdin_forwarded_to_harness_and_quoted(
+        self,
+    ) -> None:
+        """``mm-bridge spawn -`` reads the prompt from stdin (the heredoc
+        dispatch path). The piped body must reach ``create_session``
+        verbatim AND be quoted into the kickoff/announcement posts — the
+        2026-07-14 bug was the literal ``"-"`` arriving as the whole brief.
+        """
+        captured: dict = {}
+
+        async def _stub(harness_url, message, cwd, backend, model, title=None):
+            captured["message"] = message
+            sidecar.write(self.sdir, "new-sess", "new-chan")
+            return {"status": "started"}
+
+        with patch("sys.argv", ["mm-bridge", "spawn", "-"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("sys.stdin", io.StringIO("do the big multi-line brief\nstep 2\n")), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+
+        self.assertEqual(captured["message"], "do the big multi-line brief\nstep 2")
+        posts_by_chan = {p["channel_id"]: p for p in self.fake_mm.posts}
+        self.assertIn("> do the big multi-line brief", posts_by_chan["new-chan"]["message"])
+        self.assertIn("> step 2", posts_by_chan["parent-chan"]["message"])
+
+    def test_spawn_dash_empty_stdin_exits_2_without_harness_call(self) -> None:
+        """``spawn -`` with empty stdin is an explicit error — never an
+        empty brief that leaves the sub-session idle. Fails fast: no
+        harness call, no MM login, no posts."""
+        called = {"harness": False}
+
+        async def _stub(*a, **k):
+            called["harness"] = True
+            return {"status": "started"}
+
+        with patch("sys.argv", ["mm-bridge", "spawn", "-"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("sys.stdin", io.StringIO("")), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse(called["harness"])
+        self.assertEqual(self.fake_mm.posts, [])
+
+    def test_spawn_dash_tty_stdin_exits_2_rather_than_hanging(self) -> None:
+        """``spawn -`` with an interactive TTY stdin errors immediately
+        instead of blocking forever on ``read()``."""
+
+        class _FakeTTY(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        async def _stub(*a, **k):
+            raise AssertionError("harness must not be called on TTY stdin")
+
+        with patch("sys.argv", ["mm-bridge", "spawn", "-"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("sys.stdin", _FakeTTY("")), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_spawn_literal_prompt_still_works(self) -> None:
+        """A normal positional prompt (not ``-``) is unaffected — stdin
+        is never consulted."""
+        rc = self._invoke(["mm-bridge", "spawn", "plain brief"])
+        self.assertEqual(rc, 0)
+        posts_by_chan = {p["channel_id"]: p for p in self.fake_mm.posts}
+        self.assertIn("> plain brief", posts_by_chan["new-chan"]["message"])
 
     def test_spawn_posts_carry_bridge_cli_marker_prop(self) -> None:
         """Both spawn-authored posts (parent announcement and child kickoff)

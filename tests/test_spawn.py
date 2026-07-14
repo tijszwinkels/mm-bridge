@@ -98,6 +98,57 @@ class FormatSpawnAnnouncementTests(unittest.TestCase):
         self.assertNotIn(">", out)
 
 
+class QuotePromptTruncationTests(unittest.TestCase):
+    """Long forwarded quotes are capped so the preview post never blows past
+    Mattermost's post-size limit. The *actual* prompt (delivered to the
+    sub-session via the harness) is a separate value and is never touched.
+    """
+
+    def test_short_prompt_not_truncated(self) -> None:
+        for fmt in (
+            lambda p: spawn.format_spawn_kickoff("p", p),
+            lambda p: spawn.format_spawn_announcement("T", "c", p),
+        ):
+            out = fmt("a modest brief\nwith two lines")
+            self.assertIn("> a modest brief", out)
+            self.assertIn("> with two lines", out)
+            self.assertNotIn("truncated", out)
+
+    def test_over_cap_prompt_truncated_in_quote(self) -> None:
+        huge = "x" * (spawn.SPAWN_QUOTE_MAX_CHARS + 5000)
+        for fmt in (
+            lambda p: spawn.format_spawn_kickoff("p", p),
+            lambda p: spawn.format_spawn_announcement("T", "c", p),
+        ):
+            out = fmt(huge)
+            # The visible quote is bounded well under the MM post limit and
+            # much shorter than the raw prompt.
+            self.assertLess(len(out), len(huge))
+            self.assertLess(len(out), 16383)
+            self.assertIn("truncated", out.lower())
+
+    def test_many_short_lines_stay_under_post_limit(self) -> None:
+        # The reason the cap is on the RENDERED quote, not the raw prompt:
+        # a brief that's mostly short lines (a file list, narrow code) has
+        # its size roughly doubled by the ``> `` prefixes. A raw-input cap
+        # couldn't bound the post; the rendered cap does.
+        listy = "\n".join(["item"] * 10000)
+        for fmt in (
+            lambda p: spawn.format_spawn_kickoff("p", p),
+            lambda p: spawn.format_spawn_announcement("T", "c", p),
+        ):
+            out = fmt(listy)
+            self.assertLess(len(out), 16383)
+            self.assertIn("truncated", out.lower())
+
+    def test_rendered_quote_at_cap_not_truncated(self) -> None:
+        # A single line whose RENDERED form ("> " + body) is exactly the cap
+        # sits on the boundary and must not be truncated.
+        exactly = "y" * (spawn.SPAWN_QUOTE_MAX_CHARS - len("> "))
+        out = spawn.format_spawn_kickoff("p", exactly)
+        self.assertNotIn("truncated", out.lower())
+
+
 class FormatSpawnKickoffTests(unittest.TestCase):
     def test_header_line_uses_parent_channel_name(self) -> None:
         out = spawn.format_spawn_kickoff("my-parent", "fix the bug")
