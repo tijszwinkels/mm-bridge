@@ -102,7 +102,7 @@ class Config:
     # Catch-up command
     catch_up_default_n: int = 50
     catch_up_max_n: int = 500
-    # Auto-inject the last N channel messages on first session creation
+    # Auto-inject the last N channel messages on the first agent turn
     # (0 disables). Applies to both invite and engagement flows.
     initial_catch_up_n: int = 50
 

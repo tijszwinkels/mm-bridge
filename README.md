@@ -189,6 +189,13 @@ itself. They work with or without an `@claude` mention, bypass the
 mention-only gate, and are never forwarded to the agent. An unknown `.word`
 gets an "unknown command — try `.help`" reply rather than reaching the agent.
 
+A manual bot invite creates and maps a **quiet session** before showing the
+command welcome. No placeholder turn is sent to the agent, so `.backend` and
+`.model` can be changed immediately; the first conversational post becomes the
+session's first agent turn. Posts arriving during session warm-up are routed
+normally once mapping completes, so dot-commands remain commands during that
+race window.
+
 | Command | What it does |
 |---|---|
 | `.help` | List these commands. |

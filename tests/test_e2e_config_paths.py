@@ -11,6 +11,7 @@ during the change, now as a committed regression module:
   B. a config-looking first message is forwarded verbatim, never intercepted
   C. `.model` restart is quiet and posts no duplicate purpose notice
   D. `.backend` restart drops the carried model and is quiet
+  E. an invited session stays quiet while backend/model are configured
 """
 from __future__ import annotations
 
@@ -137,3 +138,37 @@ class E2EConfigPathsTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(self.bridge.harness.created, [])
         self.assertTrue(any("Unknown backend" in p.message for p in self.bridge.mm.posted))
+
+    async def test_E_invite_configures_before_first_agent_turn(self):
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "autorespond", "display_name": "Chan",
+        }
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        self.assertEqual(self._sent(), [])
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model gpt-5.4",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge.mm.deliver_ws_events(self.bridge)
+
+        configured_session = self.bridge.mapping.get_session(Anchor("c1"))
+        self.assertEqual(self._sent(), [])
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "gpt-5.4")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "inspect the build",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.harness.sent), 1)
+        sent_session, sent_body = self.bridge.harness.sent[0]
+        self.assertEqual(sent_session, configured_session)
+        self.assertTrue(sent_body.endswith("inspect the build"))
+        self.assertEqual(self._notices(), [])

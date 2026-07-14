@@ -24,8 +24,8 @@ from .typing_indicator import TypingIndicator
 
 logger = logging.getLogger(__name__)
 
-# Placeholder used when creating an invite-driven session, since the backend
-# needs a first user turn to start useful work.
+# Fallback turn for attachment-only auto-join engagement. Manual invites create
+# quiet sessions and wait for the user's first real message instead.
 INVITE_PLACEHOLDER = (
     "Hello! I've just been added to a Mattermost channel. "
     "I'll wait for the user to start the conversation."
@@ -136,7 +136,7 @@ class WarmingUpChannel:
     """A channel with a session create/link HTTP round trip in progress."""
 
     channel_id: str
-    queued_messages: list[str] = field(default_factory=list)
+    queued_posts: list[dict] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
 
 
@@ -391,12 +391,12 @@ class Bridge:
         # SSE start cursor, resolved in ``start()`` from the persisted
         # ``mapping.last_event_seq`` or a cold-start probe of the harness.
         self._event_cursor: int | None = None
-        # Channels whose invited session greeted with a placeholder and are
-        # still awaiting their first *real* user message. That message is
-        # forwarded verbatim (config is never inferred from message content —
-        # dot-commands / Channel Purpose own that) but carries a one-line
-        # MM-context preamble (who's here, @-mention etiquette).
+        # Quiet invited sessions still awaiting their first real user message.
+        # That message is forwarded verbatim (config is never inferred from
+        # message content — dot-commands / Channel Purpose own that) and
+        # carries the MM-context preamble plus invite-time catch-up context.
         self._awaiting_first_forward: set[str] = set()
+        self._pending_initial_catch_up: dict[str, str] = {}
         # Channel purposes we just wrote ourselves, so the subsequent
         # `channel_updated` event doesn't trigger a spurious change notice.
         # A SET per channel, not a single value: a `.model`/`.backend` restart
@@ -866,7 +866,11 @@ class Bridge:
             # session for this channel is still warming up, queue the message.
             warming = self.warming_up_sessions.get(channel_id)
             if warming:
-                warming.queued_messages.append(message)
+                # Retain the complete post so it can pass through normal
+                # routing once the session is mapped. In particular, a dot-
+                # command must still be intercepted rather than sent to the
+                # LLM, and attachments/attribution must not be discarded.
+                warming.queued_posts.append(dict(post))
                 return
             # Auto-joined channel: session starts on first engagement.
             if self.config.auto_join_public_channels:
@@ -885,14 +889,12 @@ class Bridge:
             )
             return
 
-        # First message after an invite: forwarded verbatim, but flagged so it
-        # carries the MM-context preamble. The slot is consumed here so
-        # subsequent messages don't re-trigger it. (Content is never parsed as
-        # config — dot-commands and Channel Purpose are the only config paths.)
-        is_first_user_message = False
-        if channel_id in self._awaiting_first_forward:
-            self._awaiting_first_forward.discard(channel_id)
-            is_first_user_message = True
+        # First successfully forwarded message after an invite carries the
+        # MM-context preamble and invite-time catch-up. `_forward_user_post`
+        # consumes the slot only after mention/empty-message gates, restoring
+        # it if delivery fails. Content is never parsed as config — dot-
+        # commands and Channel Purpose are the only configuration paths.
+        is_first_user_message = channel_id in self._awaiting_first_forward
 
         # (The bare `autorespond` / `noautorespond` message-content toggle was
         # removed — message content is never config. `.autorespond` is the
@@ -954,13 +956,12 @@ class Bridge:
             return
         if channel_id in self.warming_up_sessions:
             return
-        # Manual /invite path: welcome the channel before spinning up the
-        # session. The session-start welcome (``_format_welcome``) fires
-        # afterwards via ``_start_invited_session``; the two serve different
-        # moments — this one is "what this bot is", that one is "what just
-        # got configured".
-        await self._post_channel_join_welcome(channel_id)
+        # Manual /invite path: create and map a quiet session first. The join
+        # manual advertises dot-commands, so it doubles as a readiness signal:
+        # don't expose it until those commands can actually be handled.
         await self._start_invited_session(channel_id)
+        if self.mapping.get_session(Anchor(channel_id)):
+            await self._post_channel_join_welcome(channel_id)
 
     async def _maybe_start_engagement_session(
         self,
@@ -1052,6 +1053,7 @@ class Bridge:
         # self-write's `channel_updated` event arrives) doesn't leak an entry.
         self._self_written_purpose.pop(channel_id, None)
         self._awaiting_first_forward.discard(channel_id)
+        self._pending_initial_catch_up.pop(channel_id, None)
         self._forget_channel_silent_drops(channel_id)
         if session_id:
             self._end_tool_use_run(session_id)
@@ -1105,7 +1107,7 @@ class Bridge:
         self,
         channel_id: str,
         *,
-        initial_message: str = INVITE_PLACEHOLDER,
+        initial_message: str | None = None,
         awaits_first_message: bool = True,
         post_welcome: bool = True,
         exclude_post_id: str | None = None,
@@ -1152,11 +1154,24 @@ class Bridge:
             except Exception:
                 logger.debug("posting purpose warning failed", exc_info=True)
 
-        # Prepend the last N messages as catch-up context so the session
-        # doesn't start cold. Only applies to brand-new sessions (not restarts).
-        effective_initial = self._prepend_catch_up(
-            channel_id, initial_message, exclude_post_id=exclude_post_id,
-        )
+        # Manual invites create a quiet session so `.backend` / `.model` work
+        # before the first LLM turn. Preserve the old invite-time history
+        # semantics by holding the catch-up block for that first real turn.
+        # Engagement/replacement flows already have a real initial message and
+        # send it immediately with catch-up prepended.
+        effective_initial: str | None = None
+        self._pending_initial_catch_up.pop(channel_id, None)
+        if awaits_first_message:
+            catch_up = self._initial_catch_up_block(
+                channel_id, exclude_post_id=exclude_post_id,
+            )
+            if catch_up:
+                self._pending_initial_catch_up[channel_id] = catch_up
+        else:
+            assert initial_message is not None
+            effective_initial = self._prepend_catch_up(
+                channel_id, initial_message, exclude_post_id=exclude_post_id,
+            )
 
         # ``warming_up_sessions[channel_id]`` was set at function entry so
         # any race-arriving MM post is queued; reuse that entry here.
@@ -1178,15 +1193,19 @@ class Bridge:
             self._known_sessions.add(session_id)
             if awaits_first_message:
                 self._awaiting_first_forward.add(channel_id)
-            run = await self.harness.create_run(session_id, effective_initial)
-            self._track_run_response(session_id, run)
-            self._record_harness_send(session_id, effective_initial)
+            else:
+                assert effective_initial is not None
+                run = await self.harness.create_run(session_id, effective_initial)
+                self._track_run_response(session_id, run)
+                self._record_harness_send(session_id, effective_initial)
             await self._update_resume_purpose(
                 channel_id, session_id, cfg.backend, effective_cwd,
             )
         except Exception:
             logger.exception("Failed to create agent-harness session for channel %s", channel_id)
             self.purpose_by_channel.pop(channel_id, None)
+            self._awaiting_first_forward.discard(channel_id)
+            self._pending_initial_catch_up.pop(channel_id, None)
             try:
                 self.mm.post_message(
                     channel_id, ":warning: Failed to start an agent-harness session.",
@@ -1204,8 +1223,8 @@ class Bridge:
             except Exception:
                 logger.warning("Failed to post welcome message", exc_info=True)
 
-        if session_id and queued and queued.queued_messages:
-            await self._flush_queued(channel_id, session_id, queued.queued_messages)
+        if session_id and queued and queued.queued_posts:
+            await self._flush_queued(channel_id, queued.queued_posts)
 
     def _resolve_purpose_cwd(self, cfg: purpose.PurposeConfig) -> str:
         """Apply `cwd=` from the Channel Purpose, falling back to the default.
@@ -1417,11 +1436,18 @@ class Bridge:
                 )
             except Exception:
                 pass
-            return None
+            session_id = None
         finally:
             queued = self.warming_up_sessions.pop(channel_id, None)
-        if session_id and queued and queued.queued_messages:
-            await self._flush_queued(channel_id, session_id, queued.queued_messages)
+        # On success, posts target the replacement. On failure, the old
+        # mapping above was restored, so re-dispatch there instead of dropping
+        # anything that arrived during the failed restart.
+        if (
+            self.mapping.get_session(Anchor(channel_id))
+            and queued
+            and queued.queued_posts
+        ):
+            await self._flush_queued(channel_id, queued.queued_posts)
         return session_id
 
     def _resolve_session_model(self, cfg: purpose.PurposeConfig) -> str | None:
@@ -1675,10 +1701,18 @@ class Bridge:
         if silent_block:
             body = f"{silent_block}\n\n{body}" if body else silent_block
 
+        first_catch_up: str | None = None
         if first_message:
+            first_catch_up = self._pending_initial_catch_up.pop(channel_id, None)
+            if first_catch_up:
+                body = f"{first_catch_up}\n\n{body}" if body else first_catch_up
             preamble = await self._compute_first_message_preamble(channel_id)
             if preamble:
                 body = f"{preamble}\n\n{body}" if body else preamble
+
+            # Reserve the first-forward slot only after the message has passed
+            # the mention/empty gates. Restore it if delivery fails.
+            self._awaiting_first_forward.discard(channel_id)
 
         logger.info("MM → agent-harness [%s]: %s", session_id[:8], body[:80])
         self._record_harness_send(session_id, body)
@@ -1686,6 +1720,10 @@ class Bridge:
             run = await self.harness.create_run(session_id, body)
             self._track_run_response(session_id, run)
         except HarnessResumeUnsupported:
+            if first_message:
+                self._awaiting_first_forward.add(channel_id)
+                if first_catch_up:
+                    self._pending_initial_catch_up[channel_id] = first_catch_up
             logger.warning("agent-harness resume unsupported for %s", session_id[:8])
             try:
                 self.mm.post(
@@ -1697,6 +1735,10 @@ class Bridge:
                 pass
             self._enqueue_silent_drop(channel_id, thread_root, post)
         except Exception:
+            if first_message:
+                self._awaiting_first_forward.add(channel_id)
+                if first_catch_up:
+                    self._pending_initial_catch_up[channel_id] = first_catch_up
             logger.exception("Failed to create run for harness session %s", session_id[:8])
             try:
                 self.mm.post(
@@ -2099,16 +2141,27 @@ class Bridge:
         `initial_catch_up_n` config is enabled and there's actual history to
         quote. Returns `initial_message` unchanged when the block is empty.
         """
+        block = self._initial_catch_up_block(
+            channel_id, exclude_post_id=exclude_post_id,
+        )
+        if not block:
+            return initial_message
+        return f"{block}\n\n{initial_message}"
+
+    def _initial_catch_up_block(
+        self,
+        channel_id: str,
+        *,
+        exclude_post_id: str | None = None,
+    ) -> str:
+        """Return invite/engagement history as a block, or an empty string."""
         n = self.config.initial_catch_up_n
         if n <= 0:
-            return initial_message
+            return ""
         lines, _ = self._collect_catch_up_lines(
             channel_id, n, exclude_post_id=exclude_post_id,
         )
-        if not lines:
-            return initial_message
-        block = self._format_catch_up_block(lines)
-        return f"{block}\n\n{initial_message}"
+        return self._format_catch_up_block(lines) if lines else ""
 
     async def _run_catch_up(
         self,
@@ -2134,6 +2187,13 @@ class Bridge:
         except Exception:
             logger.exception("Failed to send catch-up block")
             return
+
+        # A successful explicit catch-up in the main channel supersedes the
+        # invite-time history snapshot. Keep `_awaiting_first_forward` so the
+        # first conversational turn still receives its MM-context preamble,
+        # but don't inject the same history a second time.
+        if thread_root is None:
+            self._pending_initial_catch_up.pop(channel_id, None)
 
         # Explicit catch-up already surfaced these messages from MM
         # history; drop only the queue entries that were actually
@@ -2913,6 +2973,8 @@ class Bridge:
             return
         self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
+        self._awaiting_first_forward.discard(channel_id)
+        self._pending_initial_catch_up.pop(channel_id, None)
         self._forget_channel_silent_drops(channel_id)
         self._end_tool_use_run(session_id)
         self.posters.forget(session_id)
@@ -3223,20 +3285,18 @@ class Bridge:
     async def _flush_queued(
         self,
         channel_id: str,
-        session_id: str,
-        queued_messages: list[str],
+        queued_posts: list[dict],
     ) -> None:
-        for msg in queued_messages:
-            self._record_harness_send(session_id, msg)
+        """Re-dispatch posts that arrived while a session was being mapped."""
+        for post in queued_posts:
             try:
-                run = await self.harness.create_run(session_id, msg)
-                self._track_run_response(session_id, run)
+                await self._on_mm_posted(post)
             except Exception:
-                logger.exception("Failed to flush queued message")
+                logger.exception("Failed to re-dispatch queued post")
                 try:
                     self.mm.post_message(
                         channel_id,
-                        ":warning: Failed to deliver a queued message to the new session.",
+                        ":warning: Failed to deliver a queued post to the new session.",
                     )
                 except Exception:
                     pass
