@@ -670,6 +670,118 @@ class InviteFlowTests(_BridgeTestCase):
         # A welcome post (plus no warnings since purpose was empty).
         self.assertTrue(any("Session started" in p.message for p in self.bridge.mm.posted))
 
+    async def test_invited_session_is_quiet_until_first_user_message(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        session_id = self.bridge.mapping.get_session(Anchor("c1"))
+        self.assertIsNotNone(session_id)
+        self.assertEqual(
+            self.bridge.harness.sent, [],
+            "inviting the bot must not spend an LLM turn on a placeholder",
+        )
+        self.assertNotIn(session_id, self.bridge.current_run_id_by_session)
+        self.assertIn("c1", self.bridge._awaiting_first_forward)
+
+    async def test_backend_and_model_can_change_before_first_user_message(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        initial_session = self.bridge.mapping.get_session(Anchor("c1"))
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+        backend_session = self.bridge.mapping.get_session(Anchor("c1"))
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model gpt-5.4",
+            "user_id": "u1", "type": "",
+        })
+        configured_session = self.bridge.mapping.get_session(Anchor("c1"))
+
+        self.assertNotEqual(backend_session, initial_session)
+        self.assertNotEqual(configured_session, backend_session)
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "gpt-5.4")
+        self.assertEqual(
+            self.bridge.harness.sent, [],
+            "configuration commands must not become LLM turns",
+        )
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude Please inspect the failing build",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.harness.sent), 1)
+        sent_session, sent_message = self.bridge.harness.sent[0]
+        self.assertEqual(sent_session, configured_session)
+        self.assertTrue(sent_message.endswith("Please inspect the failing build"))
+
+    async def test_unmentioned_post_does_not_consume_first_forward_slot(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "talking to the room",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.sent, [])
+        self.assertIn("c1", self.bridge._awaiting_first_forward)
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude now start",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.harness.sent), 1)
+        self.assertIn(
+            "Running inside Mattermost channel",
+            self.bridge.harness.sent[0][1],
+        )
+        self.assertNotIn("c1", self.bridge._awaiting_first_forward)
+
+    async def test_help_posted_during_warmup_is_dispatched_after_mapping(self):
+        self.config.auto_join_public_channels = True
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+
+        create_started = asyncio.Event()
+        allow_create = asyncio.Event()
+        original_create = self.bridge.harness.create_session
+
+        async def blocking_create(**kwargs):
+            create_started.set()
+            await allow_create.wait()
+            return await original_create(**kwargs)
+
+        self.bridge.harness.create_session = blocking_create
+        invite = asyncio.create_task(
+            self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        )
+        await create_started.wait()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".help",
+            "user_id": "u1", "type": "",
+        })
+
+        allow_create.set()
+        await invite
+
+        self.assertEqual(
+            self.bridge.harness.sent, [],
+            "a dot-command queued during warm-up must never reach the LLM",
+        )
+        self.assertTrue(
+            any(".stop" in p.message and ".backend" in p.message
+                for p in self.bridge.mm.posted),
+            "queued .help should be dispatched once the session is mapped",
+        )
+
     async def test_bot_invited_to_mapped_channel_is_noop(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
@@ -1009,12 +1121,12 @@ class ForwardingTests(_BridgeTestCase):
         from mm_bridge.bridge import WarmingUpChannel
         self.bridge.warming_up_sessions["c1"] = WarmingUpChannel(channel_id="c1")
 
-        await self.bridge._on_mm_posted({
+        post = {
             "channel_id": "c1", "message": "waiting msg", "user_id": "u1", "type": "",
-        })
+        }
+        await self.bridge._on_mm_posted(post)
 
-        self.assertIn("waiting msg",
-                      self.bridge.warming_up_sessions["c1"].queued_messages)
+        self.assertIn(post, self.bridge.warming_up_sessions["c1"].queued_posts)
         self.assertEqual(self.bridge.vd.sent, [])
 
     async def test_attribution_kicks_in_on_second_user(self):
@@ -1579,9 +1691,9 @@ class CatchUpTests(_BridgeTestCase):
 
 
 class InitialCatchUpTests(_BridgeTestCase):
-    """On first session creation, prepend the last N channel messages as context."""
+    """On the first real turn, prepend invite-time channel history as context."""
 
-    async def test_invite_session_prepends_catch_up_block(self):
+    async def test_invite_session_defers_catch_up_until_first_real_turn(self):
         self.config.initial_catch_up_n = 50
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
         self.bridge.mm.posts_by_channel["c1"] = [
@@ -1592,12 +1704,46 @@ class InitialCatchUpTests(_BridgeTestCase):
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
         self.assertEqual(len(self.bridge.vd.created), 1)
+        self.assertEqual(self.bridge.vd.sent, [])
+
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude begin",
+            "user_id": "u1", "type": "",
+        })
+
         first_msg = self.bridge.vd.sent[0][1]
         self.assertIn("Catch-up context", first_msg)
         self.assertIn("earlier chat", first_msg)
         self.assertIn("more chat", first_msg)
-        # Original placeholder still appended after the block.
-        self.assertIn("I'll wait for the user", first_msg)
+        self.assertTrue(first_msg.rstrip().endswith("begin"))
+
+    async def test_explicit_catch_up_consumes_deferred_history_not_preamble(self):
+        self.config.initial_catch_up_n = 50
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"id": "p1", "user_id": "u1", "message": "earlier chat", "type": ""},
+        ]
+
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        await self.bridge._on_mm_posted({
+            "id": "catch-up", "channel_id": "c1",
+            "message": "@claude catch up 50", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.harness.sent), 1)
+        self.assertIn("earlier chat", self.bridge.harness.sent[0][1])
+        self.assertNotIn("c1", self.bridge._pending_initial_catch_up)
+        self.assertIn("c1", self.bridge._awaiting_first_forward)
+
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude begin",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.harness.sent), 2)
+        first_conversation = self.bridge.harness.sent[1][1]
+        self.assertNotIn("Catch-up context", first_conversation)
+        self.assertIn("Running inside Mattermost channel", first_conversation)
 
     async def test_engagement_excludes_triggering_post(self):
         self.config.auto_join_public_channels = True
@@ -1629,6 +1775,11 @@ class InitialCatchUpTests(_BridgeTestCase):
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude begin",
+            "user_id": "u1", "type": "",
+        })
+
         first_msg = self.bridge.vd.sent[0][1]
         self.assertNotIn("Catch-up context", first_msg)
 
@@ -1638,6 +1789,11 @@ class InitialCatchUpTests(_BridgeTestCase):
         self.bridge.mm.posts_by_channel["c1"] = []
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        await self.bridge._on_mm_posted({
+            "id": "trigger", "channel_id": "c1", "message": "@claude begin",
+            "user_id": "u1", "type": "",
+        })
 
         first_msg = self.bridge.vd.sent[0][1]
         self.assertNotIn("Catch-up context", first_msg)
@@ -1661,6 +1817,24 @@ class LeaveTests(_BridgeTestCase):
         await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
 
         self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
+
+    async def test_leave_quiet_invited_session_clears_first_turn_state(self):
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.mm.posts_by_channel["c1"] = [
+            {"id": "p1", "user_id": "u1", "message": "history", "type": ""},
+        ]
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+        self.assertIn("c1", self.bridge._awaiting_first_forward)
+        self.assertIn("c1", self.bridge._pending_initial_catch_up)
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude leave",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertNotIn("c1", self.bridge._awaiting_first_forward)
+        self.assertNotIn("c1", self.bridge._pending_initial_catch_up)
 
 
 class StopCommandTests(_BridgeTestCase):
@@ -2381,6 +2555,40 @@ class CommandBackendTests(_BridgeTestCase):
         self.assertTrue(self.bridge.harness.created)
         sent_messages = [m for (_sid, m) in self.bridge.harness.sent]
         self.assertNotIn(INVITE_PLACEHOLDER, sent_messages)
+
+    async def test_failed_backend_restart_replays_posts_to_restored_session(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "claude, opus"}
+
+        create_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+
+        async def failing_create(**_kwargs):
+            create_started.set()
+            await allow_failure.wait()
+            raise RuntimeError("harness down")
+
+        self.bridge.harness.create_session = failing_create
+        switch = asyncio.create_task(self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        }))
+        await create_started.wait()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "still here",
+            "user_id": "u1", "type": "",
+        })
+
+        allow_failure.set()
+        await switch
+
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
+        self.assertEqual(self.bridge.harness.sent, [("s1", "still here")])
 
 
 class ThreadConfigSwitchTests(_BridgeTestCase):
@@ -4056,10 +4264,33 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
             if p.props and p.props.get("from_bridge") == "welcome"
         ]
 
-    async def test_invite_posts_join_welcome_before_session_start(self):
+    async def test_invite_posts_join_welcome_after_session_is_ready(self):
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
-        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        create_started = asyncio.Event()
+        allow_create = asyncio.Event()
+        original_create = self.bridge.harness.create_session
+
+        async def blocking_create(**kwargs):
+            create_started.set()
+            await allow_create.wait()
+            return await original_create(**kwargs)
+
+        self.bridge.harness.create_session = blocking_create
+
+        invite = asyncio.create_task(
+            self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        )
+        await create_started.wait()
+
+        self.assertEqual(
+            self._welcomes(), [],
+            "the command manual is a readiness signal and must not appear "
+            "before dot-commands can be handled",
+        )
+
+        allow_create.set()
+        await invite
 
         welcomes = self._welcomes()
         self.assertEqual(len(welcomes), 1, "exactly one join welcome on /invite")
