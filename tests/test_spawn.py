@@ -98,6 +98,41 @@ class FormatSpawnAnnouncementTests(unittest.TestCase):
         self.assertNotIn(">", out)
 
 
+class QuotePromptTruncationTests(unittest.TestCase):
+    """Long forwarded quotes are capped so the preview post never blows past
+    Mattermost's post-size limit. The *actual* prompt (delivered to the
+    sub-session via the harness) is a separate value and is never touched.
+    """
+
+    def test_short_prompt_not_truncated(self) -> None:
+        for fmt in (
+            lambda p: spawn.format_spawn_kickoff("p", p),
+            lambda p: spawn.format_spawn_announcement("T", "c", p),
+        ):
+            out = fmt("a modest brief\nwith two lines")
+            self.assertIn("> a modest brief", out)
+            self.assertIn("> with two lines", out)
+            self.assertNotIn("truncated", out)
+
+    def test_over_cap_prompt_truncated_in_quote(self) -> None:
+        huge = "x" * (spawn.SPAWN_QUOTE_MAX_CHARS + 5000)
+        for fmt in (
+            lambda p: spawn.format_spawn_kickoff("p", p),
+            lambda p: spawn.format_spawn_announcement("T", "c", p),
+        ):
+            out = fmt(huge)
+            # The visible quote is bounded well under the MM post limit and
+            # much shorter than the raw prompt.
+            self.assertLess(len(out), len(huge))
+            self.assertLess(len(out), 16383)
+            self.assertIn("truncated", out.lower())
+
+    def test_prompt_at_cap_not_truncated(self) -> None:
+        exactly = "y" * spawn.SPAWN_QUOTE_MAX_CHARS
+        out = spawn.format_spawn_kickoff("p", exactly)
+        self.assertNotIn("truncated", out.lower())
+
+
 class FormatSpawnKickoffTests(unittest.TestCase):
     def test_header_line_uses_parent_channel_name(self) -> None:
         out = spawn.format_spawn_kickoff("my-parent", "fix the bug")

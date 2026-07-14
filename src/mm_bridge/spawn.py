@@ -12,6 +12,38 @@ from collections.abc import Mapping
 
 MM_DISPLAY_NAME_MAX = 64
 
+# Cap on the forwarded-quote *preview* rendered into the kickoff /
+# announcement posts. A heredoc-piped prompt can be arbitrarily long
+# (``mm-bridge spawn - <<'EOF'``); the full text is delivered to the
+# sub-session via the harness, but the visual quote must stay well under
+# Mattermost's default ``MaxPostSize`` (16383 chars) or the post fails.
+# 4000 is a deliberate readability/safety call — a channel quote longer
+# than that is noise, and it leaves generous headroom for the header and
+# ``> `` line prefixes.
+SPAWN_QUOTE_MAX_CHARS = 4000
+
+
+def _quote_prompt(prompt: str) -> str:
+    """Render *prompt* as a Markdown blockquote for a channel preview.
+
+    Over-long prompts are truncated to :data:`SPAWN_QUOTE_MAX_CHARS` with a
+    marker line, so the preview post never exceeds Mattermost's size limit.
+    The truncation is cosmetic — it affects ONLY this quote, never the
+    prompt delivered to the sub-session. Callers guarantee *prompt* is
+    non-blank (blank prompts skip the quote entirely).
+    """
+    text = prompt
+    truncated = len(text) > SPAWN_QUOTE_MAX_CHARS
+    if truncated:
+        text = text[:SPAWN_QUOTE_MAX_CHARS]
+    quoted = "\n".join(f"> {line}" for line in text.splitlines())
+    if truncated:
+        quoted += (
+            f"\n>\n> _… quote truncated for preview ({len(prompt)} chars); "
+            f"full prompt delivered to the sub-session._"
+        )
+    return quoted
+
 
 def build_spawn_child_env(
     parent_env: Mapping[str, str],
@@ -123,8 +155,7 @@ def format_spawn_announcement(
     header = f":thread: Spawned **{title}** in ~{new_channel_name}~"
     if not prompt.strip():
         return header
-    quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
-    return f"{header}\n\n{quoted}"
+    return f"{header}\n\n{_quote_prompt(prompt)}"
 
 
 def format_spawn_kickoff(parent_channel_name: str, prompt: str) -> str:
@@ -137,8 +168,7 @@ def format_spawn_kickoff(parent_channel_name: str, prompt: str) -> str:
     header = f":thread: Spawned from ~{parent_channel_name}~"
     if not prompt.strip():
         return header
-    quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
-    return f"{header}\n\n{quoted}"
+    return f"{header}\n\n{_quote_prompt(prompt)}"
 
 
 def derive_display_name(title: str | None, fallback: str) -> str:
