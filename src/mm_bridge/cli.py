@@ -40,7 +40,55 @@ class NotInMattermostChannel(RuntimeError):
     """Raised when the current Claude session has no MM-bridge sidecar."""
 
 
+class StdinError(RuntimeError):
+    """Raised when a ``-`` free-text argument can't be read from stdin.
+
+    Two cases: stdin is an interactive terminal (reading would hang
+    forever), or the piped body is empty when the caller required content.
+    """
+
+
 # ─────────────────────── Helpers (unit-tested) ────────────────────────────
+
+
+def _read_stdin_arg(
+    value: str,
+    *,
+    label: str,
+    allow_empty: bool = False,
+    stdin=None,
+) -> str:
+    """Resolve a free-text positional that may be ``-`` (read from stdin).
+
+    The shared backing for the ``-`` convention across subcommands (``post``
+    message, ``spawn`` prompt), so the semantics stay identical everywhere:
+
+    * A value other than ``-`` is returned verbatim — stdin is never touched.
+    * ``-`` reads all of stdin and strips a trailing newline run
+      (``rstrip("\\n")``), matching ``post``'s long-standing behaviour.
+
+    Guards against two foot-guns, surfaced as :class:`StdinError` (the caller
+    maps it to a clear message + exit code rather than hanging or dispatching
+    an empty brief):
+
+    * stdin is an interactive TTY → would block on ``read()`` forever.
+    * the piped body is empty/whitespace and *allow_empty* is False.
+
+    *label* names the argument in error messages (``"message"``, ``"prompt"``).
+    *stdin* is injectable for tests; it defaults to :data:`sys.stdin`.
+    """
+    if value != "-":
+        return value
+    stream = stdin if stdin is not None else sys.stdin
+    if stream.isatty():
+        raise StdinError(
+            f"{label} was '-' but stdin is a terminal — pipe the {label} in "
+            f"(e.g. `... - <<'EOF'`) or pass it as an argument.",
+        )
+    body = stream.read().rstrip("\n")
+    if not allow_empty and not body.strip():
+        raise StdinError(f"{label} was '-' but stdin was empty.")
+    return body
 
 
 def _resolve_anchor_from_session(
@@ -539,10 +587,13 @@ def cmd_post(args: argparse.Namespace) -> int:
 
     root_id = _resolve_effective_root(anchor, args.thread, args.no_thread)
 
-    if args.message == "-":
-        body = sys.stdin.read().rstrip("\n")
-    else:
-        body = args.message
+    # ``allow_empty=True``: post keeps its own empty-body check below, which
+    # also honours the empty-body-with-``--file`` case the helper can't see.
+    try:
+        body = _read_stdin_arg(args.message, label="message", allow_empty=True)
+    except StdinError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     if not body.strip() and not args.file:
         print("Error: message body is empty.", file=sys.stderr)
@@ -888,6 +939,15 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
 
+    # Resolve ``-`` → stdin FIRST: an empty/TTY brief must fail before any
+    # MM login or harness call, so we never dispatch a sub-session with a
+    # bogus prompt (the 2026-07-14 literal ``"-"`` foot-gun).
+    try:
+        prompt = _read_stdin_arg(args.prompt, label="prompt")
+    except StdinError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     try:
         parent_session_id = _current_session_id(cfg.sidecar_dir)
         parent_anchor = _resolve_anchor_from_session(
@@ -928,7 +988,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         resp = asyncio.run(
             _harness_create_session(
                 cfg.agent_harness_url,
-                args.prompt,
+                prompt,
                 cwd,
                 backend,
                 model,
@@ -1022,8 +1082,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         try:
             mm.post(
                 new_channel_id,
-                spawn_mod.format_spawn_kickoff(parent_name, args.prompt),
-                # VD already received `args.prompt` via `create_session`
+                spawn_mod.format_spawn_kickoff(parent_name, prompt),
+                # VD already received `prompt` via `create_session`
                 # and delivers it as the new session's first user turn.
                 # The kickoff post is a visual record for the channel,
                 # not a duplicate user input — without this marker the
@@ -1057,7 +1117,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             mm.post(
                 parent_channel_id,
                 spawn_mod.format_spawn_announcement(
-                    display_name, new_channel_name, args.prompt,
+                    display_name, new_channel_name, prompt,
                 ),
                 root_id=parent_anchor.root_id,
                 # The daemon's per-process own-post tracker only sees
@@ -1192,7 +1252,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_spawn.add_argument(
         "prompt",
-        help="Initial prompt for the sub-session.",
+        help=(
+            "Initial prompt for the sub-session, or '-' to read it from "
+            "stdin (e.g. a heredoc: `mm-bridge spawn - <<'EOF'`)."
+        ),
     )
     p_spawn.add_argument(
         "--cwd",

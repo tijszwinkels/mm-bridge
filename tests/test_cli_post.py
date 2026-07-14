@@ -248,6 +248,39 @@ class PostCommandTests(unittest.TestCase):
         self.assertEqual(mm.posted[0]["message"], "piped body")
         self.assertEqual(mm.posted[0]["props"]["from_bridge_cli_target"], "self")
 
+    def test_stdin_dash_empty_no_file_exits_2(self) -> None:
+        # `post -` with empty stdin and no attachment is an empty body →
+        # exit 2 (preserved behaviour, now routed through the shared helper).
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        mm = FakeMM()
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "post", "-"], stdin="",
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("empty", err.lower())
+        self.assertEqual(mm.posted, [])
+
+    def test_stdin_dash_tty_exits_2_rather_than_hanging(self) -> None:
+        # `post -` from an interactive terminal must error, not block on read().
+        class _FakeTTY(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        sidecar.write(self.sdir, "my-sess", "self-chan")
+        mm = FakeMM()
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["mm-bridge", "post", "-"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch("mm_bridge.cli._make_mm_client", return_value=mm), \
+             patch("sys.stdout", out), patch("sys.stderr", err), \
+             patch("sys.stdin", _FakeTTY("")), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "my-sess"}, clear=False):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("terminal", err.getvalue().lower())
+        self.assertEqual(mm.posted, [])
+
     def test_empty_body_no_file_exits_2(self) -> None:
         mm = FakeMM()
         rc, _, err = self._invoke(
