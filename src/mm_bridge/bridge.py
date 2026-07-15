@@ -24,8 +24,7 @@ from .typing_indicator import TypingIndicator
 
 logger = logging.getLogger(__name__)
 
-# Fallback turn for attachment-only auto-join engagement. Manual invites create
-# quiet sessions and wait for the user's first real message instead.
+# Fallback turn for attachment-only engagement in a dormant channel.
 INVITE_PLACEHOLDER = (
     "Hello! I've just been added to a Mattermost channel. "
     "I'll wait for the user to start the conversation."
@@ -120,9 +119,9 @@ CHANNEL_JOIN_WELCOME_TEMPLATE = (
     "The **Channel Purpose** sets the defaults for new sessions and "
     "`mm-bridge spawn`.\n"
     "\n"
-    "Commands (no mention needed): `.help` for the full list, "
+    "Start with `.help` for the full command list; "
     "`.stop` to interrupt. Also `@{bot} catch up {catch_up_n}` · "
-    "`@{bot} leave`. "
+    "`@{bot} leave`. Catch-up is automatic on the first message. "
     "More: [README](https://github.com/tijszwinkels/mm-bridge#readme)."
 )
 
@@ -391,10 +390,9 @@ class Bridge:
         # SSE start cursor, resolved in ``start()`` from the persisted
         # ``mapping.last_event_seq`` or a cold-start probe of the harness.
         self._event_cursor: int | None = None
-        # Quiet invited sessions still awaiting their first real user message.
-        # That message is forwarded verbatim (config is never inferred from
-        # message content — dot-commands / Channel Purpose own that) and
-        # carries the MM-context preamble plus invite-time catch-up context.
+        # Legacy/deferred first-forward state used by adopted session paths and
+        # the forwarding helper. New channel membership uses `_dormant_channels`
+        # and creates no session until the first conversational message.
         self._awaiting_first_forward: set[str] = set()
         self._pending_initial_catch_up: dict[str, str] = {}
         # Channel purposes we just wrote ourselves, so the subsequent
@@ -407,6 +405,11 @@ class Bridge:
         # `user_added` event must not trigger a new VD session — presence
         # should be silent until a user engages.
         self._self_joined_channels: set[str] = set()
+        # Channels where the bot is a member but no agent session exists yet.
+        # Manual invites and auto-joins intentionally converge on this state:
+        # safe config commands work immediately, while the first conversational
+        # message creates the one and only harness session.
+        self._dormant_channels: set[str] = set()
         self._max_file_size: int | None = None
         # Per-session coalesced tool-use placeholder posts. Created on the
         # first tool_use block of a turn, edited on subsequent ones; the
@@ -447,6 +450,7 @@ class Bridge:
                 logger.exception("agent-harness health check failed — continuing anyway")
 
         await self._bootstrap_known_sessions()
+        await self._bootstrap_dormant_channels()
         self._event_cursor = await self._bootstrap_event_cursor()
 
         logger.info(
@@ -532,6 +536,26 @@ class Bridge:
                 continue
             if await self._create_channel_for_session(session):
                 self._known_sessions.add(session_id)
+
+    async def _bootstrap_dormant_channels(self) -> None:
+        """Recover joined-but-unmapped channels after a daemon restart."""
+        try:
+            channel_ids = await asyncio.to_thread(self.mm.get_bot_channel_ids)
+        except Exception:
+            logger.warning(
+                "Failed to enumerate bot channel memberships for dormant-state bootstrap",
+                exc_info=True,
+            )
+            return
+        self._dormant_channels = {
+            channel_id for channel_id in channel_ids
+            if not self.mapping.get_session(Anchor(channel_id))
+        }
+        if self._dormant_channels:
+            logger.info(
+                "Recovered %d dormant channel membership(s)",
+                len(self._dormant_channels),
+            )
 
     async def _bootstrap_event_cursor(self) -> int | None:
         """Return the SSE cursor to resume from on this boot.
@@ -849,34 +873,71 @@ class Bridge:
 
         session_id = self.mapping.get_session(Anchor(channel_id))
 
+        # A first conversational message may be creating the session right
+        # now. Preserve the full post so commands, attribution and attachments
+        # are re-routed normally once the mapping is ready.
+        warming = self.warming_up_sessions.get(channel_id)
+        if not session_id and warming:
+            warming.queued_posts.append(dict(post))
+            return
+
         # Dot-commands (`.stop`, `.help`, ...) are handled by the bridge
         # itself. Dispatched here — after the channel→session lookup but
         # before every forward path — so they bypass the mention-only gate
         # and are never delivered to the agent. Global commands work even
         # without a mapped session; session-scoped ones reply "no session".
         parsed = commands.parse(message, mentions=self._command_mentions())
-        if parsed is not None and self._commands_allowed_here(channel_id, session_id, message):
-            await self._dispatch_command(
-                channel_id, session_id, post, parsed, thread_root=None,
-            )
-            return
+        if parsed is not None:
+            if self._commands_allowed_here(
+                channel_id, session_id, message, parsed,
+            ):
+                await self._dispatch_command(
+                    channel_id, session_id, post, parsed, thread_root=None,
+                )
+                return
+            if channel_id in self._dormant_channels:
+                # A bare sensitive/unknown dot-word in a dormant channel is
+                # neither a command nor conversation. Swallow it so
+                # autorespond can never turn `.backend`-shaped text into the
+                # first LLM turn, while avoiding global-session data leaks.
+                return
 
         if not session_id:
-            # v1's "create on first message" path is gone (§1.3). If a warming
-            # session for this channel is still warming up, queue the message.
-            warming = self.warming_up_sessions.get(channel_id)
-            if warming:
-                # Retain the complete post so it can pass through normal
-                # routing once the session is mapped. In particular, a dot-
-                # command must still be intercepted rather than sent to the
-                # LLM, and attachments/attribution must not be discarded.
-                warming.queued_posts.append(dict(post))
+            if channel_id not in self._dormant_channels:
                 return
-            # Auto-joined channel: session starts on first engagement.
-            if self.config.auto_join_public_channels:
-                await self._maybe_start_engagement_session(
-                    channel_id, post, message,
+
+            # Natural-language control phrases advertised in the join welcome
+            # must not accidentally create a session just to say there is no
+            # session. They behave identically for invite and auto-join.
+            if _CATCH_UP_RE.match(message):
+                self._post_cmd_reply(
+                    channel_id,
+                    ":information_source: Catch-up is included automatically "
+                    "with your first message.",
+                    None,
                 )
+                return
+            if m := _LEAVE_CMD_RE.match(message):
+                try:
+                    await asyncio.to_thread(self.mm.remove_self_from_channel, channel_id)
+                except Exception:
+                    logger.warning("Failed to leave dormant channel %s", channel_id, exc_info=True)
+                    self._post_cmd_reply(
+                        channel_id, ":warning: Failed to leave the channel.", None,
+                    )
+                    return
+                self._dormant_channels.discard(channel_id)
+                self.purpose_by_channel.pop(channel_id, None)
+                return
+            if _STOP_CMD_RE.match(message):
+                self._post_cmd_reply(
+                    channel_id, ":information_source: No session in this channel.", None,
+                )
+                return
+
+            await self._maybe_start_engagement_session(
+                channel_id, post, message,
+            )
             return
 
         # Channels still mapped to a pre-cutover external session can't
@@ -889,8 +950,8 @@ class Bridge:
             )
             return
 
-        # First successfully forwarded message after an invite carries the
-        # MM-context preamble and invite-time catch-up. `_forward_user_post`
+        # A legacy deferred first message carries the MM-context preamble and
+        # catch-up. `_forward_user_post`
         # consumes the slot only after mention/empty-message gates, restoring
         # it if delivery fails. Content is never parsed as config — dot-
         # commands and Channel Purpose are the only configuration paths.
@@ -943,25 +1004,21 @@ class Bridge:
     async def _on_mm_user_added(self, channel_id: str, user_id: str) -> None:
         if user_id != self.mm.bot_user_id:
             return
-        # Self-initiated auto-join — silent presence, no session yet, but
-        # post a one-time manual so anyone browsing the channel sees how
-        # to reach the bot.
-        if channel_id in self._self_joined_channels:
-            self._self_joined_channels.discard(channel_id)
-            logger.info("Auto-joined %s — silent presence (no session until engagement)", channel_id)
-            await self._post_channel_join_welcome(channel_id)
-            return
         if self.mapping.get_session(Anchor(channel_id)):
+            self._self_joined_channels.discard(channel_id)
             logger.info("Bot already mapped for channel %s — skipping", channel_id)
             return
         if channel_id in self.warming_up_sessions:
             return
-        # Manual /invite path: create and map a quiet session first. The join
-        # manual advertises dot-commands, so it doubles as a readiness signal:
-        # don't expose it until those commands can actually be handled.
-        await self._start_invited_session(channel_id)
-        if self.mapping.get_session(Anchor(channel_id)):
-            await self._post_channel_join_welcome(channel_id)
+        joined_by_bridge = channel_id in self._self_joined_channels
+        self._self_joined_channels.discard(channel_id)
+        self._dormant_channels.add(channel_id)
+        logger.info(
+            "%s channel %s — dormant until first engagement",
+            "Auto-joined" if joined_by_bridge else "Invited to",
+            channel_id,
+        )
+        await self._post_channel_join_welcome(channel_id)
 
     async def _maybe_start_engagement_session(
         self,
@@ -969,7 +1026,7 @@ class Bridge:
         post: dict,
         message: str,
     ) -> None:
-        """Start a VD session on first user engagement in an auto-joined channel.
+        """Start a session on first engagement in any dormant channel.
 
         "Engagement" depends on the channel's effective config:
           - mention-only  → require an `@claude` / `@<bot>` mention
@@ -979,40 +1036,47 @@ class Bridge:
         (stripped of bot mention) and is forwarded verbatim — never parsed as
         config (dot-commands / Channel Purpose are the only config paths).
         """
-        try:
-            ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
-        except Exception:
-            logger.exception("Failed to fetch channel %s for engagement", channel_id)
+        # Reserve before the first await. Two near-simultaneous first messages
+        # must never race into two session creations; later posts are queued by
+        # `_on_mm_posted` and replayed after the mapping exists.
+        if channel_id in self.warming_up_sessions:
+            self.warming_up_sessions[channel_id].queued_posts.append(dict(post))
             return
-        purpose_text = ch.get("purpose", "") or ""
+        self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
 
-        models_by_backend = await self._models_for_known_backends()
-        cfg = purpose.parse(
-            purpose_text,
-            self.config.default_backend,
-            # The per-backend default is applied at session-create time
-            # (``_resolve_session_model``) so codex channels don't inherit
-            # claude's ``opus`` here.
-            default_model=None,
-            available_models_for=lambda b: models_by_backend.get(b, []),
-            default_autorespond=self.config.default_autorespond,
-        )
+        try:
+            cfg = await self._load_channel_config(channel_id, force=True)
+        except Exception:
+            logger.exception("Failed to fetch channel config for %s", channel_id)
+            queued = self.warming_up_sessions.pop(channel_id, None)
+            if queued and queued.queued_posts:
+                await self._flush_queued(channel_id, queued.queued_posts)
+            return
 
         bot_mention = f"@{self.mm.bot_username}"
         mentioned = bot_mention in message or "@claude" in message.lower()
         if cfg.mention_only and not mentioned:
+            queued = self.warming_up_sessions.pop(channel_id, None)
+            if queued and queued.queued_posts:
+                await self._flush_queued(channel_id, queued.queued_posts)
             return  # silent — not engaging
 
         cleaned = (
             message.replace(bot_mention, "").replace("@claude", "").strip()
         )
         if not cleaned and not post.get("file_ids"):
+            queued = self.warming_up_sessions.pop(channel_id, None)
+            if queued and queued.queued_posts:
+                await self._flush_queued(channel_id, queued.queued_posts)
             return
 
         # The first engagement message starts the session and is forwarded
         # verbatim — never parsed as config (dot-commands / Channel Purpose
         # are the only config paths). This mirrors the invite path.
         initial = cleaned or INVITE_PLACEHOLDER
+        preamble = await self._compute_first_message_preamble(channel_id)
+        if preamble:
+            initial = f"{preamble}\n\n{initial}"
 
         await self._start_invited_session(
             channel_id,
@@ -1049,6 +1113,7 @@ class Bridge:
         session_id = self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
         self.warming_up_sessions.pop(channel_id, None)
+        self._dormant_channels.discard(channel_id)
         # Drain per-channel config state so a removal mid-restart (before the
         # self-write's `channel_updated` event arrives) doesn't leak an entry.
         self._self_written_purpose.pop(channel_id, None)
@@ -1076,21 +1141,35 @@ class Bridge:
             "display_name": new_display, "purpose": new_purpose,
         }
 
-        session_id = self.mapping.get_session(Anchor(channel_id))
-        if not session_id:
-            return
-
         # Purpose change (only emit notice if actually changed AND we didn't
         # write it ourselves). A single self-write may fan out into more than
         # one `channel_updated` event, so match against the pending SET and
         # drain the matched entry rather than a lone slot.
-        if prev and prev.get("purpose") != new_purpose:
+        purpose_changed = bool(prev and prev.get("purpose") != new_purpose)
+        if purpose_changed:
             pending = self._self_written_purpose.get(channel_id)
             if pending is not None and new_purpose in pending:
                 pending.discard(new_purpose)
                 if not pending:
                     self._self_written_purpose.pop(channel_id, None)
                 return
+
+            if channel_id in self._dormant_channels:
+                try:
+                    await self._load_channel_config(channel_id, force=True)
+                except Exception:
+                    logger.warning(
+                        "Failed to refresh dormant config after Purpose change in %s",
+                        channel_id,
+                        exc_info=True,
+                    )
+                return
+
+        session_id = self.mapping.get_session(Anchor(channel_id))
+        if not session_id:
+            return
+
+        if purpose_changed:
             try:
                 self.mm.post_message(
                     channel_id,
@@ -1154,11 +1233,9 @@ class Bridge:
             except Exception:
                 logger.debug("posting purpose warning failed", exc_info=True)
 
-        # Manual invites create a quiet session so `.backend` / `.model` work
-        # before the first LLM turn. Preserve the old invite-time history
-        # semantics by holding the catch-up block for that first real turn.
-        # Engagement/replacement flows already have a real initial message and
-        # send it immediately with catch-up prepended.
+        # The deferred branch remains for compatibility with callers that need
+        # a mapped-but-quiet session. Dormant engagement and replacement flows
+        # have a real initial message and send it with catch-up prepended.
         effective_initial: str | None = None
         self._pending_initial_catch_up.pop(channel_id, None)
         if awaits_first_message:
@@ -1190,6 +1267,7 @@ class Bridge:
             if not session_id:
                 raise RuntimeError("agent-harness create_session response missing id")
             self.mapping.link(Anchor(channel_id), session_id)
+            self._dormant_channels.discard(channel_id)
             self._known_sessions.add(session_id)
             if awaits_first_message:
                 self._awaiting_first_forward.add(channel_id)
@@ -1474,6 +1552,29 @@ class Bridge:
                 models[b] = []
         return models
 
+    async def _load_channel_config(
+        self, channel_id: str, *, force: bool = False,
+    ) -> purpose.PurposeConfig:
+        """Return and cache the effective Channel Purpose configuration."""
+        cached = self.purpose_by_channel.get(channel_id)
+        if cached is not None and not force:
+            return cached
+        ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
+        self.last_channel_state.setdefault(channel_id, {
+            "display_name": ch.get("display_name", "") or "",
+            "purpose": ch.get("purpose", "") or "",
+        })
+        models_by_backend = await self._models_for_known_backends()
+        cfg = purpose.parse(
+            ch.get("purpose", "") or "",
+            self.config.default_backend,
+            default_model=None,
+            available_models_for=lambda b: models_by_backend.get(b, []),
+            default_autorespond=self.config.default_autorespond,
+        )
+        self.purpose_by_channel[channel_id] = cfg
+        return cfg
+
     async def _run_runtime_toggle(self, channel_id: str, token: str) -> None:
         """Flip the channel's mention_only flag from an autorespond token.
 
@@ -1615,16 +1716,7 @@ class Bridge:
         """
         cfg: purpose.PurposeConfig | None = None
         try:
-            ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
-            purpose_text = (ch.get("purpose") or "")
-            models_by_backend = await self._models_for_known_backends()
-            cfg = purpose.parse(
-                purpose_text,
-                self.config.default_backend,
-                default_model=None,
-                available_models_for=lambda b: models_by_backend.get(b, []),
-                default_autorespond=self.config.default_autorespond,
-            )
+            cfg = await self._load_channel_config(channel_id, force=True)
         except Exception:
             logger.debug(
                 "failed to derive cfg for join welcome on %s",
@@ -2263,20 +2355,28 @@ class Bridge:
         return bot_mention in message or "@claude" in message.lower()
 
     def _commands_allowed_here(
-        self, channel_id: str, session_id: str | None, message: str,
+        self,
+        channel_id: str,
+        session_id: str | None,
+        message: str,
+        parsed: commands.ParsedCommand,
     ) -> bool:
         """Whether a dot-command should be honored in this channel.
 
-        Always in channels with a mapped session, and always when auto-join is
-        disabled (the bot is only ever in channels it was explicitly invited
-        to). In auto-join "silent presence" channels that have no session yet,
-        require an explicit @mention — otherwise a bare dot-shaped message
-        (e.g. ``.gitignore ...``) could pull the lurking bot out of silence or
-        leak internal listings (`.sessions`/`.running`).
+        Active sessions retain the full command set. Dormant channels allow a
+        deliberately small bare-command set for pre-session configuration;
+        global/session-listing commands require an explicit mention so a
+        dot-shaped room message cannot leak operator-wide state.
         """
-        if session_id or not self.config.auto_join_public_channels:
+        if session_id:
             return True
-        return self._message_mentions_bot(message)
+        if channel_id not in self._dormant_channels:
+            return not self.config.auto_join_public_channels
+        if self._message_mentions_bot(message):
+            return True
+        return parsed.name in {
+            "help", "backend", "model", "models", "autorespond",
+        }
 
     def _post_cmd_reply(
         self, channel_id: str, text: str, thread_root: str | None,
@@ -2309,6 +2409,30 @@ class Bridge:
                 thread_root,
             )
             return
+        if not session_id and channel_id in self._dormant_channels:
+            if spec.name in {"backend", "model", "models", "autorespond"}:
+                try:
+                    await self._load_channel_config(channel_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to load dormant config for command in %s", channel_id,
+                    )
+                    self._post_cmd_reply(
+                        channel_id,
+                        ":warning: Could not read this channel's configuration.",
+                        thread_root,
+                    )
+                    return
+            if spec.name == "backend":
+                await self._cmd_dormant_backend(
+                    channel_id, parsed.arg, thread_root,
+                )
+                return
+            if spec.name == "model":
+                await self._cmd_dormant_model(
+                    channel_id, parsed.arg, thread_root,
+                )
+                return
         if spec.session_scoped and not session_id:
             self._post_cmd_reply(
                 channel_id,
@@ -2347,7 +2471,14 @@ class Bridge:
             )
 
     async def _cmd_help(self, channel_id: str, thread_root: str | None) -> None:
-        self._post_cmd_reply(channel_id, commands.help_text(), thread_root)
+        body = commands.help_text()
+        if channel_id in self._dormant_channels:
+            body += (
+                "\n\n_Before the first session: `.backend`, `.model`, `.models`, "
+                "and `.autorespond` work without a mention. For privacy, "
+                "`.sessions`, `.running`, and `.invite` require `@claude`._"
+            )
+        self._post_cmd_reply(channel_id, body, thread_root)
 
     async def _cmd_autorespond(
         self, channel_id: str, arg: str | None, thread_root: str | None,
@@ -2448,6 +2579,92 @@ class Bridge:
             thread_root,
         )
         return True
+
+    async def _cmd_dormant_model(
+        self, channel_id: str, arg: str | None, thread_root: str | None,
+    ) -> None:
+        """Read or persist a model without creating a harness session."""
+        cfg = self.purpose_by_channel[channel_id]
+        if not arg:
+            model = (
+                cfg.model
+                or self.config.default_model_for(cfg.backend)
+                or "default"
+            )
+            self._post_cmd_reply(
+                channel_id,
+                f":robot_face: Model for the next session: `{model}` "
+                f"(backend `{cfg.backend}`). Switch with `.model <name>`; "
+                "see options with `.models`.",
+                thread_root,
+            )
+            return
+
+        updated = purpose.PurposeConfig(
+            backend=cfg.backend,
+            model=arg,
+            mention_only=cfg.mention_only,
+            cwd=cfg.cwd,
+            warnings=[],
+        )
+        self.purpose_by_channel[channel_id] = updated
+        self._persist_purpose(channel_id, updated)
+        self._post_cmd_reply(
+            channel_id,
+            f":gear: Model set to `{arg}` — it will apply when the session starts. "
+            "If the backend rejects it, the error will appear then.",
+            thread_root,
+        )
+
+    async def _cmd_dormant_backend(
+        self, channel_id: str, arg: str | None, thread_root: str | None,
+    ) -> None:
+        """Read or persist a backend without creating a harness session."""
+        cfg = self.purpose_by_channel[channel_id]
+        known_list = ", ".join(
+            f"`{backend}`" for backend in sorted(purpose.KNOWN_BACKENDS)
+        )
+        if not arg:
+            self._post_cmd_reply(
+                channel_id,
+                f":electric_plug: Backend for the next session: `{cfg.backend}`. "
+                f"Switch with `.backend <name>`. Known: {known_list}.",
+                thread_root,
+            )
+            return
+
+        requested = purpose.canonical_backend(arg.strip())
+        if requested not in purpose.KNOWN_BACKENDS:
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Unknown backend `{arg.strip()}`. Known: {known_list}.",
+                thread_root,
+            )
+            return
+        if requested == cfg.backend:
+            self._post_cmd_reply(
+                channel_id,
+                f":information_source: Already configured for backend `{requested}`.",
+                thread_root,
+            )
+            return
+
+        target = purpose.PurposeConfig(
+            backend=requested,
+            model=None,
+            mention_only=cfg.mention_only,
+            cwd=cfg.cwd,
+            warnings=[],
+        )
+        updated = self._merge_configs(cfg, target)
+        self.purpose_by_channel[channel_id] = updated
+        self._persist_purpose(channel_id, updated)
+        self._post_cmd_reply(
+            channel_id,
+            f":gear: Backend set to `{requested}` — it will apply when the "
+            f"session starts (model reset to the `{requested}` default).",
+            thread_root,
+        )
 
     async def _cmd_model(
         self,

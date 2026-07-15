@@ -4,7 +4,7 @@ Mattermost ↔ agent-harness bridge — one channel (or thread) per Claude Code 
 
 A daemon connects a Mattermost bot account (conventionally `@claude`) to an agent-harness instance and maps conversations to sessions:
 
-- **A channel** the bot is invited to → one agent-harness session. Messages in the channel become user turns; assistant replies stream back as posts.
+- **A channel** the bot joins or is invited to → a dormant, configurable presence. The first conversational message creates one agent-harness session; assistant replies stream back as posts.
 - **A thread** inside a channel → its own *forked* session, so side-quests don't pollute the main conversation.
 - **`mm-bridge spawn "<prompt>"`** from inside a session → a fresh sibling channel with its own session, with the parent announced via a post that links the child's `~channel~` header back upstream.
 
@@ -184,17 +184,19 @@ The parent channel gets a `:thread: Spawned **Title** in ~slug~` announcement (t
 
 ## In-channel dot-commands
 
-Type these in any bridged channel (or thread) — the **bridge** handles them
-itself. They work with or without an `@claude` mention, bypass the
-mention-only gate, and are never forwarded to the agent. An unknown `.word`
-gets an "unknown command — try `.help`" reply rather than reaching the agent.
+Type these in any active bridged channel (or thread) — the **bridge** handles
+them itself, bypassing the mention-only gate, and never forwards them to the
+agent. An unknown `.word` gets an "unknown command — try `.help`" reply rather
+than reaching the agent.
 
-A manual bot invite creates and maps a **quiet session** before showing the
-command welcome. No placeholder turn is sent to the agent, so `.backend` and
-`.model` can be changed immediately; the first conversational post becomes the
-session's first agent turn. Posts arriving during session warm-up are routed
-normally once mapping completes, so dot-commands remain commands during that
-race window.
+Manual invites and auto-joins use the same **dormant channel** state: no
+harness session or LLM turn exists yet. `.help`, `.backend`, `.model`,
+`.models`, and `.autorespond` work immediately and persist their settings in
+the Channel Purpose. The first conversational post creates exactly one session
+with the final configuration. In dormant channels, global listings/actions
+(`.sessions`, `.running`, `.invite`) require an explicit `@claude` mention;
+bare sensitive or unknown dot-words are ignored. Posts arriving while the
+first session is warming up are routed normally once mapping completes.
 
 | Command | What it does |
 |---|---|
@@ -202,15 +204,15 @@ race window.
 | `.stop` | Interrupt the running turn in this channel. |
 | `.autorespond [on\|off]` | Reply to every message, or only when @mentioned (bare = toggle). Persisted in the Channel Purpose. |
 | `.status` | Session id, backend, model, cwd, autorespond flag, run state, harness status. |
-| `.model [<name>]` | Show the current model, or switch it. Names are free text — a bad one fails loudly with the backend error. Switching recreates the session, so `.stop` any active run first. |
-| `.backend [<name>]` | Show the current backend, or switch it. Validated against the known backends (`claude`, `codex`, …) — a typo is rejected inline. Switching recreates the session and **resets the model to that backend's default** (models are backend-specific), so `.stop` any active run first. |
+| `.model [<name>]` | Show or select the model. In a dormant channel it configures the future session without creating one. In an active channel it recreates the session, so `.stop` any active run first. Names are free text; a bad one fails loudly when the backend starts. |
+| `.backend [<name>]` | Show or select the backend. In a dormant channel it configures the future session without creating one. In an active channel it recreates the session. Validated against known backends (`claude`, `codex`, …); changing it **resets the model to that backend's default**. |
 | `.models` | List the available models for this channel's backend (from the `[models]` config table + the harness catalog), marking the current one. |
 | `.running` | Sessions with a run in flight right now. |
 | `.sessions [N]` | The N most recent sessions across all agents — including terminal (TUI) sessions not yet on Mattermost. Each shows its channel or an `.invite` hint. |
 | `.invite <session-id>` | Get added to a session's Mattermost channel, creating it first for unmapped/terminal sessions. Posting into a resumed terminal session **forks** it (see the channel's bootstrap note). |
 
-Session-scoped commands (`.stop`, `.status`, `.model`, `.backend`) reply "No
-session in this channel" when the channel has none; the rest work regardless.
+`.stop` and `.status` reply "No session in this channel" before first
+engagement. `.model` and `.backend` configure the future session instead.
 Inside a **thread fork**, bare `.model` / `.backend` (read-only) work, but a
 *switch* (`.model <name>` / `.backend <name>`) is refused — a restart would
 replace the channel's session, not the thread's. Switch from the channel.
