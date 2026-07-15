@@ -29,15 +29,32 @@ from typing import Iterable
 
 @dataclass(frozen=True)
 class CommandSpec:
-    """A known dot-command's metadata (used for dispatch + ``.help``)."""
+    """A known dot-command's metadata — the single source of truth the bridge
+    reads to decide pre-session (dormant) behaviour, so a new command's
+    capabilities alone determine how it's routed before a session exists.
+
+    Two orthogonal flags drive that routing:
+
+    * ``session_scoped`` — the command acts on the channel's own harness
+      session. Before a session exists these still respond (``.status``
+      reports the pre-session config; ``.stop`` says "no session"); they
+      never create one.
+    * ``global_scope`` — the command reveals or acts on operator-wide state
+      spanning channels (``.sessions``/``.running``/``.invite``). In a
+      *dormant* channel these are honored only with an explicit ``@mention``,
+      so a bare dot-word in a shared room can't leak cross-channel state. In
+      an active (mapped) channel they run normally.
+
+    The two are independent: ``.status``/``.stop`` are ``session_scoped`` but
+    channel-local (never ``global_scope``); ``.sessions`` is ``global_scope``
+    but not tied to this channel's session.
+    """
 
     name: str
     usage: str
     summary: str
-    # Session-scoped commands normally require a mapped session. The bridge
-    # explicitly handles model/backend as pre-session configuration while a
-    # channel is dormant; stop/status still reply "no session" there.
     session_scoped: bool = False
+    global_scope: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,14 +104,17 @@ _SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "running", ".running",
         "List sessions with a run in flight right now.",
+        global_scope=True,
     ),
     CommandSpec(
         "sessions", ".sessions [N]",
         "List recent sessions across all agents (incl. terminal ones).",
+        global_scope=True,
     ),
     CommandSpec(
         "invite", ".invite <session-id>",
         "Get invited to a session's Mattermost channel (creating it if needed).",
+        global_scope=True,
     ),
 )
 
@@ -151,3 +171,30 @@ def help_text() -> str:
     for spec in REGISTRY.values():
         lines.append(f"• `{spec.usage}` — {spec.summary}")
     return "\n".join(lines)
+
+
+def dormant_help_note() -> str:
+    """Explain pre-session command availability, derived from the registry.
+
+    Channel-local commands work without a mention before the first session;
+    ``global_scope`` (operator-wide) commands require an explicit ``@claude``
+    so a bare dot-word in a shared room can't leak cross-channel state. Both
+    lists come straight from :data:`REGISTRY` so a new command's ``global_scope``
+    flag is the only thing that decides where it appears.
+    """
+    channel_local = [
+        f"`.{s.name}`" for s in REGISTRY.values() if not s.global_scope
+    ]
+    operator_wide = [
+        f"`.{s.name}`" for s in REGISTRY.values() if s.global_scope
+    ]
+    note = (
+        "_Before the first session, channel commands ("
+        + ", ".join(channel_local)
+        + ") work without a mention."
+    )
+    if operator_wide:
+        note += (
+            " For privacy, " + ", ".join(operator_wide) + " require `@claude`."
+        )
+    return note + "_"
