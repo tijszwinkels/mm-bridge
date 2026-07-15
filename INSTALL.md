@@ -471,9 +471,10 @@ contains the `@…/CLAUDE-include.md` import; and in a Claude Code session bound
 
 1. `curl -s localhost:8877/v1/health` → ok.
 2. In Mattermost, create a channel and `/invite @<bot>` (skip the invite if auto-join is on).
-3. Post `@<bot> hello`. Within a few seconds you get a reply.
-4. Type `.status` → shows session id, backend, model, cwd, autorespond flag, harness status.
-5. Type `.help` → lists dot-commands (`.stop`, `.model`, `.sessions`, `.autorespond`, …).
+3. Before posting a conversational message, use `.backend <name>` and/or `.model <name>`; confirm no agent session starts yet.
+4. Post `@<bot> hello`. Within a few seconds you get a reply from a session using that configuration.
+5. Type `.status` → shows session id, backend, model, cwd, autorespond flag, harness status.
+6. Type `.help` → lists dot-commands (`.stop`, `.model`, `.sessions`, `.autorespond`, …).
 
 **✅ Done** when a message to the bot produces a model reply and `.status` reports the
 harness as reachable.
