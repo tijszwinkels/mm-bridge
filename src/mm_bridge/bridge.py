@@ -1304,20 +1304,37 @@ class Bridge:
         if session_id and queued and queued.queued_posts:
             await self._flush_queued(channel_id, queued.queued_posts)
 
-    def _resolve_purpose_cwd(self, cfg: purpose.PurposeConfig) -> str:
-        """Apply `cwd=` from the Channel Purpose, falling back to the default.
+    def _resolve_cwd(self, cfg: purpose.PurposeConfig) -> tuple[str, bool]:
+        """Return ``(effective_cwd, rejected)`` for ``cfg``.
 
-        The requested path must resolve inside `allowed_attachment_roots`;
-        otherwise we append a warning to `cfg.warnings` so the channel learns
-        the override was rejected, and fall back to `config.default_cwd`.
-        With no allowed roots configured we trust the caller (same as
-        `resolve_attachment_path`).
+        ``effective_cwd`` is a Channel Purpose ``cwd=`` validated against
+        ``allowed_attachment_roots`` (with no roots configured we trust the
+        caller, same as ``resolve_attachment_path``), else
+        ``config.default_cwd``. ``rejected`` is True only when a *supplied*
+        ``cwd=`` fell outside the allowed roots and was replaced by the
+        default. Pure — no warnings, no logging, no mutation of ``cfg`` — so
+        the warning-emitting create path and read-only ``.status`` can share
+        one resolution and never disagree.
         """
         if not cfg.cwd:
-            return self.config.default_cwd
-        roots = self.config.allowed_attachment_roots
-        resolved = resolve_attachment_path(cfg.cwd, project_path=None, allowed_roots=roots)
+            return self.config.default_cwd, False
+        resolved = resolve_attachment_path(
+            cfg.cwd, project_path=None,
+            allowed_roots=self.config.allowed_attachment_roots,
+        )
         if resolved is None:
+            return self.config.default_cwd, True
+        return str(resolved), False
+
+    def _resolve_purpose_cwd(self, cfg: purpose.PurposeConfig) -> str:
+        """Effective cwd for the session-create paths.
+
+        Delegates resolution to :meth:`_resolve_cwd` and additionally records
+        a channel-visible warning (and a log line) when a supplied ``cwd=``
+        override is rejected, so the channel learns the override didn't take.
+        """
+        cwd, rejected = self._resolve_cwd(cfg)
+        if rejected:
             cfg.warnings.append(
                 f"Channel Purpose `cwd={cfg.cwd}` is not inside any allowed_attachment_root "
                 f"— using default `{self.config.default_cwd}`."
@@ -1325,9 +1342,9 @@ class Bridge:
             logger.warning(
                 "Rejected Channel Purpose cwd=%r (not in allowed_attachment_roots)", cfg.cwd,
             )
-            return self.config.default_cwd
-        logger.info("Channel Purpose cwd override → %s", resolved)
-        return str(resolved)
+        elif cfg.cwd:
+            logger.info("Channel Purpose cwd override → %s", cwd)
+        return cwd
 
     # ─────────────────── Session reconfig + runtime toggle ─────────────────
 
@@ -1924,6 +1941,15 @@ class Bridge:
         # session (may be None → "no session" reply).
         parsed = commands.parse(message, mentions=self._command_mentions())
         if parsed is not None:
+            # A dormant channel has no session (so no thread fork either): apply
+            # the same privacy gate the channel path uses, so a bare global
+            # command (`.sessions`/`.running`/`.invite`) replied to the welcome
+            # in a thread can't leak operator-wide state without an @mention.
+            # Mapped channels keep dispatching thread commands unconditionally.
+            if channel_id in self._dormant_channels and not self._commands_allowed_here(
+                channel_id, thread_session, message, parsed,
+            ):
+                return
             await self._dispatch_command(
                 channel_id, thread_session, post, parsed, thread_root=root_id,
             )
@@ -2361,22 +2387,38 @@ class Bridge:
         message: str,
         parsed: commands.ParsedCommand,
     ) -> bool:
-        """Whether a dot-command should be honored in this channel.
+        """Whether a dot-command should be honored (intercepted) here.
 
-        Active sessions retain the full command set. Dormant channels allow a
-        deliberately small bare-command set for pre-session configuration;
-        global/session-listing commands require an explicit mention so a
-        dot-shaped room message cannot leak operator-wide state.
+        Single-source-of-truth gate driven by :class:`commands.CommandSpec`
+        metadata — there is no hand-maintained per-command allowlist, so a new
+        command can't accidentally become (or suppress) an LLM first turn.
+
+        * Active sessions (``session_id`` set) retain the full command set.
+        * Dormant channels intercept every *known* dot-command so it's handled
+          by the bridge and never forwarded — the only exception being bare
+          ``global_scope`` (operator-wide) commands, which require an explicit
+          ``@mention`` so a bare dot-word in a shared room can't leak
+          cross-channel state. ``False`` here means the main handler swallows
+          the message (dropping it, never an LLM turn).
+        * An explicit ``@mention`` deliberately addresses the bot, so it always
+          intercepts — including an unknown dot-word, which then gets the
+          "unknown command" hint instead of silence.
+        * A *bare* unknown dot-word (``spec is None``) stays swallowed in a
+          dormant channel — casual ``.foo`` chatter in an auto-joined room
+          shouldn't draw a bot reply. Active channels always answer with a hint.
         """
         if session_id:
             return True
         if channel_id not in self._dormant_channels:
             return not self.config.auto_join_public_channels
         if self._message_mentions_bot(message):
-            return True
-        return parsed.name in {
-            "help", "backend", "model", "models", "autorespond",
-        }
+            return True  # explicit address — always intercept and answer
+        spec = parsed.spec
+        if spec is None:
+            return False  # bare unknown dot-word: drop silently while dormant
+        if spec.global_scope:
+            return False  # bare operator-wide command needs an explicit @mention
+        return True
 
     def _post_cmd_reply(
         self, channel_id: str, text: str, thread_root: str | None,
@@ -2410,7 +2452,9 @@ class Bridge:
             )
             return
         if not session_id and channel_id in self._dormant_channels:
-            if spec.name in {"backend", "model", "models", "autorespond"}:
+            # Commands with a pre-session answer read the channel's effective
+            # config, so ensure it's loaded (and cached) first.
+            if spec.name in {"backend", "model", "models", "autorespond", "status"}:
                 try:
                     await self._load_channel_config(channel_id)
                 except Exception:
@@ -2432,6 +2476,9 @@ class Bridge:
                 await self._cmd_dormant_model(
                     channel_id, parsed.arg, thread_root,
                 )
+                return
+            if spec.name == "status":
+                await self._cmd_dormant_status(channel_id, thread_root)
                 return
         if spec.session_scoped and not session_id:
             self._post_cmd_reply(
@@ -2473,11 +2520,7 @@ class Bridge:
     async def _cmd_help(self, channel_id: str, thread_root: str | None) -> None:
         body = commands.help_text()
         if channel_id in self._dormant_channels:
-            body += (
-                "\n\n_Before the first session: `.backend`, `.model`, `.models`, "
-                "and `.autorespond` work without a mention. For privacy, "
-                "`.sessions`, `.running`, and `.invite` require `@claude`._"
-            )
+            body += "\n\n" + commands.dormant_help_note()
         self._post_cmd_reply(channel_id, body, thread_root)
 
     async def _cmd_autorespond(
@@ -2549,6 +2592,41 @@ class Bridge:
         hstatus = meta.get("status")
         if hstatus:
             lines.append(f"• harness session: `{hstatus}`")
+        self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
+
+    async def _cmd_dormant_status(
+        self, channel_id: str, thread_root: str | None,
+    ) -> None:
+        """`.status` before a session exists.
+
+        Reports the effective config the FIRST message will start with —
+        backend / model / cwd / autorespond — so operators can verify a
+        dormant channel without spending an LLM turn. The values resolve
+        exactly as ``_maybe_start_engagement_session`` will at create time:
+        Channel Purpose (cached in ``purpose_by_channel``) with the config
+        defaults filling any gap. Layout mirrors :meth:`_cmd_status`.
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        backend = cfg.backend if cfg else self.config.default_backend
+        model = (
+            (cfg.model if cfg else None)
+            or self.config.default_model_for(backend)
+            or "default"
+        )
+        # Resolve cwd exactly as the create path does (validating any Purpose
+        # `cwd=` against allowed roots) so `.status` never advertises a cwd the
+        # session won't actually get.
+        cwd = self._resolve_cwd(cfg)[0] if cfg else self.config.default_cwd
+        mention_only = (
+            cfg.mention_only if cfg else not self.config.default_autorespond
+        )
+        autorespond = "mention-only" if mention_only else "on"
+        lines = [
+            "**Status** — no session yet (starts on your first message).",
+            f"• backend: `{backend}`  ·  model: `{model}`",
+            f"• cwd: `{cwd}`",
+            f"• autorespond: `{autorespond}`",
+        ]
         self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
 
     def _session_has_active_run(self, session_id: str) -> bool:

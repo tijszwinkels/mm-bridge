@@ -11,6 +11,7 @@ from mm_bridge.commands import (
     REGISTRY,
     CommandSpec,
     ParsedCommand,
+    dormant_help_note,
     help_text,
     parse,
 )
@@ -179,3 +180,38 @@ def test_bare_backend_has_no_arg():
     cmd = parse(".backend")
     assert cmd.name == "backend"
     assert cmd.arg is None
+
+
+# ---------------------------------------------------------------------------
+# Command capability metadata — the single source of truth the bridge's
+# pre-session (dormant) gate reads. `global_scope` marks operator-wide
+# commands that reveal/act on state spanning channels; those need an explicit
+# @mention in a dormant channel. Everything else is channel-local and safe.
+# ---------------------------------------------------------------------------
+
+
+def test_global_scope_flags_only_operator_wide_commands():
+    # These span all of the operator's sessions — privacy-sensitive.
+    for name in ("sessions", "running", "invite"):
+        assert REGISTRY[name].global_scope is True, name
+    # These are channel-local: they only read/change THIS channel.
+    for name in ("help", "status", "stop", "model", "backend", "models", "autorespond"):
+        assert REGISTRY[name].global_scope is False, name
+
+
+def test_status_and_stop_are_session_scoped_but_channel_local():
+    # `.status`/`.stop` act on the channel's own session — never global.
+    for name in ("status", "stop"):
+        assert REGISTRY[name].session_scoped is True, name
+        assert REGISTRY[name].global_scope is False, name
+
+
+def test_dormant_help_note_is_registry_derived():
+    note = dormant_help_note()
+    # The privacy carve-out lists exactly the global-scope commands.
+    for name in ("sessions", "running", "invite"):
+        assert f"`.{name}`" in note, name
+    # Channel-local commands (incl. the previously-broken `.status`) are
+    # advertised as usable before the first session.
+    assert "`.status`" in note
+    assert "@claude" in note
