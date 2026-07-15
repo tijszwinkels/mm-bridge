@@ -848,6 +848,297 @@ class DormantChannelTests(_BridgeTestCase):
         self.assertIn("c1", self.bridge.purpose_by_channel)
         self.assertTrue(any("Failed to leave" in p.message for p in self.bridge.mm.posted))
 
+    # ── Pre-session `.status` (regression: bare `.status` was swallowed) ──
+
+    async def test_bare_status_replies_before_any_session_both_paths(self):
+        for auto_join in (False, True):
+            with self.subTest(auto_join=auto_join):
+                await self._join_dormant(auto_join=auto_join)
+                self.bridge.mm.posted.clear()
+
+                await self.bridge._on_mm_posted({
+                    "channel_id": "c1", "message": ".status",
+                    "user_id": "u1", "type": "",
+                })
+
+                # A reply is posted — the bug was total silence here.
+                self.assertTrue(
+                    self.bridge.mm.posted,
+                    "bare `.status` must get a reply in a dormant channel",
+                )
+                self.assertTrue(
+                    any("Status" in p.message for p in self.bridge.mm.posted),
+                )
+                # `.status` must never create or feed a session.
+                self.assertEqual(self.bridge.harness.created, [])
+                self.assertEqual(self.bridge.harness.sent, [])
+                self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
+                self.assertIn("c1", self.bridge._dormant_channels)
+
+                self.bridge._dormant_channels.clear()
+                self.bridge.purpose_by_channel.clear()
+                self.bridge.mm.posted.clear()
+
+    async def test_dormant_status_reports_effective_future_config(self):
+        await self._join_dormant(auto_join=False)
+        self.bridge.mm.posted.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".status",
+            "user_id": "u1", "type": "",
+        })
+
+        body = "\n".join(p.message for p in self.bridge.mm.posted).lower()
+        self.assertIn("no session", body)
+        self.assertIn("claude", body)   # effective backend
+        self.assertIn("opus", body)     # effective model (per-backend default)
+        self.assertIn("/tmp/proj", body)  # effective cwd (config default)
+        self.assertIn("mention-only", body)  # effective autorespond state
+
+    async def test_dormant_status_cwd_matches_actual_create_path(self):
+        # A Purpose `cwd=` outside allowed roots is rejected at session-create
+        # time and replaced by the default. `.status` must report the SAME
+        # effective cwd — not the raw rejected value — and must not mutate the
+        # cached config's warnings (which would duplicate the warning later).
+        self.config.allowed_attachment_roots = [self.tmp.name]
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, cwd=/etc/passwd-dir",
+            "display_name": "Test channel",
+        }
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        self.bridge.mm.posted.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".status",
+            "user_id": "u1", "type": "",
+        })
+
+        body = "\n".join(p.message for p in self.bridge.mm.posted)
+        self.assertIn("/tmp/proj", body)          # the effective (default) cwd
+        self.assertNotIn("/etc/passwd-dir", body)  # never the rejected value
+        # `.status` is read-only — it must not append a rejection warning.
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].warnings, [])
+        self.assertEqual(self.bridge.harness.created, [])
+
+    async def test_dormant_status_tracks_backend_switch(self):
+        await self._join_dormant(auto_join=False)
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+        self.bridge.mm.posted.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".status",
+            "user_id": "u1", "type": "",
+        })
+
+        body = "\n".join(p.message for p in self.bridge.mm.posted).lower()
+        self.assertIn("codex", body)
+        self.assertIn("gpt-5.5", body)  # codex per-backend default model
+        self.assertEqual(self.bridge.harness.created, [])
+
+    async def test_live_regression_sequence_status_then_first_message(self):
+        """Reproduces the exact live channel sequence for both join paths:
+        bare `.status` (reply, no session) → an ordinary message creates
+        exactly one session → `.status` again reports the live session."""
+        for auto_join in (False, True):
+            with self.subTest(auto_join=auto_join):
+                await self._join_dormant(auto_join=auto_join, purpose_text="autorespond")
+                self.bridge.mm.posted.clear()
+
+                # 1) Bare `.status` — replies, creates nothing.
+                await self.bridge._on_mm_posted({
+                    "id": "s0", "channel_id": "c1", "message": ".status",
+                    "user_id": "u1", "type": "",
+                })
+                self.assertEqual(self.bridge.harness.created, [])
+                self.assertEqual(self.bridge.harness.sent, [])
+                self.assertTrue(
+                    any("Status" in p.message for p in self.bridge.mm.posted),
+                )
+
+                # 2) First ordinary message — creates exactly one session.
+                await self.bridge._on_mm_posted({
+                    "id": "m1", "channel_id": "c1", "message": "Are you there?",
+                    "user_id": "u1", "type": "",
+                })
+                self.assertEqual(len(self.bridge.harness.created), 1)
+                self.assertEqual(len(self.bridge.harness.sent), 1)
+                self.assertTrue(self.bridge.harness.sent[0][1].endswith("Are you there?"))
+                self.assertNotIn("c1", self.bridge._dormant_channels)
+                session_id = self.bridge.mapping.get_session(Anchor("c1"))
+                self.assertIsNotNone(session_id)
+
+                # 3) `.status` now reports the live session (not swallowed).
+                self.bridge.mm.posted.clear()
+                await self.bridge._on_mm_posted({
+                    "id": "s1", "channel_id": "c1", "message": ".status",
+                    "user_id": "u1", "type": "",
+                })
+                self.assertTrue(
+                    any("Status" in p.message and session_id[:12] in p.message
+                        for p in self.bridge.mm.posted),
+                )
+                # Still exactly one session — `.status` never spawned another.
+                self.assertEqual(len(self.bridge.harness.created), 1)
+
+                # Reset for the next join path.
+                self.bridge.mapping.unlink(Anchor("c1"))
+                self.bridge._dormant_channels.clear()
+                self.bridge.purpose_by_channel.clear()
+                self.bridge._awaiting_first_forward.discard("c1")
+                self.bridge.harness.created.clear()
+                self.bridge.harness.sent.clear()
+                self.bridge.harness.session_create_count = 0
+                self.bridge.mm.posted.clear()
+
+    async def test_bare_stop_replies_no_session_in_dormant_both_paths(self):
+        for auto_join in (False, True):
+            with self.subTest(auto_join=auto_join):
+                await self._join_dormant(auto_join=auto_join)
+                self.bridge.mm.posted.clear()
+
+                await self.bridge._on_mm_posted({
+                    "channel_id": "c1", "message": ".stop",
+                    "user_id": "u1", "type": "",
+                })
+
+                self.assertTrue(
+                    any("No session" in p.message for p in self.bridge.mm.posted),
+                )
+                self.assertEqual(self.bridge.harness.created, [])
+                self.assertEqual(self.bridge.harness.sent, [])
+
+                self.bridge._dormant_channels.clear()
+                self.bridge.purpose_by_channel.clear()
+                self.bridge.mm.posted.clear()
+
+    # ── Privacy contract: operator-wide commands need an @mention ──
+
+    async def test_bare_global_commands_stay_silent_in_dormant(self):
+        for cmd in (".sessions", ".running", ".invite ses_x"):
+            with self.subTest(cmd=cmd):
+                await self._join_dormant(auto_join=False, purpose_text="autorespond")
+                self.bridge.mm.posted.clear()
+
+                await self.bridge._on_mm_posted({
+                    "channel_id": "c1", "message": cmd,
+                    "user_id": "u1", "type": "",
+                })
+
+                self.assertEqual(
+                    self.bridge.mm.posted, [],
+                    f"bare {cmd} must stay silent (no operator-wide leak)",
+                )
+                self.assertEqual(self.bridge.harness.created, [])
+                self.assertEqual(self.bridge.harness.sent, [])
+
+                self.bridge._dormant_channels.clear()
+                self.bridge.purpose_by_channel.clear()
+                self.bridge.mm.posted.clear()
+
+    async def test_mentioned_global_command_runs_in_dormant(self):
+        await self._join_dormant(auto_join=False)
+        self.bridge.mm.posted.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude .running",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(
+            self.bridge.mm.posted,
+            "an @mentioned global command should run in a dormant channel",
+        )
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.harness.sent, [])
+
+    async def test_mentioned_unknown_dot_word_gets_hint_in_dormant(self):
+        # Bare `.foo` chatter is swallowed, but explicitly addressing the bot
+        # with an unknown dot-word should get the "unknown command" hint
+        # rather than silence — and never reach the LLM.
+        await self._join_dormant(auto_join=True, purpose_text="autorespond")
+        self.bridge.mm.posted.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude .frobnicate",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(
+            any("Unknown command" in p.message for p in self.bridge.mm.posted),
+        )
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.harness.sent, [])
+
+    async def test_bare_global_command_in_thread_stays_silent_in_dormant(self):
+        # A user replies in a thread (e.g. on the welcome post) with a bare
+        # global command. A dormant channel has no session, so this must not
+        # leak operator-wide state without an @mention — same rule as the
+        # channel path.
+        await self._join_dormant(auto_join=True, purpose_text="autorespond")
+        self.bridge.mm.posted.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "root_id": "welcome1", "message": ".sessions",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.mm.posted, [])
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.harness.sent, [])
+
+    async def test_status_in_thread_reports_dormant_config(self):
+        # A channel-local command replied in a thread of a dormant channel is
+        # still answered (in-thread), and creates no session.
+        await self._join_dormant(auto_join=True, purpose_text="autorespond")
+        self.bridge.mm.posted.clear()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "root_id": "welcome1", "message": ".status",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(
+            any("Status" in p.message and p.root_id == "welcome1"
+                for p in self.bridge.mm.posted),
+        )
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.harness.sent, [])
+
+    # ── Contract: no parsed dot-command ever becomes an LLM first turn ──
+
+    async def test_no_dot_command_forwards_to_llm_in_dormant(self):
+        commands_under_test = [
+            ".help", ".status", ".stop", ".autorespond", ".model", ".models",
+            ".backend", ".sessions", ".running", ".invite ses_x",
+            ".frobnicate now",  # unknown dot-word
+            "@claude .sessions",  # mentioned global command
+        ]
+        for cmd in commands_under_test:
+            with self.subTest(cmd=cmd):
+                await self._join_dormant(auto_join=True, purpose_text="autorespond")
+
+                await self.bridge._on_mm_posted({
+                    "channel_id": "c1", "message": cmd,
+                    "user_id": "u1", "type": "",
+                })
+
+                self.assertEqual(
+                    self.bridge.harness.sent, [],
+                    f"{cmd!r} must never be forwarded as an LLM turn",
+                )
+                self.assertEqual(
+                    self.bridge.harness.created, [],
+                    f"{cmd!r} must never create a session",
+                )
+
+                self.bridge._dormant_channels.clear()
+                self.bridge.purpose_by_channel.clear()
+                self.bridge.mm.posted.clear()
+
 
 class InviteFlowTests(_BridgeTestCase):
     async def _engage(self, message: str = "@claude hello") -> None:

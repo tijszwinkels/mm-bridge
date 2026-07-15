@@ -190,13 +190,17 @@ agent. An unknown `.word` gets an "unknown command — try `.help`" reply rather
 than reaching the agent.
 
 Manual invites and auto-joins use the same **dormant channel** state: no
-harness session or LLM turn exists yet. `.help`, `.backend`, `.model`,
-`.models`, and `.autorespond` work immediately and persist their settings in
-the Channel Purpose. The first conversational post creates exactly one session
-with the final configuration. In dormant channels, global listings/actions
-(`.sessions`, `.running`, `.invite`) require an explicit `@claude` mention;
-bare sensitive or unknown dot-words are ignored. Posts arriving while the
-first session is warming up are routed normally once mapping completes.
+harness session or LLM turn exists yet. Channel-local commands — `.help`,
+`.status`, `.stop`, `.backend`, `.model`, `.models`, `.autorespond` — work
+immediately without a mention (the config commands persist their settings in
+the Channel Purpose). The first conversational post creates exactly one session
+with the final configuration. Only global listings/actions (`.sessions`,
+`.running`, `.invite`) reveal operator-wide state, so in a dormant channel they
+require an explicit `@claude` mention; bare global or unknown dot-words are
+ignored. Which commands need a mention is driven entirely by each command's
+`global_scope` flag, so **every parsed dot-command is intercepted by the
+bridge** — none can become or silence the first LLM turn. Posts arriving while
+the first session is warming up are routed normally once mapping completes.
 
 | Command | What it does |
 |---|---|
@@ -211,8 +215,9 @@ first session is warming up are routed normally once mapping completes.
 | `.sessions [N]` | The N most recent sessions across all agents — including terminal (TUI) sessions not yet on Mattermost. Each shows its channel or an `.invite` hint. |
 | `.invite <session-id>` | Get added to a session's Mattermost channel, creating it first for unmapped/terminal sessions. Posting into a resumed terminal session **forks** it (see the channel's bootstrap note). |
 
-`.stop` and `.status` reply "No session in this channel" before first
-engagement. `.model` and `.backend` configure the future session instead.
+Before first engagement, `.status` reports the config the first message will
+start with (backend, model, cwd, autorespond flag); `.stop` replies "No session
+in this channel". `.model` and `.backend` configure that future session instead.
 Inside a **thread fork**, bare `.model` / `.backend` (read-only) work, but a
 *switch* (`.model <name>` / `.backend <name>`) is refused — a restart would
 replace the channel's session, not the thread's. Switch from the channel.
