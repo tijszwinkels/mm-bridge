@@ -11,7 +11,7 @@ during the change, now as a committed regression module:
   B. a config-looking first message is forwarded verbatim, never intercepted
   C. `.model` restart is quiet and posts no duplicate purpose notice
   D. `.backend` restart drops the carried model and is quiet
-  E. an invited session stays quiet while backend/model are configured
+  E. an invited channel stays sessionless while backend/model are configured
 """
 from __future__ import annotations
 
@@ -53,21 +53,15 @@ class E2EConfigPathsTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(welcomes), 1)
         join = welcomes[0].message
-        start = next(
-            (p.message for p in self.bridge.mm.posted if "Session started" in p.message), "",
-        )
         self.assertIn(".model", join)
         self.assertIn(".backend", join)
         self.assertIn("Channel Purpose", join)
-        self.assertNotIn("first message", join)
-        self.assertIn(".model", start)
-        self.assertIn(".backend", start)
-        self.assertNotIn("First message", start)
+        self.assertNotIn("First message:", join)
+        self.assertEqual(self.bridge.harness.created, [])
 
     async def test_B_first_message_forwarded_verbatim(self):
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": "autorespond"}
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
-        sid = self.bridge.mapping.get_session(Anchor("c1"))
         self.bridge.harness.sent.clear()
         self.bridge.harness.created.clear()
         self.bridge.mm.posted.clear()
@@ -77,12 +71,13 @@ class E2EConfigPathsTests(unittest.IsolatedAsyncioTestCase):
         })
 
         fwd = self._sent()
+        sid = self.bridge.mapping.get_session(Anchor("c1"))
         self.assertEqual(len(fwd), 1)
         self.assertTrue(fwd[0].endswith("claude, sonnet"))
         self.assertTrue(any("Running inside Mattermost" in m for m in fwd))
-        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(len(self.bridge.harness.created), 1)
         self.assertFalse(any("Config applied" in p.message for p in self.bridge.mm.posted))
-        self.assertNotIn("c1", self.bridge._awaiting_first_forward)
+        self.assertNotIn("c1", self.bridge._dormant_channels)
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), sid)
 
     async def test_C_dot_model_quiet_no_dup_notice(self):
@@ -157,16 +152,18 @@ class E2EConfigPathsTests(unittest.IsolatedAsyncioTestCase):
         })
         await self.bridge.mm.deliver_ws_events(self.bridge)
 
-        configured_session = self.bridge.mapping.get_session(Anchor("c1"))
+        self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
         self.assertEqual(self._sent(), [])
-        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
-        self.assertEqual(self.bridge.harness.created[-1]["model"], "gpt-5.4")
+        self.assertEqual(self.bridge.harness.created, [])
 
         await self.bridge._on_mm_posted({
             "channel_id": "c1", "message": "inspect the build",
             "user_id": "u1", "type": "",
         })
 
+        configured_session = self.bridge.mapping.get_session(Anchor("c1"))
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "gpt-5.4")
         self.assertEqual(len(self.bridge.harness.sent), 1)
         sent_session, sent_body = self.bridge.harness.sent[0]
         self.assertEqual(sent_session, configured_session)

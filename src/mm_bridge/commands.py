@@ -34,9 +34,9 @@ class CommandSpec:
     name: str
     usage: str
     summary: str
-    # Session-scoped commands require a session mapped to the channel/thread;
-    # the dispatcher replies "no session" when one is missing. Global commands
-    # (help, models, sessions, running, invite, autorespond) run regardless.
+    # Session-scoped commands normally require a mapped session. The bridge
+    # explicitly handles model/backend as pre-session configuration while a
+    # channel is dormant; stop/status still reply "no session" there.
     session_scoped: bool = False
 
 
@@ -72,12 +72,12 @@ _SPECS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         "model", ".model [<name>]",
-        "Show the current model, or switch it (`.stop` any active run first).",
+        "Show/select the model (configures the next session if dormant).",
         session_scoped=True,
     ),
     CommandSpec(
         "backend", ".backend [<name>]",
-        "Show the current backend, or switch it (resets the model; `.stop` first).",
+        "Show/select the backend (resets the model; configures if dormant).",
         session_scoped=True,
     ),
     CommandSpec(
@@ -147,7 +147,7 @@ def parse(message: str, *, mentions: Iterable[str] = ()) -> ParsedCommand | None
 
 def help_text() -> str:
     """Render the registry as a Mattermost-friendly command list."""
-    lines = ["**Commands** — type these in-channel (no @mention needed):"]
+    lines = ["**Commands** — type these in-channel:"]
     for spec in REGISTRY.values():
         lines.append(f"• `{spec.usage}` — {spec.summary}")
     return "\n".join(lines)
