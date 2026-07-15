@@ -28,6 +28,9 @@ class FakeDriverClient:
         self.calls.append((method, endpoint))
         return FakeHttpxResponse(content=self.responses.get(endpoint, b""))
 
+    def delete(self, endpoint: str) -> None:
+        self.calls.append(("delete", endpoint))
+
 
 @dataclass
 class FakePostsApi:
@@ -119,6 +122,23 @@ def test_download_file_returns_raw_bytes_for_binary_attachment():
     client = _make_client_with_driver(driver)
 
     assert client.download_file("pdf99") == pdf_bytes
+
+
+def test_remove_self_uses_stable_rest_endpoint():
+    """The driver removed ``Channels.remove_channel_member`` in v2.
+
+    Leaving must use the stable REST endpoint exposed by the low-level client
+    so both active and dormant ``@claude leave`` paths continue to work.
+    """
+    driver = FakeDriver()
+    client = _make_client_with_driver(driver)
+    client._bot_user_id = "bot-1"
+
+    client.remove_self_from_channel("channel-1")
+
+    assert driver.client.calls == [
+        ("delete", "/api/v4/channels/channel-1/members/bot-1"),
+    ]
 
 
 def test_get_posts_since_breaks_when_pagination_repeats_page():

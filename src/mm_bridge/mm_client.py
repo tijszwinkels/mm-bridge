@@ -249,7 +249,9 @@ class MattermostClient:
 
     def remove_self_from_channel(self, channel_id: str) -> None:
         """Remove the bot from a channel."""
-        self._driver.channels.remove_channel_member(channel_id, self._bot_user_id)
+        self._driver.client.delete(
+            f"/api/v4/channels/{channel_id}/members/{self._bot_user_id}"
+        )
 
     def get_bot_channel_ids(self) -> set[str]:
         """Return the set of channel IDs the bot currently belongs to in its team."""
