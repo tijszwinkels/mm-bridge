@@ -3193,13 +3193,64 @@ class Bridge:
             thread_root,
         )
 
+    async def _resolve_active_run_id(self, session_id: str) -> str | None:
+        """Authoritative fallback for `.stop`: ask the harness which run is
+        live for ``session_id``.
+
+        Both in-memory trackers can miss a genuinely-running run — most
+        importantly after a bridge restart mid-run, where the in-memory state
+        is lost but the harness process keeps the run alive. The harness is
+        the source of truth, so consult it before concluding there is nothing
+        to stop.
+
+        Session-scoped by construction: ``list_session_runs`` only returns runs
+        belonging to ``session_id``, so this can never reach into another
+        session. Guarded to a *single* ``running`` **harness-origin** run — an
+        external (TUI-resumed) run isn't ours to kill (interrupt would 409),
+        and more than one running run is unexpected, so we don't guess.
+        """
+        try:
+            runs = await self.harness.list_session_runs(session_id)
+        except Exception:
+            logger.debug(
+                "stop: list_session_runs failed for %s", session_id[:8],
+                exc_info=True,
+            )
+            return None
+        running = [
+            r for r in runs
+            if (r.get("status") or "").lower() == "running"
+            and (r.get("origin") or "harness") == "harness"
+        ]
+        if len(running) != 1:
+            if len(running) > 1:
+                logger.warning(
+                    "stop: %d running runs for session %s — not guessing which "
+                    "to interrupt", len(running), session_id[:8],
+                )
+            return None
+        return running[0].get("id") or running[0].get("run_id")
+
     async def _run_stop_command(
         self,
         channel_id: str,
         session_id: str,
         thread_root: str | None,
     ) -> None:
-        run_id = self.current_run_id_by_session.get(session_id)
+        # Resolve the in-flight run from three sources, most-convenient first.
+        # Only ``current_run_id_by_session`` holds runs THIS daemon submitted
+        # via ``create_run``; a spawned session's run (created by the
+        # ``mm-bridge spawn`` CLI process) or any autorespond kickoff is seen
+        # only through the ``run.started`` SSE lifecycle → ``active_run_by_session``.
+        # Reading the first alone made `.stop` answer "Nothing to stop" while a
+        # live codex run was working. The harness query is the authoritative
+        # last resort (survives a restart that wiped both dicts) and is only
+        # hit — via ``or`` short-circuit — when both trackers miss.
+        run_id = (
+            self.current_run_id_by_session.get(session_id)
+            or self.active_run_by_session.get(session_id)
+            or await self._resolve_active_run_id(session_id)
+        )
         if not run_id:
             try:
                 self.mm.post(

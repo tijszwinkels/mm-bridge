@@ -2440,6 +2440,111 @@ class StopCommandTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.interrupted, [("fork-s", "run-fork")])
 
+    # ----- `.stop` finds runs the bridge itself didn't submit -----
+
+    async def test_stop_interrupts_run_tracked_only_via_active_run(self):
+        # A spawned session's initial run is created by the `mm-bridge spawn`
+        # CLI process, so the daemon never populates
+        # ``current_run_id_by_session``; it only learns of the run from the
+        # ``run.started`` SSE event → ``active_run_by_session``. `.stop` must
+        # still find and interrupt it. Regression for the codex "Nothing to
+        # stop" report (spawned + autorespond → long un-submitted run).
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.active_run_by_session["s1"] = "run-active"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-active")])
+
+    async def test_stop_falls_back_to_harness_when_trackers_empty(self):
+        # Bridge restarted mid-run: both in-memory trackers are empty, but
+        # the harness still owns a live run. `.stop` consults the harness
+        # (authoritative) and interrupts the single running harness-origin run.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.session_runs_meta["s1"] = [
+            {"id": "run-old", "status": "completed", "origin": "harness"},
+            {"id": "run-live", "status": "running", "origin": "harness"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-live")])
+
+    async def test_stop_harness_fallback_ignores_external_run(self):
+        # An external (TUI-resumed) run isn't ours to interrupt — the harness
+        # fallback is guarded to harness-origin runs only, so it reports
+        # "Nothing to stop" rather than attempting a kill that would 409.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.session_runs_meta["s1"] = [
+            {"id": "run-ext", "status": "running", "origin": "external"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+        self.assertIn(
+            ":octagonal_sign: Nothing to stop.",
+            [p.message for p in self.bridge.mm.posted],
+        )
+
+    async def test_stop_harness_fallback_does_not_guess_between_running_runs(self):
+        # More than one running run for the session is unexpected; don't
+        # guess which to kill — report nothing rather than pick wrong.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.session_runs_meta["s1"] = [
+            {"id": "run-a", "status": "running", "origin": "harness"},
+            {"id": "run-b", "status": "running", "origin": "harness"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+
+    async def test_stop_reports_nothing_when_no_run_anywhere(self):
+        # No tracked run and the harness reports nothing running → the honest
+        # "Nothing to stop." (prior behavior preserved).
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+        self.assertIn(
+            ":octagonal_sign: Nothing to stop.",
+            [p.message for p in self.bridge.mm.posted],
+        )
+
+    async def test_stop_harness_fallback_survives_dead_harness(self):
+        # If the harness probe itself errors, `.stop` degrades to "Nothing to
+        # stop" rather than raising.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.run_probe_error = RuntimeError("harness down")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [])
+        self.assertIn(
+            ":octagonal_sign: Nothing to stop.",
+            [p.message for p in self.bridge.mm.posted],
+        )
+
 
 class CommandTests(_BridgeTestCase):
     """Dot-commands (`.stop`, `.help`, `.autorespond`, `.status`, ...) are
