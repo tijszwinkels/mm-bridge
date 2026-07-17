@@ -3217,6 +3217,14 @@ class Bridge:
                 exc_info=True,
             )
             return None
+        # Deliberately `running`-only, NOT the codebase-wide liveness set
+        # HARNESS_LIVE_RUN_STATUSES ({"queued","running"}): `.stop` targets the
+        # run that is actually executing. A queued run has no process to
+        # interrupt, and counting it would make the "exactly 1" guard below
+        # misfire during a normal running+queued overlap (→ refuse to stop the
+        # real run). The origin filter drops external/TUI-resumed runs, which
+        # aren't ours to kill (interrupt would 409); harness Run rows carry
+        # ``origin`` (agent-harness models.Run), so this is a live guard.
         running = [
             r for r in runs
             if (r.get("status") or "").lower() == "running"

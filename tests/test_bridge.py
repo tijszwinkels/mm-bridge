@@ -2476,6 +2476,25 @@ class StopCommandTests(_BridgeTestCase):
 
         self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-live")])
 
+    async def test_stop_falls_back_to_harness_when_active_run_id_is_none(self):
+        # `run.started` may omit the run_id, so `active_run_by_session` can hold
+        # a None value for a live session (key present, value None). `.stop`
+        # must treat that as "known live but id unknown" and recover the id from
+        # the harness — unlike `.status`, which reports "running" off the key
+        # alone. This is the asymmetry the 3-source resolution hinges on.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.active_run_by_session["s1"] = None
+        self.bridge.harness.session_runs_meta["s1"] = [
+            {"id": "run-live", "status": "running", "origin": "harness"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "@claude stop",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.vd.interrupted, [("s1", "run-live")])
+
     async def test_stop_harness_fallback_ignores_external_run(self):
         # An external (TUI-resumed) run isn't ours to interrupt — the harness
         # fallback is guarded to harness-origin runs only, so it reports
