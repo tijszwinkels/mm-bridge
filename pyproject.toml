@@ -27,3 +27,9 @@ dev = [
 
 [project.scripts]
 mm-bridge = "mm_bridge.main:main"
+
+[tool.pytest.ini_options]
+# Keep a bare `pytest` from the repo root green: don't descend into sibling
+# worktrees (each carries its own copy of this suite → duplicate collection)
+# or the virtualenv.
+norecursedirs = ["worktree", "worktrees", ".venv"]
