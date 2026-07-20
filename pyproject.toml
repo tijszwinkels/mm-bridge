@@ -3,6 +3,8 @@ name = "mm-bridge"
 version = "0.1.0"
 description = "Mattermost ↔ agent-harness bridge — one channel per coding-agent session"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "mattermostautodriver>=2.0.0",
     "httpx>=0.27",

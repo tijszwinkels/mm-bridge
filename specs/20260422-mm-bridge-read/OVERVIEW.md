@@ -47,7 +47,7 @@ Included by default. `--no-bot` strips them (useful when piping into a summary p
 Per post, one block; posts separated by a blank line:
 
 ```
-[2026-04-22 14:32] tijs
+[2026-04-22 14:32] alice
 Got the bridge running locally; want to test the channels command next.
 
 [2026-04-22 14:35] claude

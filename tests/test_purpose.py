@@ -220,8 +220,8 @@ def test_cwd_absolute_path():
 
 
 def test_cwd_preserves_case():
-    cfg = parse("cwd=/Users/Tijs/Foo", "claude", "opus", _models_for)
-    assert cfg.cwd == "/Users/Tijs/Foo"
+    cfg = parse("cwd=/Users/alice/Foo", "claude", "opus", _models_for)
+    assert cfg.cwd == "/Users/alice/Foo"
     assert cfg.warnings == []
 
 

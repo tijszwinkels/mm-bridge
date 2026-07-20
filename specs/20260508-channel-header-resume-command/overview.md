@@ -65,7 +65,7 @@ simpler given the current code:
 
 - **Mirror config**: a new bridge config key `dangerous_permissions`
   (TOML) / `MM_BRIDGE_DANGEROUS_PERMISSIONS` (env), default `false`.
-  Tijs sets it to match VD. Single source of truth lives in operator
+  The operator sets it to match VD. Single source of truth lives in operator
   config — no API contract.
 - **Query VD**: if VibeDeck exposes its `_skip_permissions` state via
   any HTTP endpoint or SSE event, query/subscribe and use that.
