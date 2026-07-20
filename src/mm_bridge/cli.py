@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -1144,6 +1145,141 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─────────────────────────── doctor ───────────────────────────────────────
+#
+# `mm-bridge doctor` is the runbook's verification primitive: one ✓/✗ line per
+# check, nonzero exit if any fail. It diagnoses only — it never mutates config,
+# creates directories, or otherwise "fixes" anything, so it's safe to run at
+# every install checkpoint.
+
+
+@dataclass
+class _CheckResult:
+    """One diagnostic line: a labelled ✓/✗ with a human-readable detail."""
+
+    label: str
+    ok: bool
+    detail: str
+
+
+def _doctor_check_config(cfg: Config) -> _CheckResult:
+    """Required config keys are present (token, MM url/team, harness url)."""
+    required = {
+        "MM_BOT_TOKEN": cfg.mm_bot_token,
+        "mm_url": cfg.mm_url,
+        "mm_team": cfg.mm_team,
+        "agent_harness_url": cfg.agent_harness_url,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        return _CheckResult(
+            "config", False,
+            f"missing required keys: {', '.join(missing)} "
+            f"(config file: {cfg.config_file})",
+        )
+    return _CheckResult(
+        "config", True, f"loaded {cfg.config_file}; required keys present",
+    )
+
+
+def _doctor_check_mattermost(cfg: Config) -> _CheckResult:
+    """Mattermost reachable and MM_BOT_TOKEN valid; resolves the bot username."""
+    if not cfg.mm_bot_token:
+        return _CheckResult(
+            "mattermost", False, "MM_BOT_TOKEN not set — cannot authenticate",
+        )
+    mm = _make_mm_client(cfg)
+    try:
+        mm.login()
+    except Exception as exc:  # noqa: BLE001 — surface any auth/connection error
+        return _CheckResult(
+            "mattermost", False,
+            f"login failed at {cfg.mm_scheme}://{cfg.mm_url}:{cfg.mm_port} "
+            f"({exc})",
+        )
+    return _CheckResult(
+        "mattermost", True,
+        f"authenticated as @{mm.bot_username} (team {cfg.mm_team})",
+    )
+
+
+async def _harness_health(url: str) -> None:
+    """Hit the harness ``/v1/health`` endpoint, closing the client afterwards."""
+    client = AgentHarnessClient(url)
+    try:
+        await client.health()
+    finally:
+        await client.close()
+
+
+def _doctor_check_harness(cfg: Config) -> _CheckResult:
+    """agent-harness base URL reachable (``/v1/health``)."""
+    try:
+        asyncio.run(_harness_health(cfg.agent_harness_url))
+    except Exception as exc:  # noqa: BLE001 — any transport error means "down"
+        return _CheckResult(
+            "agent-harness", False,
+            f"unreachable at {cfg.agent_harness_url} ({exc})",
+        )
+    return _CheckResult(
+        "agent-harness", True, f"reachable at {cfg.agent_harness_url}",
+    )
+
+
+def _doctor_check_sidecar(cfg: Config) -> _CheckResult:
+    """Sidecar directory is writable (or its parent is, so it can be created).
+
+    Diagnose only: never creates the directory. Walks up to the nearest
+    existing ancestor and tests write+traverse permission there.
+    """
+    path = Path(os.path.expanduser(cfg.sidecar_dir))
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if not os.access(probe, os.W_OK | os.X_OK):
+        return _CheckResult(
+            "sidecar-dir", False,
+            f"{path} not writable (no write permission on {probe})",
+        )
+    state = "exists" if path.exists() else "will be created on first session"
+    return _CheckResult("sidecar-dir", True, f"{path} writable ({state})")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Diagnose the local install: config, Mattermost, harness, sidecar dir.
+
+    Prints one ✓/✗ line per check and returns nonzero if any check fails.
+    Diagnose only — never mutates config or creates directories.
+    """
+    print("mm-bridge doctor — checking the local install\n")
+    try:
+        cfg = Config.load()
+    except Exception as exc:  # noqa: BLE001 — a broken config file is a finding
+        print(f"✗ config: failed to load ({exc})")
+        sys.stdout.flush()  # keep stdout/stderr ordered when output is captured
+        print("\n1 check failed.", file=sys.stderr)
+        return 1
+
+    checks = [
+        _doctor_check_config(cfg),
+        _doctor_check_mattermost(cfg),
+        _doctor_check_harness(cfg),
+        _doctor_check_sidecar(cfg),
+    ]
+    for check in checks:
+        print(f"{'✓' if check.ok else '✗'} {check.label}: {check.detail}")
+
+    failed = [c for c in checks if not c.ok]
+    if failed:
+        sys.stdout.flush()  # keep stdout/stderr ordered when output is captured
+        print(
+            f"\n{len(failed)} of {len(checks)} checks failed.", file=sys.stderr,
+        )
+        return 1
+    print(f"\nAll {len(checks)} checks passed.")
+    return 0
+
+
 # ─────────────────────── argparse dispatch ────────────────────────────────
 
 
@@ -1156,6 +1292,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_serve = sub.add_parser("serve", help="Run the bridge daemon.")
     p_serve.set_defaults(func=cmd_serve)
+
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Diagnose the local install (config, Mattermost, harness, "
+             "sidecar dir).",
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_invite = sub.add_parser(
         "invite",
