@@ -38,6 +38,38 @@ Install **Mattermost in a container** and the **two Python services on the host*
 
 ---
 
+## Decision tree — branch here first
+
+Three choices shape the path through this runbook. Settle them with the operator
+before Step 0 (they resurface as Q4 / the systemd question / the OS below):
+
+1. **Mattermost — reuse or fresh?**
+   - *Reuse an existing Mattermost* you administer (admin access + rights to
+     create a bot token) → **skip Step 3**, go to **Step 3b** (create the bot).
+   - *No Mattermost yet* → **Step 3** stands one up in Docker, then 3b.
+   - *Hosted/Cloud Mattermost you can't create bot tokens on* → **stop.** It
+     won't work (see Prerequisites) — you need a server you control.
+
+2. **Process supervision — systemd or foreground?**
+   - *Linux with systemd* (the default, managed pattern) → **Step 6** installs
+     the user-level `agent-chatops.target` from `deploy/systemd/`.
+   - *Just evaluating, or no systemd* → run the two `run.sh` scripts in the
+     foreground / under `screen` → **Step 6 → Foreground / macOS**.
+
+3. **OS — Linux or macOS?**
+   - *Linux* → everything applies as written; the `/proc` codex tie-breaker
+     (Step 7c) is available.
+   - *macOS* → no systemd and no `/proc`: use **Step 6 → Foreground / macOS**
+     (screen or a launchd agent) and expect the less-precise cwd-matched codex
+     resolver. Everything else is identical.
+
+> **Unsure? The reference path is: fresh Docker Mattermost → user-level systemd
+> on Linux.** That's what the numbered steps assume when a branch isn't called
+> out. Every step ends in an executable **✅ Checkpoint** — do not proceed past a
+> failing one.
+
+---
+
 ## Step 0 — Ask the operator these questions FIRST
 
 Do not run anything until you have answers. Record them in the table below; later steps
@@ -71,7 +103,7 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 
 | # | Question | Default |
 |---|---|---|
-| 9  | **Bot username** — the `@name` the agent posts as. | `bmo` |
+| 9  | **Bot username** — the `@name` the agent posts as. | `b3mo` |
 | 10 | **Auto-join public channels?** If on, the bot silently joins every public channel it can see (sessions still created only on first engagement). If off, someone must `/invite @<bot>` per channel. | **off** |
 | 11 | **Autorespond default** — reply to every message, or only when `@mentioned`? | **mention-only** (off) |
 | 12 | **Default backend** for new channels (`claude` / `codex`). | `claude` |
@@ -89,7 +121,20 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 
 ## Step 1 — Prerequisites
 
-Install and verify the toolchain **as the host user**:
+**What this stack assumes** (the same list as the README *Requirements* — mm-bridge is
+glue, it bundles none of these):
+
+- **A self-hosted Mattermost you administer** — or the willingness to run one (Step 3).
+  A hosted/Cloud MM you can't mint bot tokens on won't work.
+- **agent-harness on this host** — cloned + runnable (Step 4). The bridge is useless
+  without one reachable.
+- **At least one agent CLI (`claude` and/or `codex`) installed and logged in as the host
+  user**, on this same machine (Step 2).
+- **Linux preferred** — the `/proc` codex tie-breaker is Linux-only (macOS falls back to
+  the less-precise cwd scan; see the Decision tree).
+- **Python 3.11+.**
+
+Now install and verify the toolchain **as the host user**:
 
 ```bash
 # Docker + compose plugin (for Mattermost)
@@ -340,63 +385,100 @@ Lock it down: `chmod 600 .env`.
 **✅ Checkpoint:** run `./run.sh` in the foreground. It logs a successful Mattermost
 WebSocket connection and an agent-harness SSE subscription, with no auth errors. Ctrl-C.
 
+Then run the built-in diagnostics — config + Mattermost auth + sidecar dir should be ✓
+(the agent-harness line is ✓ only if Step 4's harness is still up; it goes green for good
+once Step 6 supervises it):
+
+```bash
+set -a; source .env; set +a
+uv run mm-bridge doctor    # → ✓ config, ✓ mattermost (prints the resolved @<bot>), ✓ sidecar-dir
+```
+
 ---
 
-## Step 6 — Run both as ordered systemd **user** services
+## Step 6 — Supervise both as a systemd **user** target (Linux)
 
-Create `~/.config/systemd/user/agent-harness.service`:
+> **No systemd (macOS, or just evaluating)?** Skip to *Foreground / macOS* below.
 
-```ini
-[Unit]
-Description=agent-harness
-After=network-online.target
-Wants=network-online.target
+The repo ships ready-made unit files in **`deploy/systemd/`** — install those rather than
+hand-writing units (they encode the dependency shape deliberately):
 
-[Service]
-Type=forking
-ExecStart=/usr/bin/screen -dmS harness bash -lc '%h/projects/agent-harness-echo/run.sh'
-ExecStop=/usr/bin/screen -S harness -X quit
-Restart=on-failure
-RestartSec=5
+- `agent-chatops.target` — the whole stack; `Wants=` both services. One handle to
+  start/stop/restart the pair.
+- `agent-harness.service` — `PartOf=` the target.
+- `mm-bridge.service` — `PartOf=` the target, `After=` the harness for **soft** start
+  ordering only. Deliberately **not** `BindsTo=`/`Requires=`: the bridge reconnect-resumes
+  the harness SSE on its own, and hard coupling would mask a regression in that reconnect
+  path behind systemd restarts.
 
-[Install]
-WantedBy=default.target
+Copy them in and fill in the two `ExecStart=` paths (they default to `%h/projects/...` —
+adjust if your `<install_dir>` from Q2 differs; `run.sh` handles PATH + `.env`, so no
+secrets live in the units):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/projects/mm-bridge/deploy/systemd/agent-chatops.target \
+   ~/projects/mm-bridge/deploy/systemd/agent-harness.service \
+   ~/projects/mm-bridge/deploy/systemd/mm-bridge.service \
+   ~/.config/systemd/user/
+
+# Verify / fix the ExecStart run.sh paths for THIS host's <install_dir>:
+${EDITOR:-nano} ~/.config/systemd/user/agent-harness.service
+${EDITOR:-nano} ~/.config/systemd/user/mm-bridge.service
 ```
 
-Create `~/.config/systemd/user/mm-bridge.service` (note the `After=` ordering on the
-harness):
-
-```ini
-[Unit]
-Description=mm-bridge
-After=network-online.target agent-harness.service
-Wants=network-online.target
-
-[Service]
-Type=forking
-ExecStart=/usr/bin/screen -dmS mmbridge bash -lc '%h/projects/mm-bridge/run.sh'
-ExecStop=/usr/bin/screen -S mmbridge -X quit
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
-
-Enable, and make them start at boot **without an interactive login**:
+Enable the target and make it survive logout/reboot **without an interactive login**:
 
 ```bash
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
-systemctl --user enable --now agent-harness.service mm-bridge.service
-systemctl --user status agent-harness.service mm-bridge.service
+systemctl --user enable --now agent-chatops.target
+systemctl --user status agent-chatops.target agent-harness.service mm-bridge.service
 ```
 
-**✅ Checkpoint:** both units are `active`. `screen -ls` shows `harness` and `mmbridge`
-sessions (attach with `screen -r <name>` to read logs; detach with `Ctrl-a d`).
+The target's `Wants=` starts both services — you don't enable them individually. Logs go to
+journald:
 
-> The `screen` wrapper is optional but matches production and makes logs easy to read. A
-> plain `Type=simple` unit calling `run.sh` directly also works.
+```bash
+journalctl --user -u agent-harness -f
+journalctl --user -u mm-bridge -f
+```
+
+**✅ Checkpoint:** all three units are `active (running)`, and the bridge's own diagnostics
+are all-green:
+
+```bash
+set -a; source ~/projects/mm-bridge/.env; set +a
+cd ~/projects/mm-bridge && uv run mm-bridge doctor    # → every line ✓, exit 0
+```
+
+`mm-bridge doctor` checks config keys, Mattermost auth (printing the resolved `@<bot>`
+username), agent-harness reachability, and sidecar-dir writability in one shot — the
+fastest confirmation the stack is wired up. A ✗ on any line stops you here.
+
+### Foreground / macOS (no systemd)
+
+systemd user units are Linux-only. Elsewhere, run the two `run.sh` scripts directly — each
+`exec`s its daemon in the foreground:
+
+```bash
+# Terminal 1  (or detached: screen -dmS harness ~/projects/agent-harness-echo/run.sh)
+~/projects/agent-harness-echo/run.sh
+# Terminal 2  (or detached: screen -dmS mmbridge ~/projects/mm-bridge/run.sh)
+~/projects/mm-bridge/run.sh
+```
+
+For unattended restarts on **macOS**, wrap each `run.sh` in a launchd agent
+(`~/Library/LaunchAgents/*.plist`, `KeepAlive=true`) — the launchd analogue of the systemd
+units above. `screen`/`tmux` is fine for evaluation.
+
+**✅ Checkpoint (same as above):** with both `run.sh` processes up, `mm-bridge doctor` is
+all-green:
+
+```bash
+set -a; source ~/projects/mm-bridge/.env; set +a
+cd ~/projects/mm-bridge && uv run mm-bridge doctor    # → every line ✓, exit 0
+```
 
 ---
 
@@ -469,7 +551,10 @@ contains the `@…/CLAUDE-include.md` import; and in a Claude Code session bound
 
 ## Step 8 — End-to-end smoke test
 
-1. `curl -s localhost:8877/v1/health` → ok.
+1. `set -a; source ~/projects/mm-bridge/.env; set +a && mm-bridge doctor` → every line ✓,
+   exit 0 (config, Mattermost auth + resolved `@<bot>`, agent-harness reachable,
+   sidecar-dir writable). Sourcing `.env` gives your shell the same `MM_BOT_TOKEN` the
+   daemon uses; this subsumes the old `curl localhost:8877/v1/health` check.
 2. In Mattermost, create a channel and `/invite @<bot>` (skip the invite if auto-join is on).
 3. Before posting a conversational message, use `.backend <name>` and/or `.model <name>`; confirm no agent session starts yet.
 4. Post `@<bot> hello`. Within a few seconds you get a reply from a session using that configuration.
@@ -485,8 +570,9 @@ harness as reachable.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| Bot never replies | mm-bridge not connected — `screen -r mmbridge` for logs; check `MM_BOT_TOKEN`, `MM_URL`, team slug. |
-| Reply says harness unreachable | agent-harness down or wrong `AH_URL`; `curl localhost:8877/v1/health`. |
+| **Anything wrong / unsure where to start** | Run `mm-bridge doctor` — the first ✗ line names the broken layer (config, Mattermost auth, harness, or sidecar dir). |
+| Bot never replies | mm-bridge not connected — `journalctl --user -u mm-bridge -f` (systemd) or the `run.sh` terminal (foreground) for logs; check `MM_BOT_TOKEN`, `MM_URL`, team slug. `mm-bridge doctor` isolates it. |
+| Reply says harness unreachable | agent-harness down or wrong `AH_URL`; `mm-bridge doctor` (agent-harness line) or `curl localhost:8877/v1/health`. |
 | Turn recorded but no output | `--execute-runs` missing from harness `run.sh`. |
 | `FileNotFoundError: claude/codex` | Backend CLI not on the harness PATH — fix the `export PATH=` line in `run.sh` (systemd's non-interactive shell skips `~/.bashrc`). |
 | Services don't start after reboot | `loginctl enable-linger "$USER"` not set. |
