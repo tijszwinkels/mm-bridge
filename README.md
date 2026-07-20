@@ -17,6 +17,15 @@ The CLI discovers the current session id from one of four sources, in order:
 3. **Live-codex parent (`/proc` tie-breaker)** — Linux-only. When env vars miss, walk the parent-pid chain (depth ≤ 8) for a process whose `/proc/<pid>/comm` is `codex` and read the rollout filename out of its open fds. The UUID embedded in that filename is adopted directly. This is what disambiguates the "multiple codex sessions in the same cwd" case: only the codex actually in our ancestor chain is the one we belong to. Returns nothing on macOS (no `/proc`), background tasks where the codex parent already exited, or when the codex ancestor has no rollout fd held open — those cases fall through to step 4.
 4. **Cwd-matched codex rollout** — final fallback that scans `~/.codex/sessions/.../rollout-*.jsonl` in most-recently-active order and walks candidates whose `payload.cwd` matches the (canonicalised) caller cwd, adopting the first one whose sidecar reads back as a valid channel anchor. Helps tool shells whose codex launcher couldn't pre-pin the env var (typically the very first turn of a fresh session) and tool shells that outlive their codex parent. Note: there's a brief startup race between codex starting and the daemon writing the sidecar — if mm-bridge is invoked in that window the fallback fails cleanly with a "not in MM channel" error, which is the same behaviour the Claude Code path has had.
 
+## Requirements
+
+mm-bridge is glue between three things you must already run yourself — it does **not** bundle or install any of them:
+
+- **A self-hosted Mattermost** you control, plus a **bot account** on it and a **personal access token** for that bot (the `MM_BOT_TOKEN` the daemon authenticates with). A hosted/Cloud Mattermost you can't create bot tokens on won't work.
+- **A running [agent-harness](https://github.com/tijszwinkels/agent-harness-echo) instance** — the daemon subscribes to its SSE stream and drives sessions/runs through it. mm-bridge is useless without one reachable.
+- **The agent CLIs themselves — Claude Code and/or Codex — installed on the *same host* as the harness.** Sessions run as local processes and self-identify via the sidecar file, so the bridge, the harness, and the agent CLIs must be co-located.
+- **Linux is preferred.** The `/proc` codex-session tie-breaker (source #3 above) is Linux-only; on macOS the CLI falls back to the cwd-matched rollout scan, which is less precise when multiple codex sessions share a working directory.
+
 ## Install
 
 Requires Python 3.11+. Using [`uv`](https://github.com/astral-sh/uv):
