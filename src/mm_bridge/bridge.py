@@ -1404,9 +1404,10 @@ class Bridge:
         """Adopt a channel currently mapped to an ``origin: external``
         harness session.
 
-        Externally-launched sessions (e.g. ones created by VibeDeck before
-        the harness cutover) appear in ``GET /v1/sessions`` but the harness
-        has no stdin / IPC channel into them — ``POST /v1/sessions/<id>/runs``
+        Externally-launched sessions (e.g. a terminal ``claude``/``codex`` the
+        harness only *observes*, or one created directly against the harness
+        API) appear in ``GET /v1/sessions`` but the harness has no stdin / IPC
+        channel into them — ``POST /v1/sessions/<id>/runs``
         returns 200 but the message goes nowhere. The user's current MM
         post would silently vanish.
 
