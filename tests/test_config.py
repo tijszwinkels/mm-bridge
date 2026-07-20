@@ -280,12 +280,12 @@ class PublicUrlTests(unittest.TestCase):
         cfg = Config()
         with patch.dict(
             "os.environ",
-            {"MM_PUBLIC_URL": "http://pillar.tail72f2bc.ts.net:8065"},
+            {"MM_PUBLIC_URL": "http://mm.example.com:8065"},
             clear=True,
         ):
             cfg._apply_env()
         self.assertEqual(
-            cfg.mm_public_url, "http://pillar.tail72f2bc.ts.net:8065",
+            cfg.mm_public_url, "http://mm.example.com:8065",
         )
 
     def test_toml_mattermost_public_url_sets_field(self) -> None:

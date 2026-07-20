@@ -101,7 +101,7 @@ def test_download_file_returns_raw_bytes_for_json_attachment():
     """
     gcp_key = (
         b'{\n  "type": "service_account",\n'
-        b'  "project_id": "plenny-poc",\n'
+        b'  "project_id": "example-poc",\n'
         b'  "private_key_id": "cd77b561f2e4abc"\n}\n'
     )
     driver = FakeDriver()

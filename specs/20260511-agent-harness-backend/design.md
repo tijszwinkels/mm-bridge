@@ -459,7 +459,7 @@ class Config:
 TOML:
 ```toml
 [agent_harness]
-url = "http://pillar.tail72f2bc.ts.net:8877"
+url = "http://harness.example.com:8877"
 ```
 
 `_apply_toml`:
@@ -651,7 +651,7 @@ Add `with_transport` classmethod for ergonomic test construction.
 `@pytest.mark.skipif(not os.environ.get("HARNESS_LIVE_URL"), reason="…")`:
 
 1. Connect to `os.environ["HARNESS_LIVE_URL"]` (e.g.
-   `http://pillar.tail72f2bc.ts.net:8877`).
+   `http://harness.example.com:8877`).
 2. `GET /v1/sessions` — assert ≥1 external session visible.
 3. `POST /v1/sessions` to create a harness-origin session with a temp cwd.
 4. `POST /v1/sessions/{id}/runs` with a short prompt.
@@ -684,7 +684,7 @@ Not run in CI; documented in README as the smoke before a release cut.
 
 ### 6.4 Live shapes confirmed (one-time)
 
-Confirmed against `pillar.tail72f2bc.ts.net:8877` on 2026-05-11:
+Confirmed against `harness.example.com:8877` on 2026-05-11:
 
 ```
 GET /v1/sessions

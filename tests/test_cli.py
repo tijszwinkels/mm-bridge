@@ -75,14 +75,14 @@ class InviteHelperTests(unittest.TestCase):
     """`cli._invite_to_channel` — mockable core of the invite subcommand."""
 
     def test_resolves_username_and_calls_invite(self) -> None:
-        mm = FakeMM(users_by_username={"tijs": {"id": "u-tijs"}})
-        cli._invite_to_channel(mm, "c1", "tijs")
-        self.assertEqual(mm.invited, [("c1", "u-tijs")])
+        mm = FakeMM(users_by_username={"alice": {"id": "u-alice"}})
+        cli._invite_to_channel(mm, "c1", "alice")
+        self.assertEqual(mm.invited, [("c1", "u-alice")])
 
     def test_strips_at_prefix(self) -> None:
-        mm = FakeMM(users_by_username={"tijs": {"id": "u-tijs"}})
-        cli._invite_to_channel(mm, "c1", "@tijs")
-        self.assertEqual(mm.invited, [("c1", "u-tijs")])
+        mm = FakeMM(users_by_username={"alice": {"id": "u-alice"}})
+        cli._invite_to_channel(mm, "c1", "@alice")
+        self.assertEqual(mm.invited, [("c1", "u-alice")])
 
     def test_unknown_user_raises(self) -> None:
         mm = FakeMM(missing_users={"nobody"})
@@ -403,13 +403,13 @@ class InviteCommandTests(unittest.TestCase):
             sidecar_dir=str(self.sdir),
             state_file=f"{self.tmp.name}/state.json",
         )
-        self.fake_mm = FakeMM(users_by_username={"tijs": {"id": "u-tijs"}})
+        self.fake_mm = FakeMM(users_by_username={"alice": {"id": "u-alice"}})
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
     def test_invite_dispatch_calls_mm_with_resolved_ids(self) -> None:
-        with patch("sys.argv", ["mm-bridge", "invite", "tijs"]), \
+        with patch("sys.argv", ["mm-bridge", "invite", "alice"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
              patch.dict("os.environ", {"CLAUDE_SESSION_ID": "my-session"}), \
              patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm):
@@ -417,10 +417,10 @@ class InviteCommandTests(unittest.TestCase):
                 cli.main()
             self.assertEqual(cm.exception.code, 0)
         self.assertTrue(self.fake_mm.logged_in)
-        self.assertEqual(self.fake_mm.invited, [("my-channel", "u-tijs")])
+        self.assertEqual(self.fake_mm.invited, [("my-channel", "u-alice")])
 
     def test_invite_without_session_env_exits_nonzero(self) -> None:
-        with patch("sys.argv", ["mm-bridge", "invite", "tijs"]), \
+        with patch("sys.argv", ["mm-bridge", "invite", "alice"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
              patch.dict("os.environ", {}, clear=False) as env, \
              patch(
@@ -434,7 +434,7 @@ class InviteCommandTests(unittest.TestCase):
             self.assertNotEqual(cm.exception.code, 0)
 
     def test_invite_without_sidecar_exits_nonzero(self) -> None:
-        with patch("sys.argv", ["mm-bridge", "invite", "tijs"]), \
+        with patch("sys.argv", ["mm-bridge", "invite", "alice"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
              patch.dict("os.environ", {"CLAUDE_SESSION_ID": "unknown-sess"}):
             with self.assertRaises(SystemExit) as cm:
@@ -445,14 +445,14 @@ class InviteCommandTests(unittest.TestCase):
         """The bug the anchor refactor fixes: inviting from a thread-fork
         session must succeed and invite to the fork's channel."""
         sidecar.write(self.sdir, "fork-sess", "fork-chan", "root-9")
-        with patch("sys.argv", ["mm-bridge", "invite", "tijs"]), \
+        with patch("sys.argv", ["mm-bridge", "invite", "alice"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
              patch.dict("os.environ", {"CLAUDE_SESSION_ID": "fork-sess"}), \
              patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm):
             with self.assertRaises(SystemExit) as cm:
                 cli.main()
             self.assertEqual(cm.exception.code, 0)
-        self.assertEqual(self.fake_mm.invited, [("fork-chan", "u-tijs")])
+        self.assertEqual(self.fake_mm.invited, [("fork-chan", "u-alice")])
 
 
 class ChannelCommandTests(unittest.TestCase):
@@ -940,7 +940,7 @@ class SpawnCommandTests(unittest.TestCase):
     ) -> None:
         """When ``mm_public_url`` is set, the Parent: header permalink
         uses that base URL — not the daemon-internal ``mm_url``."""
-        self.cfg.mm_public_url = "http://pillar.tail72f2bc.ts.net:8065"
+        self.cfg.mm_public_url = "http://mm.example.com:8065"
         self.cfg.mm_team = "workspace"
         sidecar.write(self.sdir, "fork-sess", "parent-chan", "root-9")
         with patch("sys.argv", ["mm-bridge", "spawn", "carry on"]), \
@@ -958,7 +958,7 @@ class SpawnCommandTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, 0)
         header_text = self.fake_mm.headers[0][1]
         self.assertIn(
-            "http://pillar.tail72f2bc.ts.net:8065/workspace/pl/root-9",
+            "http://mm.example.com:8065/workspace/pl/root-9",
             header_text,
         )
 

@@ -45,7 +45,7 @@ end-of-turn: drop state (post stays), then post real reply.
 
 ## Server-side prerequisite
 
-None. `ServiceSettings.EnableAPIPostDeletion` was flipped to `true` across the fleet (preview, plenny, tinkertank) earlier in the design exploration; it's unused by this feature and harmless left on.
+None. `ServiceSettings.EnableAPIPostDeletion` was flipped to `true` across the fleet (staging, demo, prod) earlier in the design exploration; it's unused by this feature and harmless left on.
 
 ### DB growth
 

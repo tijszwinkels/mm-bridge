@@ -7,7 +7,7 @@ handlers, `[vibedeck]` config block). The agent-harness project at
 `/home/claude/projects/agent-harness-echo/` is the clean-slate replacement —
 same conceptual shape (sessions, runs, SSE), different wire contract
 (`/v1/...`, sequence-numbered events, run-id-addressable interrupts,
-external-vs-harness origin split). Live harness: `http://pillar.tail72f2bc.ts.net:8877`.
+external-vs-harness origin split). Live harness: `http://harness.example.com:8877`.
 
 This spec is a **hard replacement**, not a coexistence layer. After this work
 lands, mm-bridge speaks only agent-harness; the VibeDeck client is deleted.
@@ -293,7 +293,7 @@ silently and just resumes following.
 - **Unit tests** for `AgentHarnessClient`: pure shape contracts (request
   bodies, response unwrapping). Fake harness backed by an in-process FastAPI
   app fixture OR `httpx.MockTransport`-driven stubs — design.md picks one.
-- **Integration test** against `http://pillar.tail72f2bc.ts.net:8877` —
+- **Integration test** against `http://harness.example.com:8877` —
   smoke that (a) creates a session + run, (b) interrupts it, (c) observes
   the resulting events through the SSE stream. Gated behind an env flag so
   it doesn't run in CI without the tailnet.

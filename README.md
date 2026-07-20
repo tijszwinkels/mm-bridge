@@ -108,7 +108,7 @@ team = "workspace"
 # Optional user-facing base URL used when the daemon embeds permalinks
 # in channel headers / messages. Handy when the daemon reaches MM at
 # localhost but humans reach it via a Tailscale hostname.
-public_url = "http://pillar.tail72f2bc.ts.net:8065"
+public_url = "http://mm.example.com:8065"
 
 [agent_harness]
 url = "http://localhost:8877"
@@ -152,7 +152,7 @@ mm-bridge serve
 Inside a Claude Code or codex session that already has a sidecar, invites a Mattermost user to the session's channel:
 
 ```bash
-mm-bridge invite tijs
+mm-bridge invite alice
 ```
 
 ### `mm-bridge channel`

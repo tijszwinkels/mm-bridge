@@ -118,7 +118,7 @@ bridge does no detection.
 - **Soft cap at 12.** When the next post's `cslhi` would exceed 12, the
   sending bot does *not* post into the other agent's channel. It writes the
   content it was going to send and posts it into *its own* channel
-  addressed to `@tijs` (or whoever the operator is). The bot then waits for
+  addressed to `@alice` (or whoever the operator is). The bot then waits for
   a human reply.
 
 Within the cap the bot uses its own judgement — keep going while still
