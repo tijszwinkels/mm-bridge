@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import attribution, commands, directives, name_sync, purpose, resume_header
+from .backend_errors import (
+    exception_detail,
+    format_backend_error,
+    run_failure_detail,
+)
 from .agent_harness_client import (
     AgentHarnessClient,
     HarnessForkUnsupported,
@@ -1293,17 +1298,20 @@ class Bridge:
             await self._update_resume_purpose(
                 channel_id, session_id, cfg.backend, effective_cwd,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to create agent-harness session for channel %s", channel_id)
             self.purpose_by_channel.pop(channel_id, None)
             self._awaiting_first_forward.discard(channel_id)
             self._pending_initial_catch_up.pop(channel_id, None)
             try:
                 self.mm.post_message(
-                    channel_id, ":warning: Failed to start an agent-harness session.",
+                    channel_id,
+                    format_backend_error(
+                        "start a session", cfg.backend, exception_detail(exc),
+                    ),
                 )
             except Exception:
-                pass
+                logger.debug("Failed to post session-start error", exc_info=True)
             return
         finally:
             queued = self.warming_up_sessions.pop(channel_id, None)
@@ -1529,7 +1537,7 @@ class Bridge:
             await self._update_resume_purpose(
                 channel_id, session_id, cfg.backend, effective_cwd,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to restart agent-harness session for %s", channel_id)
             # Restore the prior mapping/config so the channel keeps talking to
             # its old (still-live) session instead of being orphaned — a lost
@@ -1542,10 +1550,12 @@ class Bridge:
             try:
                 self.mm.post_message(
                     channel_id,
-                    ":warning: Failed to restart the agent-harness session.",
+                    format_backend_error(
+                        "restart the session", cfg.backend, exception_detail(exc),
+                    ),
                 )
             except Exception:
-                pass
+                logger.debug("Failed to post session-restart error", exc_info=True)
             session_id = None
         finally:
             queued = self.warming_up_sessions.pop(channel_id, None)
@@ -1559,6 +1569,16 @@ class Bridge:
         ):
             await self._flush_queued(channel_id, queued.queued_posts)
         return session_id
+
+    def _backend_for_channel(self, channel_id: str) -> str | None:
+        """Backend name configured for ``channel_id``, or ``None`` if unknown.
+
+        Read from the cached Channel Purpose config. Used to name the backend
+        in surfaced error messages; ``None`` (external/observer channels with
+        no cached config) degrades the template to a generic "the backend".
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        return cfg.backend if cfg else None
 
     def _resolve_session_model(self, cfg: purpose.PurposeConfig) -> str | None:
         """Pick the model to send to ``harness.create_session``.
@@ -1859,7 +1879,7 @@ class Bridge:
             except Exception:
                 pass
             self._enqueue_silent_drop(channel_id, thread_root, post)
-        except Exception:
+        except Exception as exc:
             if first_message:
                 self._awaiting_first_forward.add(channel_id)
                 if first_catch_up:
@@ -1868,11 +1888,15 @@ class Bridge:
             try:
                 self.mm.post(
                     channel_id,
-                    ":warning: Failed to deliver the message to the session.",
+                    format_backend_error(
+                        "run your message",
+                        self._backend_for_channel(channel_id),
+                        exception_detail(exc),
+                    ),
                     root_id=thread_root,
                 )
             except Exception:
-                pass
+                logger.debug("Failed to post run-delivery error", exc_info=True)
             # Preserve the previously-queued drops AND enqueue the
             # current post too: the user's actual request would
             # otherwise vanish with the failed send. The next mention
@@ -2318,8 +2342,20 @@ class Bridge:
         try:
             run = await self.harness.create_run(session_id, block)
             self._track_run_response(session_id, run)
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to send catch-up block")
+            try:
+                self.mm.post(
+                    channel_id,
+                    format_backend_error(
+                        "send the catch-up context",
+                        self._backend_for_channel(channel_id),
+                        exception_detail(exc),
+                    ),
+                    root_id=thread_root,
+                )
+            except Exception:
+                logger.debug("Failed to post catch-up error", exc_info=True)
             return
 
         # A successful explicit catch-up in the main channel supersedes the
@@ -4100,7 +4136,48 @@ class Bridge:
         self._end_tool_use_run(session_id)
         if self.typing:
             await self.typing.stop(session_id)
+        # ``run.failed`` means the backend run died without producing a reply
+        # (CLI not found / boot error / non-zero exit). Surface it — the
+        # channel would otherwise just see typing stop with no explanation.
+        # Watchdog kills (idle-timeout / end-turn) publish ``run.interrupted``,
+        # NOT ``run.failed``, so this never double-posts with those warnings.
+        if event_type == "run.failed":
+            await self._surface_run_failure(session_id, data)
         self._mention_triggerer_on_done(session_id)
+
+    async def _surface_run_failure(self, session_id: str, data: dict) -> None:
+        """Post a channel-facing warning for a ``run.failed`` SSE event.
+
+        No-op when the session has no mapped anchor (external/observer runs
+        with no channel to post into). The full payload is already logged by
+        the SSE dispatch layer; this shapes the human-visible line.
+        """
+        anchor = self.mapping.get_anchor(session_id)
+        if not anchor:
+            logger.warning(
+                "run.failed for unmapped session %s (no channel to notify): %r",
+                session_id[:8], data,
+            )
+            return
+        detail = run_failure_detail(data)
+        logger.error(
+            "Harness run failed: session=%s detail=%s", session_id[:8], detail,
+        )
+        try:
+            self.mm.post(
+                anchor.channel_id,
+                format_backend_error(
+                    "run your message",
+                    self._backend_for_channel(anchor.channel_id),
+                    detail,
+                ),
+                root_id=anchor.root_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to post run-failure notice for session %s",
+                session_id[:8], exc_info=True,
+            )
 
     async def _on_harness_watchdog_event(self, event_type: str, data: dict) -> None:
         """Handle the two `RunProcess` watchdog events (agent-harness PR #10).

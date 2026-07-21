@@ -2920,8 +2920,10 @@ class CommandPhase2Tests(_BridgeTestCase):
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
         self.assertEqual(self.bridge.purpose_by_channel["c1"].model, "opus")
         joined = "\n".join(self._posted_texts())
-        # A failure was surfaced and NO false "Model set" confirmation posted.
-        self.assertIn("Failed to restart", joined)
+        # A failure was surfaced (with backend + detail) and NO false
+        # "Model set" confirmation posted.
+        self.assertIn("restart the session", joined)
+        self.assertIn("harness down", joined)
         self.assertNotIn("Model set", joined)
 
     async def test_bare_model_shows_current_and_hints_models(self):
