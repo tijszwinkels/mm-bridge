@@ -106,8 +106,8 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 | 9  | **Bot username** — the `@name` the agent posts as. | `b3mo` |
 | 10 | **Auto-join public channels?** If on, the bot silently joins every public channel it can see (sessions still created only on first engagement). If off, someone must `/invite @<bot>` per channel. | **off** |
 | 11 | **Autorespond default** — reply to every message, or only when `@mentioned`? | **mention-only** (off) |
-| 12 | **Default backend** for new channels (`claude` / `codex`). | `claude` |
-| 13 | **Default model** per backend. | `claude=opus, codex=gpt-5.5` |
+| 12 | **Default backend** for new channels — `claude`, `codex`, and `pi` are all first-class. Sensible default: **whichever agent is running this install**, since it's demonstrably installed + authed on this host. | the installing agent |
+| 13 | **Default model** per backend (`claude` / `codex`). **`pi` needs none** — the harness is model-optional for it (agent-harness PR #34, deployed). | `claude=opus, codex=gpt-5.5` |
 | 14 | **`default_cwd`** — working dir new sessions start in: the user's *code* root, **distinct from the install dir** (Q2 — tooling, not workspace). | `~/projects` |
 | 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. | `["~/projects"]` |
 | 16 | **Show tool-use posts?** Coalesced per-turn tool-use placeholders, or hide them (only real replies + errors). | show |
@@ -154,8 +154,11 @@ user (`docker run --rm hello-world`).
 
 ## Step 2 — Backend coding-agent CLIs
 
-agent-harness runs these as subprocesses inheriting its PATH. Install **at least the
-default backend** and authenticate **as the host user** (not root):
+agent-harness runs `claude`, `codex`, and `pi` as subprocesses inheriting its PATH — all
+three are first-class. Install **at least the default backend** (Q12) and authenticate **as
+the host user** (not root). If an agent is *running this install*, its own backend is already
+installed + authed here — the natural default; just add whichever others you chose in Q3.
+Claude Code as a worked example:
 
 ```bash
 # Claude Code → installs into ~/.npm-global/bin (which the harness puts on PATH)
@@ -164,7 +167,7 @@ export PATH="$HOME/.npm-global/bin:$PATH"
 npm install -g @anthropic-ai/claude-code
 claude    # run once and complete login / API-key setup
 
-# codex / pi: install their CLIs and authenticate the same way if requested in Q3
+# codex / pi: install their CLIs and authenticate the same way (pi needs no model config)
 ```
 
 **✅ Checkpoint:** `claude --version` (and any other chosen backend) resolves, and a trivial
@@ -361,7 +364,7 @@ default_autorespond       = false                  # Q11 (true = reply to every 
 auto_join_public_channels = false                  # Q10 (true = bot joins all public channels)
 show_tool_use             = true                   # Q16
 allowed_attachment_roots  = ["~/projects"]          # Q15
-default_models            = { claude = "opus", codex = "gpt-5.5" }   # Q13
+default_models            = { claude = "opus", codex = "gpt-5.5" }   # Q13 — pi needs none (harness is model-optional)
 state_file                = "~/.config/mm-bridge/state.json"
 sidecar_dir               = "~/.mm-bridge/sessions"
 
