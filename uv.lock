@@ -337,15 +337,15 @@ wheels = [
 
 [[package]]
 name = "mattermostautodriver"
-version = "11.6.0"
+version = "11.7.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4b/cd/7e5ac486b28a0cf137d305a7b8b37ca1e18ad98c8f1344a9dbe3533619ed/mattermostautodriver-11.6.0.tar.gz", hash = "sha256:b8a5ab174c6093dbc8249ba00522394776c42c7af27c55e34db2802944dac668", size = 121015, upload-time = "2026-04-13T12:21:04.412Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c9/e5/145fd4f961cbae5b22199534bde60ff2e937c0bb0143d2004b5f471f8dfc/mattermostautodriver-11.7.2.tar.gz", hash = "sha256:c0e3e7cae50b2ad79dda54e984f20788d629252e64df439f7597fde13f889202", size = 125317, upload-time = "2026-06-02T10:56:50.785Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/a9/c89501e785189f0406893c86b1a698024c1ff81b33dc6ddd0685f564312c/mattermostautodriver-11.6.0-py3-none-any.whl", hash = "sha256:a1ca38a17c390e7790e53a75cd3cb64c8d08950f5eec4d04d4e8239562be143a", size = 175631, upload-time = "2026-04-13T12:21:03.254Z" },
+    { url = "https://files.pythonhosted.org/packages/90/04/93b1a99e295d5efed1da81a534bdb1492279a5ff8143f944745c640c8d06/mattermostautodriver-11.7.2-py3-none-any.whl", hash = "sha256:f5c3a406c9ece1e8206f25a9eae64f59f48786e7262587e96e101dfec8e7506a", size = 181599, upload-time = "2026-06-02T10:56:49.526Z" },
 ]
 
 [[package]]
@@ -369,7 +369,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx-sse", specifier = ">=0.4" },
-    { name = "mattermostautodriver", specifier = ">=2.0.0" },
+    { name = "mattermostautodriver", specifier = ">=2.0.0,<11.8" },
 ]
 
 [package.metadata.requires-dev]
