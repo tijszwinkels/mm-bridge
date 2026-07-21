@@ -81,6 +81,15 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 - agent-harness → `https://github.com/tijszwinkels/agent-harness`
 - mm-bridge → `https://github.com/tijszwinkels/mm-bridge`
 
+> **No GitHub access from this host (air-gapped, private repos, blocked egress)?**
+> Steps 4 and 5 only need the two repo trees *present* under `<install_dir>` — the
+> `git clone` is one way to get them there, not the only way. Populate the install
+> dir another way instead (e.g. `rsync -a --exclude .venv --exclude '.git'` from a
+> host that has them, or unpack a tarball) and skip the two `git clone` lines. The
+> rest of the runbook is identical. Do **not** copy any `.env`, `run.sh`,
+> `config.toml`, or state files across hosts — those are per-host and recreated
+> from the templates here.
+
 ### 0a. Host & backends (blocking — you cannot proceed without these)
 
 | # | Question | Notes |
@@ -150,6 +159,17 @@ node --version; screen --version | head -1; jq --version; git --version
 **✅ Checkpoint:** every command above prints a version. Docker can run containers as this
 user (`docker run --rm hello-world`).
 
+> **🔴 Security — public-IP host?** The agent-harness API (Step 4) is **unauthenticated**
+> and spawns backend CLIs with `--dangerously-skip-permissions`. Anyone who can reach its
+> port (default `8877`) gets remote code execution as this user. Keep it bound to
+> **loopback** (`--host 127.0.0.1`, the default in Step 4's template) — the bridge reaches
+> it over localhost, so nothing else needs to. **Never bind `0.0.0.0` on a box with a
+> public IP.** If this host is internet-facing, also firewall everything except SSH (22) and
+> the Mattermost port before proceeding — e.g. `sudo ufw default deny incoming; sudo ufw
+> allow 22; sudo ufw allow 8065; sudo ufw enable` (adjust the MM port for your Q6 variant).
+> Serve Mattermost over TLS when `DOMAIN` is a public hostname — plain `:8065` sends the
+> bot token and passwords in cleartext.
+
 ---
 
 ## Step 2 — Backend coding-agent CLIs
@@ -186,7 +206,9 @@ Official quick-start (`github.com/mattermost/docker`):
 git clone https://github.com/mattermost/docker
 cd docker
 cp env.example .env
-# Edit .env: set DOMAIN=<DOMAIN>   (from Q5)
+# Edit .env:
+#   DOMAIN=<DOMAIN>                              (from Q5)
+#   MM_SERVICESETTINGS_SITEURL=<site_url>        (see below — MUST match how clients reach MM)
 
 mkdir -p ./volumes/app/mattermost/{config,data,logs,plugins,client/plugins,bleve-indexes}
 sudo chown -R 2000:2000 ./volumes/app/mattermost
@@ -201,6 +223,13 @@ docker compose -f docker-compose.yml -f docker-compose.without-nginx.yml up -d
 # OR HTTPS via bundled nginx
 # docker compose -f docker-compose.yml -f docker-compose.nginx.yml up -d
 ```
+
+> **`MM_SERVICESETTINGS_SITEURL` per variant (Q6).** SiteURL must equal the origin clients
+> actually use, or logins and the bot WebSocket break:
+> - **Plain `:8065`** → `http://<DOMAIN>:8065` (note the port and **http**, not https).
+> - **Bundled nginx / your own TLS proxy** → `https://<DOMAIN>` (no port).
+>
+> For `DOMAIN=localhost` the plain SiteURL is `http://localhost:8065`.
 
 > **Host already runs an `nginx-proxy` (auto-vhost + acme-companion)?** Don't use the
 > bundled nginx — you'll get a cert/routing conflict. Bring Mattermost up with the
@@ -229,26 +258,111 @@ docker compose -f docker-compose.yml -f docker-compose.without-nginx.yml up -d
 > (Env-var names follow the standard `nginx-proxy` / `acme-companion` convention; the
 > network name and email are host-specific — confirm them with the operator.)
 
-Then in the browser at `https://<DOMAIN>/` (or `http://<DOMAIN>:8065/` for the plain variant):
+Now create the **system-admin** user and the **team**. This runbook's audience is an AI
+agent with no browser, so the **headless REST-API path is primary** (the browser is only an
+alternative — see the note at the end of this step).
 
-1. Create the **system-admin** user.
-2. Create a **team**; note its slug → this is `MM_TEAM` (Q8).
+**On a brand-new server the *first* user to register is automatically granted the
+`system_admin` role** — so create it via the API. Generate a strong password, store it
+`chmod 600`, and never echo it into the channel or logs:
+
+```bash
+# 1. Server is up?
+curl -sSf http://localhost:8065/api/v4/system/ping    # → {"status":"OK"}
+
+# 2. Generate + persist the admin credentials FIRST (so a crash can't lose the password).
+mkdir -p ~/.config/mm-bridge
+ADMIN_PW=$(openssl rand -base64 24)
+umask 077
+cat > ~/.config/mm-bridge/admin.env <<ENV
+MM_ADMIN_USER=admin
+MM_ADMIN_EMAIL=<admin_email>          # Q — a real address you control
+MM_ADMIN_PASSWORD=$ADMIN_PW
+ENV
+chmod 600 ~/.config/mm-bridge/admin.env
+# ^ The MM admin password lives here alongside config.toml/env, chmod 600, out of the repo.
+#   Do not print $ADMIN_PW to the channel. Recover it later with:
+#   set -a; source ~/.config/mm-bridge/admin.env; set +a
+
+# 3. First user → becomes system admin (no auth needed for the very first user).
+curl -sSf -X POST http://localhost:8065/api/v4/users \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"<admin_email>\",\"username\":\"admin\",\"password\":\"$ADMIN_PW\"}" >/dev/null
+
+# 4. Log in as admin → capture the session token from the `Token` response header.
+ADMIN_TOKEN=$(curl -sS -D - -o /dev/null -X POST http://localhost:8065/api/v4/users/login \
+  -H 'Content-Type: application/json' \
+  -d "{\"login_id\":\"admin\",\"password\":\"$ADMIN_PW\"}" \
+  | awk 'tolower($1)=="token:"{print $2}' | tr -d '\r')
+[ -n "$ADMIN_TOKEN" ] || { echo "admin login failed"; exit 1; }
+
+# 5. Create the team. `name` is the URL slug = MM_TEAM (Q8); type O = open.
+curl -sSf -X POST http://localhost:8065/api/v4/teams \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"<MM_TEAM>","display_name":"<MM_TEAM>","type":"O"}' >/dev/null
+```
+
+> **`mmctl` alternative.** If you have the Mattermost CLI, the same two objects are
+> `mmctl user create --system-admin --email <admin_email> --username admin --password "$ADMIN_PW"`
+> and `mmctl team create --name <MM_TEAM> --display-name <MM_TEAM>` (after
+> `mmctl auth login http://localhost:8065 --name local --username admin --password "$ADMIN_PW"`).
+
+> **Browser alternative.** If a human with a browser is available, open
+> `http://<DOMAIN>:8065/` (plain variant) or `https://<DOMAIN>/` (nginx/TLS), create the
+> system-admin user on the first-run screen, then create the team — its slug is `MM_TEAM`.
+> Still record the admin password in `~/.config/mm-bridge/admin.env` (chmod 600) as above.
 
 **✅ Checkpoint:** `curl -sSf http://localhost:8065/api/v4/system/ping` returns
-`{"status":"OK"}` and you can log in as the admin.
+`{"status":"OK"}`, `~/.config/mm-bridge/admin.env` exists (chmod 600), and the admin login
+in step 4 yielded a non-empty `$ADMIN_TOKEN`.
 
 ### Step 3b — Bot account + personal access token
 
-In **System Console**:
+Headless path (primary), continuing as the admin from Step 3. Re-establish an admin token
+first (a fresh shell won't have `$ADMIN_TOKEN` from Step 3):
 
-1. **Integrations → Bot Accounts** → *Enable Bot Account Creation* = **true**.
-2. **Integrations → Integration Management** → *Enable Personal Access Tokens* = **true**.
-3. Product menu → **Integrations → Bot Accounts → Add Bot Account**. Username = `<bot>`
-   (Q9). Create a token — **copy it immediately, it is shown once.**
+```bash
+set -a; source ~/.config/mm-bridge/admin.env; set +a
+ADMIN_TOKEN=$(curl -sS -D - -o /dev/null -X POST http://localhost:8065/api/v4/users/login \
+  -H 'Content-Type: application/json' \
+  -d "{\"login_id\":\"$MM_ADMIN_USER\",\"password\":\"$MM_ADMIN_PASSWORD\"}" \
+  | awk 'tolower($1)=="token:"{print $2}' | tr -d '\r')
 
-That token is `MM_BOT_TOKEN`.
+# 1. Enable bot-account creation + personal access tokens (System Console flags, via API).
+curl -sSf -X PUT http://localhost:8065/api/v4/config/patch \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"ServiceSettings":{"EnableBotAccountCreation":true,"EnableUserAccessTokens":true}}' >/dev/null
 
-**✅ Checkpoint:** the token works:
+# 2. Create the bot (Q9) and capture its user id.
+BOT_USER_ID=$(curl -sSf -X POST http://localhost:8065/api/v4/bots \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username":"<bot>","display_name":"<bot>"}' | jq -r .user_id)
+
+# 3. Add the bot to the team (it must be a member to see/post in channels).
+TEAM_ID=$(curl -sSf http://localhost:8065/api/v4/teams/name/<MM_TEAM> \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .id)
+curl -sSf -X POST http://localhost:8065/api/v4/teams/$TEAM_ID/members \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"team_id\":\"$TEAM_ID\",\"user_id\":\"$BOT_USER_ID\"}" >/dev/null
+
+# 4. Mint the bot's personal access token → this value is MM_BOT_TOKEN.
+curl -sSf -X POST http://localhost:8065/api/v4/users/$BOT_USER_ID/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"description":"mm-bridge"}' | jq -r .token
+```
+
+The `token` printed by step 4 is **`MM_BOT_TOKEN`** — put it in `~/.config/mm-bridge/env`
+(Step 5b), never in the repo or the channel. (`mmctl` equivalent:
+`mmctl bot create <bot> --display-name <bot>` then
+`mmctl token generate <bot> mm-bridge`, after `mmctl auth login`.)
+
+> **Browser alternative.** In **System Console**: **Integrations → Bot Accounts** → *Enable
+> Bot Account Creation* = true; **Integrations → Integration Management** → *Enable Personal
+> Access Tokens* = true; then **Integrations → Bot Accounts → Add Bot Account**
+> (username `<bot>`, Q9) and create a token — **copy it immediately, it is shown once.**
+> Add the bot to the team.
+
+**✅ Checkpoint:** the token works and resolves to the bot:
 
 ```bash
 curl -s -H "Authorization: Bearer <MM_BOT_TOKEN>" \
@@ -280,11 +394,17 @@ set -euo pipefail
 cd "$(dirname "$0")"
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"   # ← adjust if backends live elsewhere (Step 2)
 exec uv run agent-harness serve \
-  --host 0.0.0.0 --port 8877 \
+  --host 127.0.0.1 --port 8877 \              # ← loopback: the API is UNAUTHENTICATED (see Step 1). Never 0.0.0.0 on a public box.
   --database "$HOME/.local/state/agent-harness/harness.db.8877" \   # ← state OUT of the repo (XDG state dir)
   --execute-runs                              # ← REQUIRED: without it, runs are recorded but no CLI launches
   # --cors-origin https://your-dashboard      # only if a browser app calls the harness cross-origin
 ```
+
+> **Why loopback?** The bridge reaches the harness at `http://localhost:8877`, so nothing
+> needs a wider bind. The harness has no auth and launches agents with
+> `--dangerously-skip-permissions`; `0.0.0.0` on a public-IP host is unauthenticated remote
+> code execution (see the Step 1 security callout). Widen the bind only behind a firewall +
+> authenticating proxy — the harness logs a startup WARNING whenever `--host` isn't loopback.
 
 > The stock `run.sh.example` writes the DB into the clone (`.agent-harness.db.8877`);
 > point `--database` at `~/.local/state/agent-harness/` so state survives a re-clone and
@@ -379,6 +499,10 @@ public_url = "<public_url>"                    # Q7 — the URL humans click
 url = "http://localhost:8877"
 ```
 
+> **Create `default_cwd` if it's missing.** New sessions start there, and it may not exist
+> on a fresh box (`~/projects` is *not* the install dir). `mkdir -p "$(eval echo <default_cwd>)"`
+> so the first session doesn't land in a non-existent directory.
+
 ### 5b. Secrets — `~/.config/mm-bridge/env` (chmod 600)
 
 The bot token is read from the **environment** — there is no TOML key for it — so it lives
@@ -415,6 +539,12 @@ once Step 6 supervises it):
 set -a; source ~/.config/mm-bridge/env; set +a
 uv run mm-bridge doctor    # → ✓ config, ✓ mattermost (prints the resolved @<bot>), ✓ sidecar-dir
 ```
+
+> **PATH:** `uv run …` needs the `uv` binary on PATH, which lives in `~/.local/bin` — not on
+> PATH in a bare non-login shell. If you get `uv: command not found`, run
+> `export PATH="$HOME/.local/bin:$PATH"` first (and run this from inside the mm-bridge repo
+> dir, since `uv run` resolves the project there). After **Step 7a** installs the console
+> script, the bare `mm-bridge doctor` works from any cwd — no `uv run`.
 
 ---
 
