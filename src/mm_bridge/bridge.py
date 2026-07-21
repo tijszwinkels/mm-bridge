@@ -125,9 +125,26 @@ CHANNEL_JOIN_WELCOME_TEMPLATE = (
     "More: [README](https://github.com/tijszwinkels/mm-bridge#readme)."
 )
 
-_CATCH_UP_RE = re.compile(r"^@claude\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE)
-_LEAVE_CMD_RE = re.compile(r"^@claude\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
-_STOP_CMD_RE = re.compile(r"^(?P<mention>@claude\s+)?stop\s*$", re.IGNORECASE)
+def _compile_bot_command_res(
+    bot: str,
+) -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
+    """Compile the catch-up/leave/stop regexes for bot handle ``bot``.
+
+    ``bot`` is the runtime bot username (no leading ``@``); it's ``re.escape``-d
+    so an exotic handle can't inject regex metacharacters. Falls back to
+    ``claude`` when empty (pre-login) so the patterns are always usable.
+    Matching stays case-insensitive — identical to the old ``@claude`` literals
+    for a bot actually named ``claude``.
+    """
+    handle = re.escape(bot or "claude")
+    catch_up = re.compile(
+        rf"^@{handle}\s+catch\s+up(?:\s+(\d+))?\s*$", re.IGNORECASE,
+    )
+    leave = re.compile(
+        rf"^@{handle}\s+leave\b(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL,
+    )
+    stop = re.compile(rf"^(?P<mention>@{handle}\s+)?stop\s*$", re.IGNORECASE)
+    return catch_up, leave, stop
 
 
 @dataclass
@@ -909,7 +926,7 @@ class Bridge:
             # Natural-language control phrases advertised in the join welcome
             # must not accidentally create a session just to say there is no
             # session. They behave identically for invite and auto-join.
-            if _CATCH_UP_RE.match(message):
+            if self._catch_up_re.match(message):
                 self._post_cmd_reply(
                     channel_id,
                     ":information_source: Catch-up is included automatically "
@@ -917,7 +934,7 @@ class Bridge:
                     None,
                 )
                 return
-            if m := _LEAVE_CMD_RE.match(message):
+            if m := self._leave_cmd_re.match(message):
                 try:
                     await asyncio.to_thread(self.mm.remove_self_from_channel, channel_id)
                 except Exception:
@@ -929,7 +946,7 @@ class Bridge:
                 self._dormant_channels.discard(channel_id)
                 self.purpose_by_channel.pop(channel_id, None)
                 return
-            if _STOP_CMD_RE.match(message):
+            if self._stop_cmd_re.match(message):
                 self._post_cmd_reply(
                     channel_id, ":information_source: No session in this channel.", None,
                 )
@@ -962,17 +979,17 @@ class Bridge:
         # supported path; such words now forward to the agent verbatim.)
 
         # Command: @claude catch up
-        if m := _CATCH_UP_RE.match(message):
+        if m := self._catch_up_re.match(message):
             await self._run_catch_up(channel_id, session_id, None, m)
             return
         # Command: @claude leave
-        if m := _LEAVE_CMD_RE.match(message):
+        if m := self._leave_cmd_re.match(message):
             await self._run_leave_command(
                 channel_id, session_id, thread_root=None, reason=(m.group(1) or "").strip(),
             )
             return
         # Command: @claude stop (bare `stop` is honored only in autorespond mode)
-        if sm := _STOP_CMD_RE.match(message):
+        if sm := self._stop_cmd_re.match(message):
             cfg = self.purpose_by_channel.get(channel_id)
             if sm.group("mention") or not (cfg and cfg.mention_only):
                 await self._run_stop_command(channel_id, session_id, thread_root=None)
@@ -1053,17 +1070,14 @@ class Bridge:
                 await self._flush_queued(channel_id, queued.queued_posts)
             return
 
-        bot_mention = f"@{self.mm.bot_username}"
-        mentioned = bot_mention in message or "@claude" in message.lower()
+        mentioned = self._message_mentions_bot(message)
         if cfg.mention_only and not mentioned:
             queued = self.warming_up_sessions.pop(channel_id, None)
             if queued and queued.queued_posts:
                 await self._flush_queued(channel_id, queued.queued_posts)
             return  # silent — not engaging
 
-        cleaned = (
-            message.replace(bot_mention, "").replace("@claude", "").strip()
-        )
+        cleaned = self._strip_bot_mention(message)
         if not cleaned and not post.get("file_ids"):
             queued = self.warming_up_sessions.pop(channel_id, None)
             if queued and queued.queued_posts:
@@ -1390,9 +1404,10 @@ class Bridge:
         """Adopt a channel currently mapped to an ``origin: external``
         harness session.
 
-        Externally-launched sessions (e.g. ones created by VibeDeck before
-        the harness cutover) appear in ``GET /v1/sessions`` but the harness
-        has no stdin / IPC channel into them — ``POST /v1/sessions/<id>/runs``
+        Externally-launched sessions (e.g. a terminal ``claude``/``codex`` the
+        harness only *observes*, or one created directly against the harness
+        API) appear in ``GET /v1/sessions`` but the harness has no stdin / IPC
+        channel into them — ``POST /v1/sessions/<id>/runs``
         returns 200 but the message goes nowhere. The user's current MM
         post would silently vanish.
 
@@ -1673,7 +1688,8 @@ class Bridge:
         head = ", ".join(parts)
         hint = (
             "Hi! Reply to catch me up, or just start asking. "
-            f"Use `@claude catch up {self.config.catch_up_default_n}` to include "
+            f"Use `@{self.mm.bot_username} catch up "
+            f"{self.config.catch_up_default_n}` to include "
             f"the last {self.config.catch_up_default_n} messages."
         )
         if cfg.mention_only:
@@ -1772,8 +1788,8 @@ class Bridge:
             self._enqueue_silent_drop(channel_id, thread_root, post)
             return
 
-        # Strip the @-mention so Claude doesn't see a stray handle.
-        cleaned = message.replace(bot_mention, "").replace("@claude", "").strip()
+        # Strip the @-mention so the agent doesn't see a stray handle.
+        cleaned = self._strip_bot_mention(message)
 
         # Download any inbound MM attachments into the session's cwd.
         attachment_notes: list[str] = []
@@ -1956,7 +1972,7 @@ class Bridge:
             return
 
         # Leave command inside a thread only removes the thread mapping.
-        if m := _LEAVE_CMD_RE.match(message):
+        if m := self._leave_cmd_re.match(message):
             await self._run_leave_command(
                 channel_id, session_id=None, thread_root=root_id,
                 reason=(m.group(1) or "").strip(),
@@ -1964,10 +1980,10 @@ class Bridge:
             return
 
         if thread_session:
-            if cm := _CATCH_UP_RE.match(message):
+            if cm := self._catch_up_re.match(message):
                 await self._run_catch_up(channel_id, thread_session, root_id, cm)
                 return
-            if sm := _STOP_CMD_RE.match(message):
+            if sm := self._stop_cmd_re.match(message):
                 cfg = self.purpose_by_channel.get(channel_id)
                 if sm.group("mention") or not (cfg and cfg.mention_only):
                     await self._run_stop_command(
@@ -2230,7 +2246,7 @@ class Bridge:
                 continue
             if _is_mm_system_post(p):
                 continue
-            if _CATCH_UP_RE.match((p.get("message") or "").strip()):
+            if self._catch_up_re.match((p.get("message") or "").strip()):
                 continue
             username = self._resolve_username(p.get("user_id", ""))
             lines.append(f"{username}: {p.get('message', '')}")
@@ -2371,14 +2387,56 @@ class Bridge:
 
     # ─────────────────────── Dot-command dispatch ─────────────────────────
 
+    def _bot_command_res(
+        self,
+    ) -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
+        """The catch-up/leave/stop regexes, compiled for the live bot handle.
+
+        Compiled lazily from ``self.mm.bot_username`` (stable after login) and
+        cached; recompiled only if the resolved handle ever changes. Keying off
+        the runtime handle is what makes the bot name configurable — no more
+        hardcoded ``@claude``.
+        """
+        bot = self.mm.bot_username or "claude"
+        cache = getattr(self, "_bot_command_res_cache", None)
+        if cache is None or cache[0] != bot:
+            cache = (bot, _compile_bot_command_res(bot))
+            self._bot_command_res_cache = cache
+        return cache[1]
+
+    @property
+    def _catch_up_re(self) -> re.Pattern[str]:
+        return self._bot_command_res()[0]
+
+    @property
+    def _leave_cmd_re(self) -> re.Pattern[str]:
+        return self._bot_command_res()[1]
+
+    @property
+    def _stop_cmd_re(self) -> re.Pattern[str]:
+        return self._bot_command_res()[2]
+
     def _command_mentions(self) -> tuple[str, ...]:
         """Bot handles whose leading ``@mention`` ``commands.parse`` strips."""
-        return ("claude", self.mm.bot_username)
+        return (self.mm.bot_username,)
 
     def _message_mentions_bot(self, message: str) -> bool:
-        """True if ``message`` @-mentions this bot (matches engagement logic)."""
-        bot_mention = f"@{self.mm.bot_username}"
-        return bot_mention in message or "@claude" in message.lower()
+        """True if ``message`` @-mentions this bot (matches engagement logic).
+
+        Case-insensitive on the runtime handle — for a bot named ``claude``
+        this matches ``@claude``/``@Claude`` exactly as before.
+        """
+        return f"@{self.mm.bot_username}".lower() in message.lower()
+
+    def _strip_bot_mention(self, message: str) -> str:
+        """Remove this bot's ``@handle`` from a forwarded message.
+
+        Case-sensitive, matching the historical strip: the agent shouldn't see
+        a stray ``@<bot>`` handle. Keyed off the runtime bot username — for a
+        bot named ``claude`` this is identical to the old
+        ``.replace("@claude", "")``.
+        """
+        return message.replace(f"@{self.mm.bot_username}", "").strip()
 
     def _commands_allowed_here(
         self,

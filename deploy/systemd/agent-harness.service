@@ -1,0 +1,33 @@
+# agent-harness.service — the coding-agent session runtime (:8877 by default).
+#
+# User-level unit (~/.config/systemd/user/). Runs as the login user so the
+# agent CLIs it spawns inherit that user's git identity, repos, and
+# ~/.claude / ~/.codex credentials — see INSTALL.md "Topology" for why this
+# is NOT containerised.
+#
+# BEFORE ENABLING: replace the ExecStart path below with the absolute path to
+# your agent-harness/run.sh (INSTALL.md Step 4). %h expands to this user's
+# home; the default install dir is ~/.local/opt/agent-chatops, so the placeholder
+# usually just works — but verify it, don't assume. run.sh puts the backend CLIs + uv on
+# PATH and passes --execute-runs.
+#
+# Logs: journalctl --user -u agent-harness -f
+
+[Unit]
+Description=agent-harness (coding-agent session runtime)
+Documentation=https://github.com/tijszwinkels/mm-bridge/blob/main/INSTALL.md
+# Part of the chat-ops target so target stop/restart cascades here. No hard
+# binding to the bridge — they're independent daemons.
+PartOf=agent-chatops.target
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ── FILL IN / verify: absolute path to agent-harness/run.sh ──
+ExecStart=%h/.local/opt/agent-chatops/agent-harness/run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=agent-chatops.target

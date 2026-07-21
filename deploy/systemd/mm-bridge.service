@@ -1,0 +1,33 @@
+# mm-bridge.service — the Mattermost <-> agent-harness bridge daemon.
+#
+# User-level unit (~/.config/systemd/user/). Runs as the login user so agent
+# sessions it drives share that user's environment.
+#
+# BEFORE ENABLING: replace the ExecStart path below with the absolute path to
+# your mm-bridge/run.sh (INSTALL.md Step 5). run.sh sources the repo's .env
+# (MM_BOT_TOKEN etc.) and puts uv on PATH before exec-ing the daemon, so
+# secrets stay out of this unit file. %h expands to this user's home; default
+# install dir is ~/.local/opt/agent-chatops — verify it.
+#
+# Logs: journalctl --user -u mm-bridge -f
+
+[Unit]
+Description=mm-bridge (Mattermost <-> agent-harness bridge)
+Documentation=https://github.com/tijszwinkels/mm-bridge/blob/main/INSTALL.md
+PartOf=agent-chatops.target
+# Soft ordering only: start after the harness so its SSE endpoint is usually
+# up first. Deliberately NOT BindsTo=/Requires= — the bridge reconnect-resumes
+# the harness SSE on its own, and hard coupling would mask that reconnect path
+# (a regression there would otherwise be papered over by systemd restarts).
+After=network-online.target agent-harness.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ── FILL IN / verify: absolute path to mm-bridge/run.sh ──
+ExecStart=%h/.local/opt/agent-chatops/mm-bridge/run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=agent-chatops.target

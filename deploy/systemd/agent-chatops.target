@@ -1,0 +1,22 @@
+# agent-chatops.target — the whole chat-ops stack as one unit.
+#
+# User-level systemd target (installs under ~/.config/systemd/user/). It pulls
+# in BOTH daemons, so a single `systemctl --user {start,stop,restart,status}
+# agent-chatops.target` drives the pair. Each service is PartOf= this target,
+# so stop/restart cascades to both.
+#
+# Install + enable (see INSTALL.md Step 6):
+#   loginctl enable-linger "$USER"                 # start at boot w/o a login
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agent-chatops.target
+#
+# The target's Wants= starts both services as a runtime dependency; you don't
+# need to enable them individually.
+
+[Unit]
+Description=Agent chat-ops stack (agent-harness + mm-bridge)
+Documentation=https://github.com/tijszwinkels/mm-bridge/blob/main/INSTALL.md
+Wants=agent-harness.service mm-bridge.service
+
+[Install]
+WantedBy=default.target

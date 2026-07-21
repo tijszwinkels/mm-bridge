@@ -7,5 +7,8 @@ cd "$(dirname "$0")"
 # script being on PATH. Prepend ~/.local/bin so `uv` itself resolves under
 # systemd's non-interactive shell (which skips ~/.bashrc).
 export PATH="$HOME/.local/bin:$PATH"
-set -a; source .env; set +a
+# Secrets: prefer the XDG config dir (chmod 600, outside the repo);
+# fall back to a repo-local .env for compatibility.
+if [ -f "$HOME/.config/mm-bridge/env" ]; then set -a; source "$HOME/.config/mm-bridge/env"; set +a
+elif [ -f .env ]; then set -a; source .env; set +a; fi
 exec uv run mm-bridge serve

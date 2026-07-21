@@ -1,8 +1,18 @@
 # mm-bridge
 
-Mattermost ↔ agent-harness bridge — one channel (or thread) per Claude Code / Codex session.
+**Chat-ops for coding agents.** Run, steer, fork, and spawn Claude Code / Codex sessions straight from your team chat — one Mattermost channel (or thread) per session.
 
-A daemon connects a Mattermost bot account (conventionally `@claude`) to an agent-harness instance and maps conversations to sessions:
+## Quickstart — agent-first install
+
+The install is itself an agent task. Clone this repo, open it in **Claude Code** (or **Codex**), and say:
+
+> **install this**
+
+The agent follows [`INSTALL.md`](INSTALL.md): it interviews you for the few things it can't infer (Mattermost URL + bot token, the host user, which projects dir) and stands up the full stack — Mattermost, agent-harness, and this bridge — verifying every step with `mm-bridge doctor`. Prefer to drive it yourself? `INSTALL.md` is a plain numbered runbook you can follow by hand.
+
+## How it works
+
+A daemon connects a Mattermost bot account (conventionally `@b3mo`) to an agent-harness instance and maps conversations to sessions:
 
 - **A channel** the bot joins or is invited to → a dormant, configurable presence. The first conversational message creates one agent-harness session; assistant replies stream back as posts.
 - **A thread** inside a channel → its own *forked* session, so side-quests don't pollute the main conversation.
@@ -22,13 +32,15 @@ The CLI discovers the current session id from one of four sources, in order:
 mm-bridge is glue between three things you must already run yourself — it does **not** bundle or install any of them:
 
 - **A self-hosted Mattermost** you control, plus a **bot account** on it and a **personal access token** for that bot (the `MM_BOT_TOKEN` the daemon authenticates with). A hosted/Cloud Mattermost you can't create bot tokens on won't work.
-- **A running [agent-harness](https://github.com/tijszwinkels/agent-harness-echo) instance** — the daemon subscribes to its SSE stream and drives sessions/runs through it. mm-bridge is useless without one reachable.
+- **A running [agent-harness](https://github.com/tijszwinkels/agent-harness) instance** — the daemon subscribes to its SSE stream and drives sessions/runs through it. mm-bridge is useless without one reachable.
 - **The agent CLIs themselves — Claude Code and/or Codex — installed on the *same host* as the harness.** Sessions run as local processes and self-identify via the sidecar file, so the bridge, the harness, and the agent CLIs must be co-located.
 - **Linux is preferred.** The `/proc` codex-session tie-breaker (source #3 above) is Linux-only; on macOS the CLI falls back to the cwd-matched rollout scan, which is less precise when multiple codex sessions share a working directory.
 
-## Install
+## Install from source (manual)
 
-Requires Python 3.11+. Using [`uv`](https://github.com/astral-sh/uv):
+Prefer the agent-first [Quickstart](#quickstart--agent-first-install) for the full stack;
+this is the bare Python-package install. Requires Python 3.11+. Using
+[`uv`](https://github.com/astral-sh/uv):
 
 ```bash
 uv sync
@@ -205,7 +217,7 @@ immediately without a mention (the config commands persist their settings in
 the Channel Purpose). The first conversational post creates exactly one session
 with the final configuration. Only global listings/actions (`.sessions`,
 `.running`, `.invite`) reveal operator-wide state, so in a dormant channel they
-require an explicit `@claude` mention; bare global or unknown dot-words are
+require an explicit `@b3mo` mention; bare global or unknown dot-words are
 ignored. Which commands need a mention is driven entirely by each command's
 `global_scope` flag, so **every parsed dot-command is intercepted by the
 bridge** — none can become or silence the first LLM turn. Posts arriving while
