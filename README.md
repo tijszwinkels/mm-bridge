@@ -32,7 +32,7 @@ The CLI discovers the current session id from one of four sources, in order:
 mm-bridge is glue between three things you must already run yourself — it does **not** bundle or install any of them:
 
 - **A self-hosted Mattermost** you control, plus a **bot account** on it and a **personal access token** for that bot (the `MM_BOT_TOKEN` the daemon authenticates with). A hosted/Cloud Mattermost you can't create bot tokens on won't work.
-- **A running [agent-harness](https://github.com/tijszwinkels/agent-harness-echo) instance** — the daemon subscribes to its SSE stream and drives sessions/runs through it. mm-bridge is useless without one reachable.
+- **A running [agent-harness](https://github.com/tijszwinkels/agent-harness) instance** — the daemon subscribes to its SSE stream and drives sessions/runs through it. mm-bridge is useless without one reachable.
 - **The agent CLIs themselves — Claude Code and/or Codex — installed on the *same host* as the harness.** Sessions run as local processes and self-identify via the sidecar file, so the bridge, the harness, and the agent CLIs must be co-located.
 - **Linux is preferred.** The `/proc` codex-session tie-breaker (source #3 above) is Linux-only; on macOS the CLI falls back to the cwd-matched rollout scan, which is less precise when multiple codex sessions share a working directory.
 

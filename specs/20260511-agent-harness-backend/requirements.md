@@ -4,7 +4,7 @@
 
 `mm-bridge` currently talks to **VibeDeck** (`vd_client.py`, `_on_vd_*` SSE
 handlers, `[vibedeck]` config block). The agent-harness project at
-`/home/claude/projects/agent-harness-echo/` is the clean-slate replacement —
+`/home/claude/projects/agent-harness/` is the clean-slate replacement —
 same conceptual shape (sessions, runs, SSE), different wire contract
 (`/v1/...`, sequence-numbered events, run-id-addressable interrupts,
 external-vs-harness origin split). Live harness: `http://harness.example.com:8877`.

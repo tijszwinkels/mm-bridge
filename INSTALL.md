@@ -78,7 +78,7 @@ reference these names. If the operator says "use your judgement" / "go", pick th
 
 The two services are public repos — you will clone them in Steps 4 and 5:
 
-- agent-harness → `https://github.com/tijszwinkels/agent-harness-echo`
+- agent-harness → `https://github.com/tijszwinkels/agent-harness`
 - mm-bridge → `https://github.com/tijszwinkels/mm-bridge`
 
 ### 0a. Host & backends (blocking — you cannot proceed without these)
@@ -260,8 +260,8 @@ Clone into the install directory (Q2) and sync. Example uses `~/projects`:
 
 ```bash
 cd ~/projects                    # <install_dir> from Q2
-git clone https://github.com/tijszwinkels/agent-harness-echo
-cd agent-harness-echo
+git clone https://github.com/tijszwinkels/agent-harness
+cd agent-harness
 uv sync
 cp run.sh.example run.sh && chmod +x run.sh   # run.sh is gitignored (per-host) — create it from the template
 ```
@@ -462,8 +462,8 @@ systemd user units are Linux-only. Elsewhere, run the two `run.sh` scripts direc
 `exec`s its daemon in the foreground:
 
 ```bash
-# Terminal 1  (or detached: screen -dmS harness ~/projects/agent-harness-echo/run.sh)
-~/projects/agent-harness-echo/run.sh
+# Terminal 1  (or detached: screen -dmS harness ~/projects/agent-harness/run.sh)
+~/projects/agent-harness/run.sh
 # Terminal 2  (or detached: screen -dmS mmbridge ~/projects/mm-bridge/run.sh)
 ~/projects/mm-bridge/run.sh
 ```

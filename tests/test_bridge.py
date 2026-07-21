@@ -4803,7 +4803,7 @@ class MentionUserWhenDoneTests(_BridgeTestCase):
 class HarnessEventEnvelopeTests(_BridgeTestCase):
     """The live harness places ``session_id`` and ``run_id`` at the top
     level of the SSE Event envelope, NOT inside the inner ``data`` payload
-    (see ``models.py: class Event`` in agent-harness-echo). Bridge handlers
+    (see ``models.py: class Event`` in agent-harness). Bridge handlers
     must see them through ``_on_harness_event``'s dispatch.
     """
 
