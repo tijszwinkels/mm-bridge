@@ -2166,6 +2166,74 @@ class InboundAttachmentTests(_BridgeTestCase):
         self.assertIn("replying", fork_body)
         self.assertIn("Mattermost thread context", fork_body)
 
+    async def test_first_engagement_message_downloads_attachment(self):
+        """A file attached to the very first message in a dormant channel —
+        the message that CREATES the session — must be downloaded and
+        referenced in the session's opening turn, not silently dropped."""
+        self.config.default_cwd = self.tmp.name
+        # Dormant channel: bot joined, autorespond → any message engages.
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "autorespond", "display_name": "Test channel",
+        }
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        self.bridge.mm.posted.clear()
+        self.bridge.mm.files_by_id["fid-boot"] = b"\xff\xd8\xff-jpeg"
+
+        await self.bridge._on_mm_posted({
+            "id": "m1", "channel_id": "c1", "message": "what hardware is this?",
+            "user_id": "u1", "type": "",
+            "file_ids": ["fid-boot"],
+            "metadata": {"files": [{"id": "fid-boot", "name": "device.jpg",
+                                     "size": 8}]},
+        })
+
+        # Exactly one session created and one opening turn sent.
+        self.assertEqual(len(self.bridge.harness.created), 1)
+        self.assertEqual(len(self.bridge.harness.sent), 1)
+
+        saved = Path(self.tmp.name) / ".mattermost-inbox" / "device.jpg"
+        self.assertTrue(
+            saved.exists(),
+            "attachment on the session-creating message was not downloaded",
+        )
+        self.assertEqual(saved.read_bytes(), b"\xff\xd8\xff-jpeg")
+
+        body = self.bridge.harness.sent[0][1]
+        self.assertIn(f"[User attached file: {saved}]", body)
+        self.assertIn("what hardware is this?", body)
+
+    async def test_external_session_replacement_downloads_attachment(self):
+        """When a post with an attachment adopts a channel mapped to an
+        unreachable external session, the fresh session's first turn must
+        include the downloaded file, not just the text."""
+        self.config.default_cwd = self.tmp.name
+        self.bridge.mapping.link(Anchor("c1"), "ext-old")
+        self.bridge._external_sessions.add("ext-old")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "", "display_name": "Adopted channel",
+        }
+        self.bridge.mm.files_by_id["fid-adopt"] = b"adopted-bytes"
+
+        await self.bridge._on_mm_posted({
+            "id": "m1", "channel_id": "c1", "message": "please analyse",
+            "user_id": "u1", "type": "",
+            "file_ids": ["fid-adopt"],
+            "metadata": {"files": [{"id": "fid-adopt", "name": "report.pdf",
+                                     "size": 13}]},
+        })
+
+        self.assertEqual(len(self.bridge.harness.created), 1)
+        self.assertEqual(len(self.bridge.harness.sent), 1)
+
+        saved = Path(self.tmp.name) / ".mattermost-inbox" / "report.pdf"
+        self.assertTrue(
+            saved.exists(),
+            "attachment dropped when adopting an external session",
+        )
+        body = self.bridge.harness.sent[0][1]
+        self.assertIn(f"[User attached file: {saved}]", body)
+        self.assertIn("please analyse", body)
+
 
 class CatchUpTests(_BridgeTestCase):
     async def test_catch_up_command_sends_block_to_session(self):

@@ -1103,6 +1103,7 @@ class Bridge:
             awaits_first_message=False,
             post_welcome=False,
             exclude_post_id=post.get("id"),
+            post=post,
         )
 
     async def _on_mm_channel_created(self, channel_id: str) -> None:
@@ -1209,6 +1210,7 @@ class Bridge:
         awaits_first_message: bool = True,
         post_welcome: bool = True,
         exclude_post_id: str | None = None,
+        post: dict | None = None,
     ) -> None:
         # Reserve the channel-id slot first so any MM post that lands while
         # we're still fetching channel metadata / model lists / catch-up
@@ -1268,6 +1270,25 @@ class Bridge:
             effective_initial = self._prepend_catch_up(
                 channel_id, initial_message, exclude_post_id=exclude_post_id,
             )
+            # Download attachments on the session-CREATING message so the
+            # opening turn includes them. The forward path
+            # (``_forward_user_post``) only runs for posts to an EXISTING
+            # session, so without this a file attached to the very first
+            # message in a channel — or to the message that adopts an
+            # unreachable external session — is silently dropped. The files
+            # land in ``effective_cwd`` (the cwd this session is created with),
+            # matching where ``_forward_user_post`` writes for live sessions.
+            if post and post.get("file_ids"):
+                if effective_cwd:
+                    notes = await self._save_mm_attachments(post, effective_cwd)
+                else:
+                    notes = ["[MM attachment skipped: no project path for session]"]
+                if notes:
+                    notes_block = "\n".join(notes)
+                    effective_initial = (
+                        f"{notes_block}\n\n{effective_initial}"
+                        if effective_initial else notes_block
+                    )
 
         # ``warming_up_sessions[channel_id]`` was set at function entry so
         # any race-arriving MM post is queued; reuse that entry here.
@@ -1457,6 +1478,7 @@ class Bridge:
             awaits_first_message=False,
             post_welcome=False,
             exclude_post_id=post.get("id"),
+            post=post,
         )
 
         # Commit the "old session is gone" state ONLY if the replacement
