@@ -5083,16 +5083,34 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
 
 
 class HarnessWatchdogEventsTests(_BridgeTestCase):
-    """Watchdog events from agent-harness PR #10:
+    """Watchdog events from the harness ``RunProcess`` watchdogs:
 
     - ``run.terminated_after_end_turn`` (subprocess didn't exit within
       grace window after ``end_turn``) — render SILENT.
-    - ``run.timed_out_idle`` (30min without ``message``/``message.delta``/
-      ``tool_use``) — render a VISIBLE warning post in the session anchor.
+    - ``run.timed_out_idle`` (idle watchdog force-stopped a silent run) —
+      VISIBLE warning post in the session anchor.
 
-    Both events are supplemental; a normal terminal event still follows,
-    so this handler must NOT touch typing/run-id state.
+    agent-harness v0.1.1 (idle-watchdog spec, PR #36) added three more:
+    - ``run.idle_warning`` (idle threshold crossed but the process tree is
+      CPU-busy — kill DEFERRED) — reassure that work continues.
+    - ``run.max_runtime_warning`` (emitted a lead window before the hard
+      runtime cap) — warn the run will be stopped soon.
+    - ``run.exceeded_max_runtime`` (the cap kill) — the session is fine.
+
+    Every notice event posts AT MOST ONCE per run (no repeats if the
+    harness re-emits). All events are supplemental; a normal terminal event
+    still follows, so this handler must NOT touch typing/run-id state.
     """
+
+    @staticmethod
+    def _envelope(event: str, data: dict, *, session="codex_s1", run="run-1"):
+        return {
+            "sequence": 1,
+            "event": event,
+            "data": data,
+            "session_id": session,
+            "run_id": run,
+        }
 
     async def test_terminated_after_end_turn_is_silent(self):
         """The LLM already finished its turn — no operator-facing post."""
@@ -5101,50 +5119,44 @@ class HarnessWatchdogEventsTests(_BridgeTestCase):
 
         await self.bridge._on_harness_event(
             "run.terminated_after_end_turn",
-            {
-                "sequence": 12,
-                "event": "run.terminated_after_end_turn",
-                "data": {
+            self._envelope(
+                "run.terminated_after_end_turn",
+                {
                     "grace_seconds": 20,
                     "hard_kill": False,
                     "returncode": -15,
                     "reason": "subprocess_did_not_exit_after_end_turn",
                 },
-                "session_id": "codex_s1",
-                "run_id": "run-1",
-            },
+            ),
         )
 
         # mm.posted unchanged — purely silent.
         self.assertEqual(self.bridge.mm.posted, posts_before)
 
     async def test_timed_out_idle_posts_warning_to_anchor(self):
-        from mm_bridge.bridge import IDLE_TIMEOUT_WARNING
+        from mm_bridge.watchdog_notices import idle_timeout_notice
         self.bridge.mapping.link(Anchor("c1", "root-post"), "codex_s1")
 
+        payload = {
+            "idle_seconds": 600,
+            "last_activity_event": "message.delta",
+            "last_activity_at": "2026-05-17T12:00:00Z",
+            "hard_kill": False,
+            "reason": "no_activity_within_threshold",
+        }
         await self.bridge._on_harness_event(
-            "run.timed_out_idle",
-            {
-                "sequence": 13,
-                "event": "run.timed_out_idle",
-                "data": {
-                    "idle_seconds": 1800,
-                    "last_activity_event": "message.delta",
-                    "last_activity_at": "2026-05-17T12:00:00Z",
-                    "hard_kill": False,
-                    "reason": "no_activity_within_threshold",
-                },
-                "session_id": "codex_s1",
-                "run_id": "run-1",
-            },
+            "run.timed_out_idle", self._envelope("run.timed_out_idle", payload),
         )
 
-        warnings = [
-            p for p in self.bridge.mm.posted if p.message == IDLE_TIMEOUT_WARNING
-        ]
+        expected = idle_timeout_notice(payload)
+        warnings = [p for p in self.bridge.mm.posted if p.message == expected]
         self.assertEqual(len(warnings), 1)
         self.assertEqual(warnings[0].channel_id, "c1")
         self.assertEqual(warnings[0].root_id, "root-post")
+        # Regression: the stale "30 minutes" copy is gone; the threshold now
+        # comes from the payload (600s → 10 min).
+        self.assertNotIn("30 minutes", warnings[0].message)
+        self.assertIn("10 min", warnings[0].message)
 
     async def test_timed_out_idle_unmapped_session_does_not_post(self):
         """Without an anchor we have nowhere to put the warning — log and
@@ -5154,19 +5166,17 @@ class HarnessWatchdogEventsTests(_BridgeTestCase):
 
         await self.bridge._on_harness_event(
             "run.timed_out_idle",
-            {
-                "sequence": 14,
-                "event": "run.timed_out_idle",
-                "data": {
-                    "idle_seconds": 1800,
+            self._envelope(
+                "run.timed_out_idle",
+                {
+                    "idle_seconds": 600,
                     "last_activity_event": "message.delta",
                     "last_activity_at": "2026-05-17T12:00:00Z",
                     "hard_kill": False,
                     "reason": "no_activity_within_threshold",
                 },
-                "session_id": "unknown_session",
-                "run_id": "run-1",
-            },
+                session="unknown_session",
+            ),
         )
 
         self.assertEqual(self.bridge.mm.posted, posts_before)
@@ -5185,20 +5195,177 @@ class HarnessWatchdogEventsTests(_BridgeTestCase):
         # Must not raise.
         await self.bridge._on_harness_event(
             "run.timed_out_idle",
-            {
-                "sequence": 15,
-                "event": "run.timed_out_idle",
-                "data": {
-                    "idle_seconds": 1800,
+            self._envelope(
+                "run.timed_out_idle",
+                {
+                    "idle_seconds": 600,
                     "last_activity_event": "tool_use",
                     "last_activity_at": "2026-05-17T12:00:00Z",
                     "hard_kill": True,
                     "reason": "no_activity_within_threshold",
                 },
-                "session_id": "codex_s1",
-                "run_id": "run-1",
-            },
+            ),
         )
+
+    # ---- new v0.1.1 watchdog warning events ----
+
+    async def test_idle_warning_posts_notice_to_anchor(self):
+        from mm_bridge.watchdog_notices import idle_warning_notice
+        self.bridge.mapping.link(Anchor("c1", "root-post"), "codex_s1")
+
+        payload = {
+            "idle_seconds": 605,
+            "idle_timeout_seconds": 600,
+            "cpu_seconds_delta": 3.2,
+            "reason": "process_tree_busy_deferring_kill",
+        }
+        await self.bridge._on_harness_event(
+            "run.idle_warning", self._envelope("run.idle_warning", payload),
+        )
+
+        notes = [
+            p for p in self.bridge.mm.posted
+            if p.message == idle_warning_notice(payload)
+        ]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].channel_id, "c1")
+        self.assertEqual(notes[0].root_id, "root-post")
+
+    async def test_max_runtime_warning_posts_notice_to_anchor(self):
+        from mm_bridge.watchdog_notices import max_runtime_warning_notice
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        payload = {
+            "max_run_seconds": 3600,
+            "seconds_until_kill": 600,
+            "reason": "approaching_max_runtime",
+        }
+        await self.bridge._on_harness_event(
+            "run.max_runtime_warning",
+            self._envelope("run.max_runtime_warning", payload),
+        )
+
+        notes = [
+            p for p in self.bridge.mm.posted
+            if p.message == max_runtime_warning_notice(payload)
+        ]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].channel_id, "c1")
+
+    async def test_exceeded_max_runtime_posts_notice_to_anchor(self):
+        from mm_bridge.watchdog_notices import exceeded_max_runtime_notice
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        payload = {
+            "max_run_seconds": 3600,
+            "hard_kill": False,
+            "reason": "max_runtime_exceeded",
+        }
+        await self.bridge._on_harness_event(
+            "run.exceeded_max_runtime",
+            self._envelope("run.exceeded_max_runtime", payload),
+        )
+
+        notes = [
+            p for p in self.bridge.mm.posted
+            if p.message == exceeded_max_runtime_notice(payload)
+        ]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].channel_id, "c1")
+
+    async def test_idle_warning_unmapped_session_does_not_post(self):
+        posts_before = list(self.bridge.mm.posted)
+
+        await self.bridge._on_harness_event(
+            "run.idle_warning",
+            self._envelope(
+                "run.idle_warning",
+                {"idle_seconds": 605, "idle_timeout_seconds": 600},
+                session="unknown_session",
+            ),
+        )
+
+        self.assertEqual(self.bridge.mm.posted, posts_before)
+
+    async def test_idle_warning_swallows_mm_post_failure(self):
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated mm.post failure")
+
+        self.bridge.mm.post = boom  # type: ignore[assignment]
+
+        # Must not raise.
+        await self.bridge._on_harness_event(
+            "run.idle_warning",
+            self._envelope(
+                "run.idle_warning",
+                {"idle_seconds": 605, "idle_timeout_seconds": 600},
+            ),
+        )
+
+    async def test_watchdog_notice_deduped_per_run(self):
+        """A re-emitted warning for the same run posts only once."""
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+        payload = {"idle_seconds": 605, "idle_timeout_seconds": 600}
+
+        for _ in range(3):
+            await self.bridge._on_harness_event(
+                "run.idle_warning", self._envelope("run.idle_warning", payload),
+            )
+
+        from mm_bridge.watchdog_notices import idle_warning_notice
+        notes = [
+            p for p in self.bridge.mm.posted
+            if p.message == idle_warning_notice(payload)
+        ]
+        self.assertEqual(len(notes), 1)
+
+    async def test_distinct_events_same_run_each_post_once(self):
+        """Dedup is per (run, event-type): different warning events for the
+        same run each get their own single post."""
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+
+        await self.bridge._on_harness_event(
+            "run.idle_warning",
+            self._envelope("run.idle_warning", {"idle_seconds": 605}),
+        )
+        await self.bridge._on_harness_event(
+            "run.max_runtime_warning",
+            self._envelope(
+                "run.max_runtime_warning",
+                {"max_run_seconds": 3600, "seconds_until_kill": 600},
+            ),
+        )
+
+        self.assertEqual(len(self.bridge.mm.posted), 2)
+
+    async def test_watchdog_notice_reposts_after_run_terminal(self):
+        """The per-run dedup is cleared when the run ends, so a later run in
+        the same session can warn again."""
+        self.bridge.mapping.link(Anchor("c1"), "codex_s1")
+        payload = {"idle_seconds": 605, "idle_timeout_seconds": 600}
+
+        await self.bridge._on_harness_event(
+            "run.idle_warning",
+            self._envelope("run.idle_warning", payload, run="run-1"),
+        )
+        # Run ends (terminal event clears the session's watchdog dedup state).
+        await self.bridge._on_harness_event(
+            "run.completed",
+            self._envelope("run.completed", {"returncode": 0}, run="run-1"),
+        )
+        await self.bridge._on_harness_event(
+            "run.idle_warning",
+            self._envelope("run.idle_warning", payload, run="run-2"),
+        )
+
+        from mm_bridge.watchdog_notices import idle_warning_notice
+        notes = [
+            p for p in self.bridge.mm.posted
+            if p.message == idle_warning_notice(payload)
+        ]
+        self.assertEqual(len(notes), 2)
 
 
 class TypingIndicatorActivityTests(_BridgeTestCase):

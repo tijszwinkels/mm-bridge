@@ -10,7 +10,15 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import attribution, commands, directives, name_sync, purpose, resume_header
+from . import (
+    attribution,
+    commands,
+    directives,
+    name_sync,
+    purpose,
+    resume_header,
+    watchdog_notices,
+)
 from .backend_errors import (
     exception_detail,
     format_backend_error,
@@ -70,22 +78,35 @@ HARNESS_LIVE_RUN_STATUSES = {"queued", "running"}
 # on their own), and those QUIET flips additionally STOP typing.
 HARNESS_QUIET_SESSION_STATUSES = {"idle", "waiting_for_input", "archived"}
 
-# Watchdog events — emitted by the harness `RunProcess` watchdogs (see
-# agent-harness PR #10). NOT in HARNESS_RUN_TERMINAL_EVENTS or
-# HARNESS_ACTIVITY_EVENTS: they're supplemental signals that PRECEDE a
-# normal terminal event (`run.completed`/`run.failed`/`run.interrupted`),
-# which still does the typing-stop / run-id-pop cleanup.
-HARNESS_WATCHDOG_EVENTS = {"run.terminated_after_end_turn", "run.timed_out_idle"}
+# Watchdog events — emitted by the harness `RunProcess` watchdogs. NOT in
+# HARNESS_RUN_TERMINAL_EVENTS or HARNESS_ACTIVITY_EVENTS: they're supplemental
+# signals that PRECEDE (or, for `run.idle_warning`, may precede) a normal
+# terminal event (`run.completed`/`run.failed`/`run.interrupted`), which still
+# does the typing-stop / run-id-pop cleanup.
+#
+# - `run.terminated_after_end_turn` (PR #10): rendered SILENT.
+# - `run.timed_out_idle` (PR #10): the idle-kill notice.
+# - `run.idle_warning` / `run.max_runtime_warning` / `run.exceeded_max_runtime`
+#   (v0.1.1, idle-watchdog spec): the deferred-kill, cap-approaching, and
+#   cap-kill notices respectively.
+HARNESS_WATCHDOG_EVENTS = {
+    "run.terminated_after_end_turn",
+    "run.timed_out_idle",
+    "run.idle_warning",
+    "run.max_runtime_warning",
+    "run.exceeded_max_runtime",
+}
 
-# Body posted to the session's anchor channel/thread when the idle-timeout
-# watchdog fires (after 30min without `message`/`message.delta`/`tool_use`).
-# The harness force-stops the subprocess; the user's previous reply may be
-# truncated. Markdown — preserve the leading emoji + italic block.
-IDLE_TIMEOUT_WARNING = (
-    "⚠️ _Session timed out after 30 minutes of inactivity. "
-    "The harness force-stopped it; the previous reply may be incomplete. "
-    "Send a new message to resume._"
-)
+# Watchdog events that post a channel notice, mapped to the formatter that
+# turns the event payload into the operator-facing Markdown. Each notice is
+# posted at most once per run (see ``Bridge._on_harness_watchdog_event``).
+# ``run.terminated_after_end_turn`` is deliberately absent — it's silent.
+HARNESS_WATCHDOG_NOTICE_FORMATTERS = {
+    "run.timed_out_idle": watchdog_notices.idle_timeout_notice,
+    "run.idle_warning": watchdog_notices.idle_warning_notice,
+    "run.max_runtime_warning": watchdog_notices.max_runtime_warning_notice,
+    "run.exceeded_max_runtime": watchdog_notices.exceeded_max_runtime_notice,
+}
 
 # How often to flush the SSE cursor (`mapping.last_event_seq`) to disk.
 # Each event triggers an in-memory update; the disk write is throttled to
@@ -391,6 +412,13 @@ class Bridge:
         # watchdog (reconcile instead of stop) and the quiet-flip handler
         # (ignore freshness idle-flips mid-run).
         self.active_run_by_session: dict[str, str | None] = {}
+        # Watchdog notice events (idle/runtime warnings + kills) already posted
+        # for the session's CURRENT run, so a harness re-emit doesn't double
+        # post. Keyed by session_id → set of event types; at most one run is
+        # active per session, and the set is cleared on the run's terminal
+        # event (see ``_on_harness_run_lifecycle``), so it bounds naturally and
+        # a later run in the same session can warn afresh.
+        self._posted_watchdog_notices: dict[str, set[str]] = {}
         self._known_sessions: set[str] = set()
         # Sessions the harness reports as ``origin: external`` — i.e. NOT
         # launched by the harness itself, so it has no stdin / IPC channel
@@ -3450,6 +3478,7 @@ class Bridge:
         self.posters.forget(session_id)
         self._session_triggerer.pop(session_id, None)
         self._recent_harness_sends.pop(session_id, None)
+        self._posted_watchdog_notices.pop(session_id, None)
         if self.typing:
             await self.typing.stop(session_id)
 
@@ -4155,6 +4184,9 @@ class Bridge:
             self.current_run_id_by_session.pop(session_id, None)
         self.active_run_by_session.pop(session_id, None)
         self.last_activity_ts.pop(session_id, None)
+        # The run is over — clear its watchdog-notice dedup so the next run in
+        # this session can warn afresh (and the map stays bounded).
+        self._posted_watchdog_notices.pop(session_id, None)
         self._end_tool_use_run(session_id)
         if self.typing:
             await self.typing.stop(session_id)
@@ -4202,18 +4234,20 @@ class Bridge:
             )
 
     async def _on_harness_watchdog_event(self, event_type: str, data: dict) -> None:
-        """Handle the two `RunProcess` watchdog events (agent-harness PR #10).
+        """Handle the harness `RunProcess` watchdog events.
 
-        Both events are SUPPLEMENTAL — the harness still emits a normal
-        terminal event (`run.completed`/`run.failed`/`run.interrupted`)
-        after the watchdog kill. This handler does NOT touch typing
-        indicators or run-id state; the terminal-event handler does.
+        All are SUPPLEMENTAL — a normal terminal event still follows a kill
+        (or the run keeps going after a deferral). This handler does NOT
+        touch typing indicators or run-id state; the terminal-event handler
+        does.
 
-        - ``run.terminated_after_end_turn``: silent (INFO log only). The
-          LLM already finished its turn; operator doesn't need noise.
-        - ``run.timed_out_idle``: visible warning post to the session's
-          anchor channel/thread, so the user knows the reply may be
-          incomplete and can send a follow-up to resume.
+        - ``run.terminated_after_end_turn``: silent (INFO log only). The LLM
+          already finished its turn; operator doesn't need noise.
+        - ``run.timed_out_idle`` (idle kill), ``run.idle_warning`` (deferred
+          kill), ``run.max_runtime_warning`` (cap approaching), and
+          ``run.exceeded_max_runtime`` (cap kill): post a channel notice
+          shaped from the event payload. Each posts AT MOST ONCE per run —
+          if the harness re-emits, the dedup set swallows the repeat.
         """
         session_id = data.get("session_id", "")
         sid_short = session_id[:8] if session_id else "?"
@@ -4229,37 +4263,43 @@ class Bridge:
             )
             return
 
-        if event_type == "run.timed_out_idle":
-            logger.warning(
-                "Harness watchdog killed idle run "
-                "(session=%s idle_seconds=%s last_activity_event=%s "
-                "last_activity_at=%s hard_kill=%s)",
-                sid_short,
-                data.get("idle_seconds"),
-                data.get("last_activity_event"),
-                data.get("last_activity_at"),
-                data.get("hard_kill"),
+        formatter = HARNESS_WATCHDOG_NOTICE_FORMATTERS.get(event_type)
+        if formatter is None:
+            logger.debug("Unhandled watchdog event %s", event_type)
+            return
+
+        logger.warning(
+            "Harness watchdog event %s (session=%s payload=%s)",
+            event_type, sid_short, data,
+        )
+        if not session_id:
+            return
+        if event_type in self._posted_watchdog_notices.get(session_id, ()):
+            logger.debug(
+                "Watchdog notice %s already posted for session %s; skipping",
+                event_type, sid_short,
             )
-            if not session_id:
-                return
-            anchor = self.mapping.get_anchor(session_id)
-            if not anchor:
-                logger.debug(
-                    "No anchor for idle-timeout session %s; skipping warning post",
-                    sid_short,
-                )
-                return
-            try:
-                self.mm.post(
-                    anchor.channel_id,
-                    IDLE_TIMEOUT_WARNING,
-                    root_id=anchor.root_id,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to post idle-timeout warning to channel %s (session %s)",
-                    anchor.channel_id, sid_short, exc_info=True,
-                )
+            return
+        anchor = self.mapping.get_anchor(session_id)
+        if not anchor:
+            logger.debug(
+                "No anchor for watchdog event %s (session %s); skipping post",
+                event_type, sid_short,
+            )
+            return
+        try:
+            self.mm.post(
+                anchor.channel_id,
+                formatter(data),
+                root_id=anchor.root_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to post watchdog notice %s to channel %s (session %s)",
+                event_type, anchor.channel_id, sid_short, exc_info=True,
+            )
+            return
+        self._posted_watchdog_notices.setdefault(session_id, set()).add(event_type)
 
     def _mention_triggerer_on_done(self, session_id: str) -> None:
         """Post ``@<username>`` in the session's channel/thread so the user
