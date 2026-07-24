@@ -177,6 +177,28 @@ model, no cost. You can configure it (`.model`, `.backend`, `.autorespond`) befo
 first real message; those settings are stored in the Channel Purpose and applied when the
 session is finally created.
 
+### Which directory a session starts in
+
+Sessions start in `default_cwd` (see [Configure](#configure)) unless something says
+otherwise. Three ways to say otherwise:
+
+- **Per channel — the Channel Purpose.** It's where the bridge persists per-channel
+  settings, and it takes a `cwd=` token:
+
+  ```
+  claude, opus, autorespond, cwd=/home/you/projects/some-repo
+  ```
+
+  Backend and model come first (either may be omitted); `autorespond` / `mention-only` and
+  `cwd=<absolute path>` may appear anywhere in the list. The path **must be absolute** —
+  `~` is not expanded — and must exist. Set it while the channel is still dormant and the
+  first message starts a session right there.
+- **Per sub-session** — `mm-bridge spawn --cwd <path> "<brief>"`.
+- **Globally** — `default_cwd` in the config, for every channel that doesn't override it.
+
+`.status` shows the cwd in effect. Note there is deliberately no `.cwd` command yet: unlike
+`.model` / `.backend`, the working directory is edited in the Channel Purpose.
+
 ### In-channel dot-commands
 
 The **bridge** handles these itself — they bypass the mention gate and are never
