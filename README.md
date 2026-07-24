@@ -8,8 +8,7 @@ the couch.
 If you've seen [Claude Tag](https://www.anthropic.com/news/introducing-claude-tag) —
 Anthropic's Claude-as-a-teammate in Slack — this is the self-hosted cousin: **your**
 Mattermost (one you already run, or one the installer stands up for you), your hardware,
-and whichever agent CLI you prefer. And where Claude Tag gives you one teammate, this gives
-you as many as you care to start — see [Swarms](#swarms--many-agents-one-chat-server).
+and whichever agent CLI you prefer.
 
 ```
    you  (Mattermost — desktop, phone, watch-it-from-the-train)
@@ -22,111 +21,77 @@ you as many as you care to start — see [Swarms](#swarms--many-agents-one-chat-
 mm-bridge is the middle box: it maps **one channel (or thread) to one agent session** and
 relays both directions.
 
-## What it's like to use
+## Features
 
-**A channel is a conversation with an agent.** Invite the bot, say what you want. The
-first message starts a session; replies stream back as posts. The channel keeps its
-context for as long as it lives — scroll up and the whole project history is there.
-
-**A thread is a side quest.** Reply in a thread and you get a *forked* session, so
-tangents don't pollute the main conversation.
-
-**Hand off work and walk away.** The agent can start *other* agents in *other* channels
-and get on with something else — see [Swarms](#swarms--many-agents-one-chat-server).
-
-**Watch the work, without drowning in it.** Tool calls collapse into a single
-live-updating post per turn, so you can see it grepping and editing at a glance. A typing
-indicator shows when it's thinking. If a run stalls or hits its runtime cap, the bridge
-says so in plain language instead of going quiet.
-
-**Files both ways.** Drop a screenshot, log, or PDF into the channel and the agent gets
-the file. It attaches files back with a one-line directive in its reply.
-
-**Agents can pull in humans.** When it needs a decision, the agent runs
-`mm-bridge invite alice` and you're in the channel.
-
-**Rescue a terminal session.** Started something in your terminal and want to continue it
-from the train? `.sessions` lists recent sessions — including terminal ones the bridge
-has never seen — and `.invite <session-id>` gives one a channel.
-
-**Change your mind mid-conversation.** `.model sonnet`, `.backend codex`,
-`.autorespond on`. Configuration lives in the channel; there's nothing to edit on the
-server.
+| | |
+|---|---|
+| **Channel = session** | Invite the bot, say what you want. The first message starts a session; the channel keeps its context for as long as it lives. |
+| **Thread = fork** | A thread reply gets its own forked session, so tangents stay out of the main conversation. |
+| **Sub-agents** | An agent can start other agents in other channels — see [Swarms](#swarms--many-agents-one-chat-server). |
+| **Live tool-use** | Tool calls collapse into one post per turn that updates as it works, plus a typing indicator. Or hide them entirely. |
+| **Stall warnings** | When a run idles or hits its runtime cap, the bridge says so instead of going quiet. |
+| **Files both ways** | Drop a screenshot, log, or PDF in the channel and the agent gets it; it attaches files back with a one-line directive. |
+| **Agent-initiated invites** | `mm-bridge invite alice` — the agent pulls in a human when it needs a decision. |
+| **Terminal rescue** | `.sessions` finds sessions you started in your terminal; `.invite <id>` gives one a channel to continue in. |
+| **Reconfigure in place** | `.model sonnet`, `.backend codex`, `.autorespond on` — per channel, from chat, nothing to edit on the server. |
+| **Catch-up** | A new session reads the channel's recent history first, so it starts with the context you already typed. |
 
 ## Swarms — many agents, one chat server
 
-Chat turns out to be a good substrate for running *several* agents at once, mostly because
-the hard part of a swarm is having somewhere to watch it from.
+Chat is a good substrate for running *several* agents at once, mostly because the hard part
+of a swarm is having somewhere to watch it from.
 
-**Agents spawn agents.** `mm-bridge spawn --title "Migrate the parser" "<brief>"` creates a
-new channel with its own session and kicks it off. The parent channel gets a link to the
-child; the child's header points back at the parent. A morning's work leaves a readable
-tree of channels — one per unit of work, each with its full transcript, all searchable.
+| | |
+|---|---|
+| **Agents spawn agents** | `mm-bridge spawn --title "Migrate the parser" "<brief>"` opens a new channel with its own session. Parent links to child, child's header links back. A morning's work leaves a readable tree — one channel per unit of work, each with its full transcript. |
+| **Mixed fleets** | Backend and model are per-channel: Opus planning in one, Codex implementing in three, pi reviewing in a fourth. |
+| **Agent-to-agent** | `mm-bridge post --channel <id>` and `read --channel <id>` let one agent brief another or request a review — as ordinary posts, so you can read the negotiation afterwards instead of guessing at it. |
+| **No half-conversations** | Every cross-channel post is mirrored into the sender's own channel (`_→ also sent to ~channel~_`). |
+| **Fleet view** | `.running` shows every session working right now; `.sessions` lists recent ones across all agents. |
+| **Circuit breaker** | [`CLAUDE-include.md`](CLAUDE-include.md) ships a convention where agents name themselves and count turns, handing the conversation back to a human before two of them talk in circles. |
 
-**Every agent can be a different agent.** Backend and model are per-channel, so a swarm can
-be mixed: Claude Opus planning in one channel, Codex implementing in three, pi reviewing in
-a fourth. Switch any of them at any time with `.backend` / `.model`.
-
-**Agents talk to each other.** `mm-bridge post --channel <id>` and
-`mm-bridge read --channel <id>` let one agent brief another, request a review, or settle a
-disagreement — as ordinary posts, which is the whole point: you can read the negotiation
-afterwards instead of guessing at it. Every cross-channel post is mirrored back into the
-sender's own channel (`_→ also sent to ~channel~_`), so neither half of an exchange is
-invisible. [`CLAUDE-include.md`](CLAUDE-include.md) ships a convention for this: each agent
-picks a name and prefixes its posts, and a turn counter pauses the conversation and hands
-it to a human if two agents get ~12 turns deep without one.
-
-**You supervise from anywhere.** `.running` shows every session with a turn in flight right
-now; `.sessions` lists recent ones across all agents. Any agent can pull you in with
-`mm-bridge invite <you>` when it hits a decision it shouldn't make alone. It's all normal
-Mattermost underneath — push notifications on your phone, one search box across every
-agent's transcript.
+It's all ordinary Mattermost underneath: push notifications on your phone, one search box
+across every agent's transcript.
 
 ## Where Claude Tag is better
 
-Worth being straight about, since the comparison is the first thing this README makes:
+Worth being straight about, since this README opens on the comparison:
 
-- **It runs in Slack.** This doesn't, and won't. If your team lives in Slack, use Claude
-  Tag. :slightly_smiling_face:
-- **Per-thread memory.** Claude Tag gives each thread its own task-scoped context. Here a
-  channel is *one long-running session*: everything ever said in it accumulates, and a
-  thread fork **inherits** the channel's whole history rather than starting clean. In
-  practice: open a new channel per task, and don't expect a two-month-old channel to stay
-  sharp or cheap.
-- **It's a managed product.** Claude Tag comes with a vendor, an SLA, and admin controls.
-  mm-bridge is three moving parts on a box you own — bridge, harness, and agent CLIs — that
-  you upgrade and debug yourself. There's no permission model beyond channel membership.
-- **It's proactive.** Claude Tag can notice something and speak up. Agents here only act
-  when a message reaches them (mention, or `.autorespond`).
-- **Enterprise connectors.** Claude Tag reaches into your org's data sources. Here the
-  agent gets whatever the local CLI already has — your repos, your shell, your MCP servers.
-  A good trade for code, a bad one for tickets and docs.
+- **It runs in Slack.** This doesn't, and won't. :slightly_smiling_face:
+- **Per-thread memory.** Claude Tag scopes context to a thread. Here a channel is *one
+  long-running session*: everything said in it accumulates, and a thread fork **inherits**
+  that history rather than starting clean. Open a new channel per task; don't expect a
+  two-month-old channel to stay sharp or cheap.
+- **It's a managed product** — vendor, SLA, admin controls. This is three moving parts on a
+  box you own, which you upgrade and debug. There's no permission model beyond channel
+  membership.
+- **It's proactive.** Claude Tag can notice something and speak up. Agents here move only
+  when a message reaches them.
+- **Enterprise connectors.** Claude Tag reaches into your org's data sources; these agents
+  get whatever the local CLI has. Good trade for code, bad one for tickets and docs.
 
-What you get back for all that: your data stays on your machine, any backend you like, as
-many agents at once as you want, and no per-seat bill.
+What you get back: your data stays on your machine, any backend you like, as many agents at
+once as you want, and no per-seat bill.
 
 ## What you bring
 
-mm-bridge itself is just a daemon and a CLI. The pieces around it are yours — though the
-installer in the Quickstart can put most of them there for you:
+mm-bridge is a daemon and a CLI. The pieces around it are yours — though the installer can
+put most of them there for you:
 
-- **A Mattermost server you administer.** *You* choose which one: a Mattermost you already
-  run, or a fresh one the installer stands up in Docker on the same machine. Either way you
-  need admin rights on it, because the bridge signs in as a **bot account** with a
-  personal-access token. A hosted/Cloud Mattermost where you can't create bot tokens won't
-  work. (These docs call the bot `@b3mo` by convention; you pick the name.)
+- **A Mattermost server you administer.** *You* choose which: one you already run, or a
+  fresh one the installer stands up in Docker. Either way you need admin rights, because
+  the bridge signs in as a **bot account** with a personal-access token — so a hosted/Cloud
+  Mattermost won't work. (These docs call the bot `@b3mo`; you pick the name.)
 - **A running [agent-harness](https://github.com/tijszwinkels/agent-harness)** — the local
-  runtime that starts and supervises the agent processes. The bridge subscribes to its
-  event stream and is useless without one. The installer sets this up as well.
-- **At least one agent CLI, installed and logged in on the same host** as the harness —
-  Claude Code, Codex, and/or pi. Sessions are ordinary local processes in your working
-  directories, which is the whole point — and means they act with your credentials.
+  runtime that starts and supervises agent processes. The installer sets this up too.
+- **At least one agent CLI, installed and logged in on the same host** as the harness:
+  Claude Code, Codex, or pi.
 - **Linux, preferably.** One session-discovery trick (below) is Linux-only; macOS falls
   back to a less precise path.
 
-One thing worth saying out loud: **the agent runs as you, on your machine, with your
-credentials.** Anyone who can post in a bridged channel can drive it. Treat channel
-membership like shell access.
+Worth saying out loud: **the agent runs as you, on your machine, with your credentials.**
+Anyone who can post in a bridged channel can drive it. Treat channel membership like shell
+access.
 
 ## Quickstart — tell an agent to install it
 
@@ -142,16 +107,16 @@ or **pi** on the machine that should run your agents, and tell it what you've go
 > **Install this against my existing Mattermost at `https://chat.example.com` — I'm an
 > admin there. Create the bot account and its token yourself.**
 
-Either way the agent follows [`INSTALL.md`](INSTALL.md), a runbook written for agents: it
-interviews you first (host user, install dir, which agent CLIs to enable, which directory
-sessions should start in, bot name, where Mattermost should be reachable), then stands up
-everything you don't already have — Mattermost + Postgres in Docker, agent-harness and
-mm-bridge as user-level systemd services — and verifies each step with a checkpoint,
-finishing on `mm-bridge doctor` and a live round-trip: you post in a channel, an agent
-answers.
+Either way the agent follows [`INSTALL.md`](INSTALL.md). It interviews you first — host
+user, install dir, which agent CLIs, which directory sessions start in, bot name, where
+Mattermost should be reachable — then stands up whatever you don't already have
+(Mattermost + Postgres in Docker, agent-harness and mm-bridge as user-level systemd
+services), checkpointing each step. It finishes on `mm-bridge doctor` and a live
+round-trip: you post in a channel, an agent answers.
 
-Nothing is guessed silently: when you say "use your judgement", it picks the documented
-default and tells you which.
+Nothing is guessed silently. Say "use your judgement" and it takes the documented default
+and tells you which — except for the answers that decide which machine, which user, and
+which directory your agents get. Those it asks.
 
 Prefer to drive it yourself? `INSTALL.md` is a plain numbered runbook for humans too. For
 just the Python package (Python 3.11+):
@@ -173,31 +138,29 @@ Then run the daemon with `mm-bridge serve`.
 - **`@b3mo leave`** sends the bot out of the channel.
 
 A channel the bot has joined but nobody has engaged yet is **dormant**: no session, no
-model, no cost. You can configure it (`.model`, `.backend`, `.autorespond`) before the
-first real message; those settings are stored in the Channel Purpose and applied when the
-session is finally created.
+model, no cost. Configure it (`.model`, `.backend`, `.autorespond`) before the first real
+message and those settings — stored in the Channel Purpose — apply when the session is
+created.
 
 ### Which directory a session starts in
 
-Sessions start in `default_cwd` (see [Configure](#configure)) unless something says
-otherwise. Three ways to say otherwise:
+Sessions start in `default_cwd` (see [Configure](#configure)) unless something overrides
+it:
 
-- **Per channel — the Channel Purpose.** It's where the bridge persists per-channel
-  settings, and it takes a `cwd=` token:
+- **Per channel — the Channel Purpose**, where the bridge persists per-channel settings:
 
   ```
   claude, opus, autorespond, cwd=/home/you/projects/some-repo
   ```
 
   Backend and model come first (either may be omitted); `autorespond` / `mention-only` and
-  `cwd=<absolute path>` may appear anywhere in the list. The path **must be absolute** —
-  `~` is not expanded — and must exist. Set it while the channel is still dormant and the
-  first message starts a session right there.
+  `cwd=<path>` go anywhere in the list. The path must be **absolute** (`~` is not expanded)
+  and must exist. Set it while the channel is dormant and the first message starts there.
 - **Per sub-session** — `mm-bridge spawn --cwd <path> "<brief>"`.
-- **Globally** — `default_cwd` in the config, for every channel that doesn't override it.
+- **Globally** — `default_cwd`, for every channel that doesn't override it.
 
-`.status` shows the cwd in effect. Note there is deliberately no `.cwd` command yet: unlike
-`.model` / `.backend`, the working directory is edited in the Channel Purpose.
+`.status` shows the cwd in effect. There's no `.cwd` command yet — the working directory is
+edited in the Channel Purpose, unlike `.model` / `.backend`.
 
 ### In-channel dot-commands
 
