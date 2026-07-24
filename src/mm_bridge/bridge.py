@@ -347,7 +347,10 @@ def resolve_attachment_path(
     Returns None if outside the allowed roots or if resolution fails.
     """
     try:
-        candidate = Path(raw_path)
+        # ``expanduser`` first so a ``~/…`` path resolves against $HOME
+        # instead of being treated as a cwd-relative dir literally named
+        # ``~`` (which never matches a configured root).
+        candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             if not project_path:
                 return None
@@ -378,6 +381,30 @@ def resolve_attachment_path(
         except ValueError:
             continue
     return None
+
+
+def describe_allowed_roots(
+    project_path: str | None, allowed_roots: list[str],
+) -> str:
+    """Backtick-quoted, comma-joined list of the roots an attachment may live
+    under — the session cwd first (always implicitly allowed), then the
+    operator-configured roots. Used to make a rejected-attach warning
+    self-explaining so the agent knows where to put the file instead of
+    guessing (``/tmp`` etc.). Paths are expanded + resolved so a ``~`` root
+    shows as a real directory. Returns ``""`` when nothing is configured.
+    """
+    labels: list[str] = []
+    seen: set[str] = set()
+    for raw in ([project_path] if project_path else []) + list(allowed_roots):
+        try:
+            resolved = str(Path(raw).expanduser().resolve(strict=False))
+        except (OSError, ValueError):
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        labels.append(f"`{resolved}`")
+    return ", ".join(labels)
 
 
 class Bridge:
@@ -4007,8 +4034,16 @@ class Bridge:
                     raw_path, project_path, self.config.allowed_attachment_roots,
                 )
                 if not resolved:
+                    roots_desc = describe_allowed_roots(
+                        project_path, self.config.allowed_attachment_roots,
+                    )
+                    hint = (
+                        f" Copy it into one of these and re-attach: {roots_desc}."
+                        if roots_desc else ""
+                    )
                     warnings.append(
-                        f"_Could not attach `{raw_path}`: outside allowed roots._"
+                        f"_Could not attach `{raw_path}`: outside the allowed "
+                        f"roots.{hint}_"
                     )
                     continue
                 if not resolved.exists():
