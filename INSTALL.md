@@ -120,7 +120,7 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 | 12 | **Autorespond default** — reply to every message, or only when `@mentioned`? | **mention-only** (off) |
 | 13 | **Default backend** for new channels — `claude`, `codex`, and `pi` are all first-class. Sensible default: **whichever agent is running this install**, since it's demonstrably installed + authed on this host. | the installing agent |
 | 14 | **Default model** per backend (`claude` / `codex`). **`pi` needs none** — the harness is model-optional for it (agent-harness PR #34, deployed). | `claude=opus, codex=gpt-5.5` |
-| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. Include a scratch dir (`~/mm-attachments`) so agents have an unambiguous place to stage generated files — otherwise they reach for `/tmp`, which is outside the roots and silently fails to attach. | `["~/projects", "~/mm-attachments"]` |
+| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. Include a scratch dir (`~/mm-attachments`) so agents have an unambiguous place to stage generated files — otherwise they reach for `/tmp`, which is outside the roots and silently fails to attach. **Must also contain the Q4 `default_cwd`**: these roots gate more than attachments — a per-channel `cwd=` outside them is silently replaced by `default_cwd`. If Q4 was answered `~/src`, this list needs `~/src`. | `["~/projects", "~/mm-attachments"]` (+ the Q4 answer if it differs) |
 | 16 | **Show tool-use posts?** Coalesced per-turn tool-use placeholders, or hide them (only real replies + errors). | show |
 
 > **Fill this in before continuing:**
