@@ -118,7 +118,7 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 | 12 | **Default backend** for new channels — `claude`, `codex`, and `pi` are all first-class. Sensible default: **whichever agent is running this install**, since it's demonstrably installed + authed on this host. | the installing agent |
 | 13 | **Default model** per backend (`claude` / `codex`). **`pi` needs none** — the harness is model-optional for it (agent-harness PR #34, deployed). | `claude=opus, codex=gpt-5.5` |
 | 14 | **`default_cwd`** — working dir new sessions start in: the user's *code* root, **distinct from the install dir** (Q2 — tooling, not workspace). | `~/projects` |
-| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. | `["~/projects"]` |
+| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. Include a scratch dir (`~/mm-attachments`) so agents have an unambiguous place to stage generated files — otherwise they reach for `/tmp`, which is outside the roots and silently fails to attach. | `["~/projects", "~/mm-attachments"]` |
 | 16 | **Show tool-use posts?** Coalesced per-turn tool-use placeholders, or hide them (only real replies + errors). | show |
 
 > **Fill this in before continuing:**
@@ -483,7 +483,7 @@ default_cwd               = "<default_cwd>"         # Q14
 default_autorespond       = false                  # Q11 (true = reply to every message)
 auto_join_public_channels = false                  # Q10 (true = bot joins all public channels)
 show_tool_use             = true                   # Q16
-allowed_attachment_roots  = ["~/projects"]          # Q15
+allowed_attachment_roots  = ["~/projects", "~/mm-attachments"]   # Q15 (scratch dir for agent-generated attachments)
 default_models            = { claude = "opus", codex = "gpt-5.5" }   # Q13 — pi needs none (harness is model-optional)
 state_file                = "~/.config/mm-bridge/state.json"
 sidecar_dir               = "~/.mm-bridge/sessions"
@@ -502,6 +502,10 @@ url = "http://localhost:8877"
 > **Create `default_cwd` if it's missing.** New sessions start there, and it may not exist
 > on a fresh box (`~/projects` is *not* the install dir). `mkdir -p "$(eval echo <default_cwd>)"`
 > so the first session doesn't land in a non-existent directory.
+>
+> **Create the attachment scratch dir (Q15).** `mkdir -p ~/mm-attachments` so agents have a
+> whitelisted place to stage generated files for `<openFile>`. Without it the agent falls back
+> to `/tmp`, which is outside `allowed_attachment_roots` and can't be attached.
 
 ### 5b. Secrets — `~/.config/mm-bridge/env` (chmod 600)
 
@@ -729,7 +733,7 @@ harness as reachable.
 | Turn recorded but no output | `--execute-runs` missing from harness `run.sh`. |
 | `FileNotFoundError: claude/codex` | Backend CLI not on the harness PATH — fix the `export PATH=` line in `run.sh` (systemd's non-interactive shell skips `~/.bashrc`). |
 | Services don't start after reboot | `loginctl enable-linger "$USER"` not set. |
-| `<openFile>` uploads nothing | Path is outside `allowed_attachment_roots`. |
+| `<openFile>` uploads nothing | Path is outside `allowed_attachment_roots` (the bridge posts a warning listing the roots that *are* allowed). Stage the file in `~/mm-attachments` (Q15) or the session cwd, or add its dir to `allowed_attachment_roots`. |
 | `mm-bridge` says "not in MM channel" | SessionStart hook missing (claude) or invoked in the startup race before the sidecar exists. |
 | Bot works but never uses the CLI (won't read scrollback, `invite`, `spawn`) | The session doesn't know the CLI exists / can't find it. Import `CLAUDE-include.md` into `~/.claude/CLAUDE.md` (Step 7b) and put `mm-bridge` on PATH via `uv tool install ~/.local/opt/agent-chatops/mm-bridge` (Step 7a). |
 | `mm-bridge: command not found` inside a session | CLI not on the session's PATH — `uv tool install ~/.local/opt/agent-chatops/mm-bridge` (Step 7a); confirm `~/.local/bin` is on PATH. |
